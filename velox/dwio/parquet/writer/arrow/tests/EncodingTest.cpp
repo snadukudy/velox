@@ -34,18 +34,17 @@
 #include "arrow/type_traits.h"
 #include "arrow/util/bit_block_counter.h"
 #include "arrow/util/bit_run_reader.h"
-#include "arrow/util/bit_stream_utils.h"
 #include "arrow/util/bit_util.h"
 #include "arrow/util/bitmap_ops.h"
 #include "arrow/util/bitmap_writer.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/hashing.h"
 #include "arrow/util/int_util_overflow.h"
-#include "arrow/util/logging.h"
-#include "arrow/util/rle_encoding.h"
 #include "arrow/util/ubsan.h"
 #include "arrow/visit_data_inline.h"
 
+#include "velox/common/base/Exceptions.h"
+#include "velox/dwio/parquet/common/RleEncodingInternal.h"
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
 #include "velox/dwio/parquet/writer/arrow/Platform.h"
 #include "velox/dwio/parquet/writer/arrow/Schema.h"
@@ -148,7 +147,7 @@ class PlainEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
   }
 
   void UnsafePutByteArray(const void* data, uint32_t length) {
-    DCHECK(length == 0 || data != nullptr) << "Value ptr cannot be NULL";
+    VELOX_DCHECK(length == 0 || data != nullptr, "Value ptr cannot be NULL");
     sink_.UnsafeAppend(&length, sizeof(uint32_t));
     sink_.UnsafeAppend(data, static_cast<int64_t>(length));
   }
@@ -276,7 +275,7 @@ inline void PlainEncoder<ByteArrayType>::Put(const ::arrow::Array& values) {
   if (::arrow::is_binary_like(values.type_id())) {
     PutBinaryArray(checked_cast<const ::arrow::BinaryArray&>(values));
   } else {
-    DCHECK(::arrow::is_large_binary_like(values.type_id()));
+    VELOX_DCHECK(::arrow::is_large_binary_like(values.type_id()));
     PutBinaryArray(checked_cast<const ::arrow::LargeBinaryArray&>(values));
   }
 }
@@ -325,7 +324,7 @@ inline void PlainEncoder<FLBAType>::Put(
   }
   for (int i = 0; i < num_values; ++i) {
     // Write the result to the output stream
-    DCHECK(src[i].ptr != nullptr) << "Value ptr cannot be NULL";
+    VELOX_DCHECK_NOT_NULL(src[i].ptr, "Value ptr cannot be NULL");
     PARQUET_THROW_NOT_OK(sink_.Append(src[i].ptr, descr_->type_length()));
   }
 }
@@ -378,7 +377,7 @@ class PlainEncoder<BooleanType> : public EncoderImpl,
     const auto& data = checked_cast<const ::arrow::BooleanArray&>(values);
     if (data.null_count() == 0) {
       PARQUET_THROW_NOT_OK(
-          sink_.Reserve(bit_util::BytesForBits(data.length())));
+          sink_.Reserve(::arrow::bit_util::BytesForBits(data.length())));
       // no nulls, just dump the data
       ::arrow::internal::CopyBitmap(
           data.data()->GetValues<uint8_t>(1),
@@ -387,7 +386,8 @@ class PlainEncoder<BooleanType> : public EncoderImpl,
           sink_.mutable_data(),
           sink_.length());
     } else {
-      auto n_valid = bit_util::BytesForBits(data.length() - data.null_count());
+      auto n_valid =
+          ::arrow::bit_util::BytesForBits(data.length() - data.null_count());
       PARQUET_THROW_NOT_OK(sink_.Reserve(n_valid));
       ::arrow::internal::FirstTimeBitmapWriter writer(
           sink_.mutable_data(), sink_.length(), n_valid);
@@ -411,7 +411,7 @@ class PlainEncoder<BooleanType> : public EncoderImpl,
   int bits_available_;
   std::shared_ptr<ResizableBuffer> bits_buffer_;
   ::arrow::BufferBuilder sink_;
-  ::arrow::bit_util::BitWriter bit_writer_;
+  BitWriter bit_writer_;
 
   template <typename SequenceType>
   void PutImpl(const SequenceType& src, int num_values);
@@ -433,7 +433,7 @@ void PlainEncoder<BooleanType>::PutImpl(
     if (bits_available_ == 0) {
       bit_writer_.Flush();
       PARQUET_THROW_NOT_OK(
-          sink_.Append(bit_writer_.buffer(), bit_writer_.bytes_written()));
+          sink_.Append(bit_writer_.buffer(), bit_writer_.bytesWritten()));
       bit_writer_.Clear();
     }
   }
@@ -453,7 +453,7 @@ void PlainEncoder<BooleanType>::PutImpl(
     if (bits_available_ == 0) {
       bit_writer_.Flush();
       PARQUET_THROW_NOT_OK(
-          sink_.Append(bit_writer_.buffer(), bit_writer_.bytes_written()));
+          sink_.Append(bit_writer_.buffer(), bit_writer_.bytesWritten()));
       bit_writer_.Clear();
     }
   }
@@ -461,14 +461,14 @@ void PlainEncoder<BooleanType>::PutImpl(
 
 int64_t PlainEncoder<BooleanType>::EstimatedDataEncodedSize() {
   int64_t position = sink_.length();
-  return position + bit_writer_.bytes_written();
+  return position + bit_writer_.bytesWritten();
 }
 
 std::shared_ptr<Buffer> PlainEncoder<BooleanType>::FlushValues() {
   if (bits_available_ > 0) {
     bit_writer_.Flush();
     PARQUET_THROW_NOT_OK(
-        sink_.Append(bit_writer_.buffer(), bit_writer_.bytes_written()));
+        sink_.Append(bit_writer_.buffer(), bit_writer_.bytesWritten()));
     bit_writer_.Clear();
     bits_available_ = static_cast<int>(bits_buffer_->size()) * 8;
   }
@@ -517,8 +517,8 @@ int RlePreserveBufferSize(int num_values, int bit_width) {
   // is called, we have to reserve an extra "RleEncoder::MinBufferSize"
   // bytes. These extra bytes won't be used but not reserving them
   // would cause the encoder to fail.
-  return ::arrow::util::RleEncoder::MaxBufferSize(bit_width, num_values) +
-      ::arrow::util::RleEncoder::MinBufferSize(bit_width);
+  return RleEncoder::MaxBufferSize(bit_width, num_values) +
+      RleEncoder::MinBufferSize(bit_width);
 }
 
 /// See the dictionary encoding section of
@@ -546,7 +546,7 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
         memo_table_(pool, kInitialHashTableSize) {}
 
   ~DictEncoderImpl() override {
-    DCHECK(buffered_indices_.empty());
+    VELOX_DCHECK(buffered_indices_.empty());
   }
 
   int dict_encoded_size() const override {
@@ -559,7 +559,7 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
     ++buffer;
     --buffer_len;
 
-    ::arrow::util::RleEncoder encoder(buffer, buffer_len, bit_width());
+    RleEncoder encoder(buffer, buffer_len, bit_width());
 
     for (int32_t index : buffered_indices_) {
       if (ARROW_PREDICT_FALSE(!encoder.Put(index)))
@@ -589,7 +589,7 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
       return 0;
     if (ARROW_PREDICT_FALSE(num_entries() == 1))
       return 1;
-    return bit_util::Log2(num_entries());
+    return ::arrow::bit_util::Log2(num_entries());
   }
 
   /// Encode value. Note that this does not actually write any data, just
@@ -709,7 +709,7 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
 
   template <typename ArrayType>
   void PutBinaryDictionaryArray(const ArrayType& array) {
-    DCHECK_EQ(array.null_count(), 0);
+    VELOX_DCHECK_EQ(array.null_count(), 0);
     for (int64_t i = 0; i < array.length(); i++) {
       auto v = array.GetView(i);
       if (ARROW_PREDICT_FALSE(v.size() > kMaxByteArraySize)) {
@@ -732,7 +732,7 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
 template <typename DType>
 void DictEncoderImpl<DType>::WriteDict(uint8_t* buffer) const {
   // For primitive types, only a memcpy
-  DCHECK_EQ(
+  VELOX_DCHECK_EQ(
       static_cast<size_t>(dict_encoded_size_), sizeof(T) * memo_table_.size());
   memo_table_.CopyValues(0 /* start_pos */, reinterpret_cast<T*>(buffer));
 }
@@ -752,7 +752,7 @@ void DictEncoderImpl<ByteArrayType>::WriteDict(uint8_t* buffer) const {
 template <>
 void DictEncoderImpl<FLBAType>::WriteDict(uint8_t* buffer) const {
   memo_table_.VisitValues(0, [&](::std::string_view v) {
-    DCHECK_EQ(v.length(), static_cast<size_t>(type_length_));
+    VELOX_DCHECK_EQ(v.length(), static_cast<size_t>(type_length_));
     memcpy(buffer, v.data(), type_length_);
     buffer += type_length_;
   });
@@ -776,7 +776,7 @@ template <typename DType>
 inline void DictEncoderImpl<DType>::PutByteArray(
     const void* ptr,
     int32_t length) {
-  DCHECK(false);
+  VELOX_DCHECK(false);
 }
 
 template <>
@@ -790,7 +790,7 @@ inline void DictEncoderImpl<ByteArrayType>::PutByteArray(
     dict_encoded_size_ += static_cast<int>(length + sizeof(uint32_t));
   };
 
-  DCHECK(ptr != nullptr || length == 0);
+  VELOX_DCHECK(ptr != nullptr || length == 0);
   ptr = (ptr != nullptr) ? ptr : empty;
   int32_t memo_index;
   PARQUET_THROW_NOT_OK(memo_table_.GetOrInsert(
@@ -812,7 +812,7 @@ inline void DictEncoderImpl<FLBAType>::Put(const FixedLenByteArray& v) {
     dict_encoded_size_ += type_length_;
   };
 
-  DCHECK(v.ptr != nullptr || type_length_ == 0);
+  VELOX_DCHECK(v.ptr != nullptr || type_length_ == 0);
   const void* ptr = (v.ptr != nullptr) ? v.ptr : empty;
   int32_t memo_index;
   PARQUET_THROW_NOT_OK(memo_table_.GetOrInsert(
@@ -874,7 +874,7 @@ void DictEncoderImpl<ByteArrayType>::Put(const ::arrow::Array& values) {
   if (::arrow::is_binary_like(values.type_id())) {
     PutBinaryArray(checked_cast<const ::arrow::BinaryArray&>(values));
   } else {
-    DCHECK(::arrow::is_large_binary_like(values.type_id()));
+    VELOX_DCHECK(::arrow::is_large_binary_like(values.type_id()));
     PutBinaryArray(checked_cast<const ::arrow::LargeBinaryArray&>(values));
   }
 }
@@ -934,7 +934,7 @@ void DictEncoderImpl<ByteArrayType>::PutDictionary(
   if (::arrow::is_binary_like(values.type_id())) {
     PutBinaryDictionaryArray(checked_cast<const ::arrow::BinaryArray&>(values));
   } else {
-    DCHECK(::arrow::is_large_binary_like(values.type_id()));
+    VELOX_DCHECK(::arrow::is_large_binary_like(values.type_id()));
     PutBinaryDictionaryArray(
         checked_cast<const ::arrow::LargeBinaryArray&>(values));
   }
@@ -1324,7 +1324,7 @@ class PlainBooleanDecoder : public DecoderImpl, virtual public BooleanDecoder {
       typename EncodingTraits<BooleanType>::DictAccumulator* out) override;
 
  private:
-  std::unique_ptr<::arrow::bit_util::BitReader> bit_reader_;
+  std::unique_ptr<BitReader> bit_reader_;
 };
 
 PlainBooleanDecoder::PlainBooleanDecoder(const ColumnDescriptor* descr)
@@ -1335,7 +1335,7 @@ void PlainBooleanDecoder::SetData(
     const uint8_t* data,
     int len) {
   num_values_ = num_values;
-  bit_reader_ = std::make_unique<bit_util::BitReader>(data, len);
+  bit_reader_ = std::make_unique<BitReader>(data, len);
 }
 
 int PlainBooleanDecoder::DecodeArrow(
@@ -1706,7 +1706,7 @@ class DictDecoderImpl : public DecoderImpl, virtual public DictDecoder<Type> {
     num_values_ = num_values;
     if (len == 0) {
       // Initialize dummy decoder to avoid crashes later on
-      idx_decoder_ = ::arrow::util::RleDecoder(data, len, /*bit_width=*/1);
+      idx_decoder_ = RleDecoder(data, len, /*bit_width=*/1);
       return;
     }
     uint8_t bit_width = *data;
@@ -1715,7 +1715,7 @@ class DictDecoderImpl : public DecoderImpl, virtual public DictDecoder<Type> {
           "Invalid or corrupted bit_width " + std::to_string(bit_width) +
           ". Maximum allowed is 32.");
     }
-    idx_decoder_ = ::arrow::util::RleDecoder(++data, --len, bit_width);
+    idx_decoder_ = RleDecoder(++data, --len, bit_width);
   }
 
   int Decode(T* buffer, int num_values) override {
@@ -1888,7 +1888,7 @@ class DictDecoderImpl : public DecoderImpl, virtual public DictDecoder<Type> {
   // BinaryDictionary32Builder
   std::shared_ptr<ResizableBuffer> indices_scratch_space_;
 
-  ::arrow::util::RleDecoder idx_decoder_;
+  RleDecoder idx_decoder_;
 };
 
 template <typename Type>
@@ -2263,7 +2263,8 @@ class DictByteArrayDecoderImpl : public DictDecoderImpl<ByteArrayType>,
         }
       } else {
         for (int64_t i = 0; i < block.length; ++i, ++position) {
-          if (bit_util::GetBit(valid_bits, valid_bits_offset + position)) {
+          if (::arrow::bit_util::GetBit(
+                  valid_bits, valid_bits_offset + position)) {
             ARROW_RETURN_NOT_OK(visit_valid(position));
           } else {
             ARROW_RETURN_NOT_OK(visit_null());
@@ -2523,7 +2524,7 @@ class DeltaBitPackEncoder : public EncoderImpl,
   ArrowPoolVector<UT> deltas_;
   std::shared_ptr<ResizableBuffer> bits_buffer_;
   ::arrow::BufferBuilder sink_;
-  ::arrow::bit_util::BitWriter bit_writer_;
+  BitWriter bit_writer_;
 };
 
 template <typename DType>
@@ -2569,7 +2570,7 @@ void DeltaBitPackEncoder<DType>::FlushBlock() {
   // Call to GetNextBytePtr reserves mini_blocks_per_block_ bytes of space to
   // write bit widths of miniblocks as they become known during the encoding.
   uint8_t* bit_width_data = bit_writer_.GetNextBytePtr(mini_blocks_per_block_);
-  DCHECK(bit_width_data != nullptr);
+  VELOX_DCHECK(bit_width_data != nullptr);
 
   const uint32_t num_miniblocks = static_cast<uint32_t>(std::ceil(
       static_cast<double>(values_current_block_) /
@@ -2586,7 +2587,7 @@ void DeltaBitPackEncoder<DType>::FlushBlock() {
     // The minimum number of bits required to write any of values in deltas_
     // vector. See overflow comment above.
     const auto bit_width = bit_width_data[i] =
-        bit_util::NumRequiredBits(max_delta - min_delta);
+        ::arrow::bit_util::NumRequiredBits(max_delta - min_delta);
 
     for (uint32_t j = start; j < start + values_current_mini_block; j++) {
       // See overflow comment above.
@@ -2610,11 +2611,11 @@ void DeltaBitPackEncoder<DType>::FlushBlock() {
   for (uint32_t i = num_miniblocks; i < mini_blocks_per_block_; i++) {
     bit_width_data[i] = 0;
   }
-  DCHECK_EQ(values_current_block_, 0);
+  VELOX_DCHECK_EQ(values_current_block_, 0);
 
   bit_writer_.Flush();
   PARQUET_THROW_NOT_OK(
-      sink_.Append(bit_writer_.buffer(), bit_writer_.bytes_written()));
+      sink_.Append(bit_writer_.buffer(), bit_writer_.bytesWritten()));
   bit_writer_.Clear();
 }
 
@@ -2626,7 +2627,7 @@ std::shared_ptr<Buffer> DeltaBitPackEncoder<DType>::FlushValues() {
   PARQUET_ASSIGN_OR_THROW(auto buffer, sink_.Finish(/*shrink_to_fit=*/true));
 
   uint8_t header_buffer_[kMaxPageHeaderWriterSize] = {};
-  bit_util::BitWriter header_writer(header_buffer_, sizeof(header_buffer_));
+  BitWriter header_writer(header_buffer_, sizeof(header_buffer_));
   if (!header_writer.PutVlqInt(values_per_block_) ||
       !header_writer.PutVlqInt(mini_blocks_per_block_) ||
       !header_writer.PutVlqInt(total_value_count_) ||
@@ -2639,11 +2640,11 @@ std::shared_ptr<Buffer> DeltaBitPackEncoder<DType>::FlushValues() {
   // possible header and data was written immediately after. We now write the
   // header data immediately before the end of reserved space.
   const size_t offset_bytes =
-      kMaxPageHeaderWriterSize - header_writer.bytes_written();
+      kMaxPageHeaderWriterSize - header_writer.bytesWritten();
   std::memcpy(
       buffer->mutable_data() + offset_bytes,
       header_buffer_,
-      header_writer.bytes_written());
+      header_writer.bytesWritten());
 
   // Reset counter of cached values
   total_value_count_ = 0;
@@ -2743,15 +2744,13 @@ class DeltaBitPackDecoder : public DecoderImpl,
     // num_values is equal to page's num_values, including null values in this
     // page
     this->num_values_ = num_values;
-    decoder_ = std::make_shared<::arrow::bit_util::BitReader>(data, len);
+    decoder_ = std::make_shared<BitReader>(data, len);
     InitHeader();
   }
 
   // Set BitReader which is already initialized by DeltaLengthByteArrayDecoder
   // or DeltaByteArrayDecoder
-  void SetDecoder(
-      int num_values,
-      std::shared_ptr<::arrow::bit_util::BitReader> decoder) {
+  void SetDecoder(int num_values, std::shared_ptr<BitReader> decoder) {
     this->num_values_ = num_values;
     decoder_ = std::move(decoder);
     InitHeader();
@@ -2845,7 +2844,7 @@ class DeltaBitPackDecoder : public DecoderImpl,
   }
 
   void InitBlock() {
-    DCHECK_GT(total_values_remaining_, 0) << "InitBlock called at EOF";
+    VELOX_DCHECK_GT(total_values_remaining_, 0, "InitBlock called at EOF");
 
     if (!decoder_->GetZigZagVlqInt(&min_delta_))
       ParquetException::EofException("InitBlock EOF");
@@ -2886,7 +2885,7 @@ class DeltaBitPackDecoder : public DecoderImpl,
       if (ARROW_PREDICT_FALSE(values_remaining_current_mini_block_ == 0)) {
         if (ARROW_PREDICT_FALSE(!first_block_initialized_)) {
           buffer[i++] = last_value_;
-          DCHECK_EQ(i, 1); // we're at the beginning of the page
+          VELOX_DCHECK_EQ(i, 1); // we're at the beginning of the page
           if (ARROW_PREDICT_FALSE(i == max_values)) {
             // When block is uninitialized and i reaches max_values we have two
             // different possibilities:
@@ -2944,7 +2943,7 @@ class DeltaBitPackDecoder : public DecoderImpl,
   }
 
   MemoryPool* pool_;
-  std::shared_ptr<::arrow::bit_util::BitReader> decoder_;
+  std::shared_ptr<BitReader> decoder_;
   uint32_t values_per_block_;
   uint32_t mini_blocks_per_block_;
   uint32_t values_per_mini_block_;
@@ -3122,7 +3121,7 @@ class DeltaLengthByteArrayDecoder : public DecoderImpl,
 
   void SetData(int num_values, const uint8_t* data, int len) override {
     DecoderImpl::SetData(num_values, data, len);
-    decoder_ = std::make_shared<::arrow::bit_util::BitReader>(data, len);
+    decoder_ = std::make_shared<BitReader>(data, len);
     DecodeLengths();
   }
 
@@ -3130,7 +3129,7 @@ class DeltaLengthByteArrayDecoder : public DecoderImpl,
     // Decode up to `max_values` strings into an internal buffer
     // and reference them into `buffer`.
     max_values = std::min(max_values, num_valid_values_);
-    DCHECK_GE(max_values, 0);
+    VELOX_DCHECK_GE(max_values, 0);
     if (max_values == 0) {
       return 0;
     }
@@ -3139,7 +3138,7 @@ class DeltaLengthByteArrayDecoder : public DecoderImpl,
     const int32_t* length_ptr =
         reinterpret_cast<const int32_t*>(buffered_length_->data()) +
         length_idx_;
-    int bytes_offset = len_ - decoder_->bytes_left();
+    int bytes_offset = len_ - decoder_->bytesLeft();
     for (int i = 0; i < max_values; ++i) {
       int32_t len = length_ptr[i];
       if (ARROW_PREDICT_FALSE(len < 0)) {
@@ -3200,10 +3199,10 @@ class DeltaLengthByteArrayDecoder : public DecoderImpl,
 
     // call len_decoder_.Decode to decode all the lengths.
     // all the lengths are buffered in buffered_length_.
-    int ret = len_decoder_.Decode(
+    VELOX_DEBUG_ONLY int ret = len_decoder_.Decode(
         reinterpret_cast<int32_t*>(buffered_length_->mutable_data()),
         num_length);
-    DCHECK_EQ(ret, num_length);
+    VELOX_DCHECK_EQ(ret, num_length);
     length_idx_ = 0;
     num_valid_values_ = num_length;
   }
@@ -3251,12 +3250,12 @@ class DeltaLengthByteArrayDecoder : public DecoderImpl,
           return Status::OK();
         }));
 
-    DCHECK_EQ(null_count, 0);
+    VELOX_DCHECK_EQ(null_count, 0);
     *out_num_values = num_valid_values;
     return Status::OK();
   }
 
-  std::shared_ptr<::arrow::bit_util::BitReader> decoder_;
+  std::shared_ptr<BitReader> decoder_;
   DeltaBitPackDecoder<Int32Type> len_decoder_;
   int num_valid_values_;
   uint32_t length_idx_;
@@ -3364,7 +3363,7 @@ std::shared_ptr<Buffer> RleBooleanEncoder::FlushValues() {
   int rle_buffer_size_max = MaxRleBufferSize();
   std::shared_ptr<ResizableBuffer> buffer =
       AllocateBuffer(this->pool_, rle_buffer_size_max + kRleLengthInBytes);
-  ::arrow::util::RleEncoder encoder(
+  RleEncoder encoder(
       buffer->mutable_data() + kRleLengthInBytes,
       rle_buffer_size_max,
       /*bit_width*/ kBitWidth);
@@ -3407,7 +3406,7 @@ class RleBooleanDecoder : public DecoderImpl, virtual public BooleanDecoder {
 
     auto decoder_data = data + 4;
     if (decoder_ == nullptr) {
-      decoder_ = std::make_shared<::arrow::util::RleDecoder>(
+      decoder_ = std::make_shared<RleDecoder>(
           decoder_data,
           num_bytes,
           /*bit_width=*/1);
@@ -3469,7 +3468,7 @@ class RleBooleanDecoder : public DecoderImpl, virtual public BooleanDecoder {
   }
 
  private:
-  std::shared_ptr<::arrow::util::RleDecoder> decoder_;
+  std::shared_ptr<RleDecoder> decoder_;
 };
 
 // ----------------------------------------------------------------------
@@ -3490,7 +3489,7 @@ class DeltaByteArrayDecoder : public DecoderImpl,
 
   void SetData(int num_values, const uint8_t* data, int len) override {
     num_values_ = num_values;
-    decoder_ = std::make_shared<::arrow::bit_util::BitReader>(data, len);
+    decoder_ = std::make_shared<BitReader>(data, len);
     prefix_len_decoder_.SetDecoder(num_values, decoder_);
 
     // get the number of encoded prefix lengths
@@ -3499,16 +3498,16 @@ class DeltaByteArrayDecoder : public DecoderImpl,
     // all the prefix lengths are buffered in buffered_prefix_length_.
     PARQUET_THROW_NOT_OK(
         buffered_prefix_length_->Resize(num_prefix * sizeof(int32_t)));
-    int ret = prefix_len_decoder_.Decode(
+    VELOX_DEBUG_ONLY int ret = prefix_len_decoder_.Decode(
         reinterpret_cast<int32_t*>(buffered_prefix_length_->mutable_data()),
         num_prefix);
-    DCHECK_EQ(ret, num_prefix);
+    VELOX_DCHECK_EQ(ret, num_prefix);
     prefix_len_offset_ = 0;
     num_valid_values_ = num_prefix;
 
-    int bytes_left = decoder_->bytes_left();
+    int bytes_left = decoder_->bytesLeft();
     // If len < bytes_left, prefix_len_decoder.Decode will throw exception.
-    DCHECK_GE(len, bytes_left);
+    VELOX_DCHECK_GE(len, bytes_left);
     int suffix_begins = len - bytes_left;
     // at this time, the decoder_ will be at the start of the encoded suffix
     // data.
@@ -3618,7 +3617,7 @@ class DeltaByteArrayDecoder : public DecoderImpl,
     std::vector<ByteArray> values(num_values);
     const int num_valid_values =
         GetInternal(values.data(), num_values - null_count);
-    DCHECK_EQ(num_values - null_count, num_valid_values);
+    VELOX_DCHECK_EQ(num_values - null_count, num_valid_values);
 
     auto values_ptr = reinterpret_cast<const ByteArray*>(values.data());
     int value_idx = 0;
@@ -3643,12 +3642,12 @@ class DeltaByteArrayDecoder : public DecoderImpl,
           return Status::OK();
         }));
 
-    DCHECK_EQ(null_count, 0);
+    VELOX_DCHECK_EQ(null_count, 0);
     *out_num_values = num_valid_values;
     return Status::OK();
   }
 
-  std::shared_ptr<::arrow::bit_util::BitReader> decoder_;
+  std::shared_ptr<BitReader> decoder_;
   DeltaBitPackDecoder<Int32Type> prefix_len_decoder_;
   DeltaLengthByteArrayDecoder suffix_decoder_;
   std::string last_value_;
@@ -3841,7 +3840,7 @@ std::unique_ptr<Encoder> MakeEncoder(
       case Type::FIXED_LEN_BYTE_ARRAY:
         return std::make_unique<DictEncoderImpl<FLBAType>>(descr, pool);
       default:
-        DCHECK(false) << "Encoder not implemented";
+        VELOX_DCHECK(false, "Encoder not implemented");
         break;
     }
   } else if (encoding == Encoding::PLAIN) {
@@ -3863,7 +3862,7 @@ std::unique_ptr<Encoder> MakeEncoder(
       case Type::FIXED_LEN_BYTE_ARRAY:
         return std::make_unique<PlainEncoder<FLBAType>>(descr, pool);
       default:
-        DCHECK(false) << "Encoder not implemented";
+        VELOX_DCHECK(false, "Encoder not implemented");
         break;
     }
   } else if (encoding == Encoding::BYTE_STREAM_SPLIT) {
@@ -3906,7 +3905,7 @@ std::unique_ptr<Encoder> MakeEncoder(
   } else {
     ParquetException::NYI("Selected encoding is not supported");
   }
-  DCHECK(false) << "Should not be able to reach this code";
+  VELOX_DCHECK(false, "Should not be able to reach this code");
   return nullptr;
 }
 
@@ -3974,7 +3973,7 @@ std::unique_ptr<Decoder> MakeDecoder(
   } else {
     ParquetException::NYI("Selected encoding is not supported");
   }
-  DCHECK(false) << "Should not be able to reach this code";
+  VELOX_DCHECK(false, "Should not be able to reach this code");
   return nullptr;
 }
 
@@ -4004,7 +4003,7 @@ std::unique_ptr<Decoder> MakeDictDecoder(
     default:
       break;
   }
-  DCHECK(false) << "Should not be able to reach this code";
+  VELOX_DCHECK(false, "Should not be able to reach this code");
   return nullptr;
 }
 

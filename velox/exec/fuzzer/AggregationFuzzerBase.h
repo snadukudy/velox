@@ -17,6 +17,8 @@
 
 #include "velox/common/file/FileSystems.h"
 #include "velox/connectors/hive/HiveConnector.h"
+#include "velox/dwio/dwrf/RegisterDwrfReader.h"
+#include "velox/dwio/dwrf/RegisterDwrfWriter.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/Split.h"
 #include "velox/exec/fuzzer/FuzzerUtil.h"
@@ -63,21 +65,33 @@ class AggregationFuzzerBase {
           customInputGenerators,
       VectorFuzzer::Options::TimestampPrecision timestampPrecision,
       const std::unordered_map<std::string, std::string>& queryConfigs,
-      std::unique_ptr<ReferenceQueryRunner> referenceQueryRunner)
+      const std::unordered_map<std::string, std::string>& hiveConfigs,
+      bool orderableGroupKeys,
+      std::unique_ptr<ReferenceQueryRunner> referenceQueryRunner,
+      std::optional<VectorFuzzer::Options> fuzzerOptions = std::nullopt)
       : customVerificationFunctions_{customVerificationFunctions},
         customInputGenerators_{customInputGenerators},
         queryConfigs_{queryConfigs},
+        orderableGroupKeys_{orderableGroupKeys},
         persistAndRunOnce_{FLAGS_persist_and_run_once},
         reproPersistPath_{FLAGS_repro_persist_path},
         referenceQueryRunner_{std::move(referenceQueryRunner)},
-        vectorFuzzer_{getFuzzerOptions(timestampPrecision), pool_.get()} {
+        vectorFuzzer_{
+            fuzzerOptions.has_value() ? fuzzerOptions.value()
+                                      : getFuzzerOptions(timestampPrecision),
+            pool_.get()} {
     filesystems::registerLocalFileSystem();
-    auto hiveConnector =
-        connector::getConnectorFactory(
-            connector::hive::HiveConnectorFactory::kHiveConnectorName)
-            ->newConnector(
-                kHiveConnectorId, std::make_shared<core::MemConfig>());
-    connector::registerConnector(hiveConnector);
+    connector::registerConnectorFactory(
+        std::make_shared<connector::hive::HiveConnectorFactory>());
+    registerHiveConnector(hiveConfigs);
+    dwrf::registerDwrfReaderFactory();
+    dwrf::registerDwrfWriterFactory();
+
+    for (const auto& type : referenceQueryRunner_->supportedScalarTypes()) {
+      if (!type->isReal() && !type->isDouble()) {
+        supportedKeyTypes_.push_back(type);
+      }
+    }
 
     seed(initialSeed);
   }
@@ -102,11 +116,16 @@ class AggregationFuzzerBase {
     size_t numFailed{0};
   };
 
-  enum ReferenceQueryErrorCode {
-    kSuccess,
-    kReferenceQueryFail,
-    kReferenceQueryUnsupported
-  };
+  static VectorFuzzer::Options getFuzzerOptions(
+      VectorFuzzer::Options::TimestampPrecision timestampPrecision) {
+    VectorFuzzer::Options opts;
+    opts.vectorSize = FLAGS_batch_size;
+    opts.stringVariableLength = true;
+    opts.stringLength = 4'000;
+    opts.nullRatio = FLAGS_null_ratio;
+    opts.timestampPrecision = timestampPrecision;
+    return opts;
+  }
 
  protected:
   struct Stats {
@@ -136,8 +155,7 @@ class AggregationFuzzerBase {
 
     void print(size_t numIterations) const;
 
-    void updateReferenceQueryStats(
-        AggregationFuzzerBase::ReferenceQueryErrorCode errorCode);
+    void updateReferenceQueryStats(ReferenceQueryErrorCode errorCode);
   };
 
   int32_t randInt(int32_t min, int32_t max);
@@ -153,17 +171,6 @@ class AggregationFuzzerBase {
       const CallableSignature& signature);
 
   PlanWithSplits deserialize(const folly::dynamic& obj);
-
-  static VectorFuzzer::Options getFuzzerOptions(
-      VectorFuzzer::Options::TimestampPrecision timestampPrecision) {
-    VectorFuzzer::Options opts;
-    opts.vectorSize = FLAGS_batch_size;
-    opts.stringVariableLength = true;
-    opts.stringLength = 4'000;
-    opts.nullRatio = FLAGS_null_ratio;
-    opts.timestampPrecision = timestampPrecision;
-    return opts;
-  }
 
   void seed(size_t seed) {
     currentSeed_ = seed;
@@ -185,11 +192,15 @@ class AggregationFuzzerBase {
       std::vector<TypePtr>& types);
 
   // Similar to generateKeys, but restricts types to orderable types (i.e. no
-  // maps).
+  // maps). For k-RANGE frame bounds, rangeFrame must be set to true so only
+  // one sorting key is generated.
   std::vector<std::string> generateSortingKeys(
       const std::string& prefix,
       std::vector<std::string>& names,
-      std::vector<TypePtr>& types);
+      std::vector<TypePtr>& types,
+      bool rangeFrame = false,
+      const std::vector<TypePtr>& scalarTypes = defaultScalarTypes(),
+      std::optional<uint32_t> numKeys = std::nullopt);
 
   std::pair<CallableSignature, SignatureStats&> pickSignature();
 
@@ -198,20 +209,19 @@ class AggregationFuzzerBase {
       std::vector<TypePtr> types,
       const std::optional<CallableSignature>& signature);
 
-  // Generate a RowVector of the given types of children with an additional
-  // child named "row_number" of BIGINT row numbers that differentiates every
-  // row. Row numbers start from 0. This additional input vector is needed for
-  // result verification of window aggregations.
+  /// Generate a RowVector of the given types of children with an additional
+  /// child named "row_number" of INTEGER row numbers that differentiates every
+  /// row. Row numbers start from 0. This additional input vector is needed for
+  /// result verification of window aggregations.
+  /// @param windowFrameBounds Names of frame bound columns of a window
+  /// operation. These columns are fuzzed without NULLs.
   std::vector<RowVectorPtr> generateInputDataWithRowNumber(
       std::vector<std::string> names,
       std::vector<TypePtr> types,
       const std::vector<std::string>& partitionKeys,
+      const std::vector<std::string>& windowFrameBounds,
+      const std::vector<std::string>& sortingKeys,
       const CallableSignature& signature);
-
-  std::pair<std::optional<MaterializedRowMultiset>, ReferenceQueryErrorCode>
-  computeReferenceResults(
-      const core::PlanNodePtr& plan,
-      const std::vector<RowVectorPtr>& input);
 
   velox::fuzzer::ResultOrError execute(
       const core::PlanNodePtr& plan,
@@ -219,15 +229,6 @@ class AggregationFuzzerBase {
       bool injectSpill = false,
       bool abandonPartial = false,
       int32_t maxDrivers = 2);
-
-  // Will throw if referenceQueryRunner doesn't support
-  // returning results as a vector.
-  std::pair<
-      std::optional<std::vector<RowVectorPtr>>,
-      AggregationFuzzerBase::ReferenceQueryErrorCode>
-  computeReferenceResultsAsVector(
-      const core::PlanNodePtr& plan,
-      const std::vector<RowVectorPtr>& input);
 
   void compare(
       const velox::fuzzer::ResultOrError& actual,
@@ -257,13 +258,14 @@ class AggregationFuzzerBase {
 
   void printSignatureStats();
 
-  void logVectors(const std::vector<RowVectorPtr>& vectors);
-
   const std::unordered_map<std::string, std::shared_ptr<ResultVerifier>>
       customVerificationFunctions_;
   const std::unordered_map<std::string, std::shared_ptr<InputGenerator>>
       customInputGenerators_;
   const std::unordered_map<std::string, std::string> queryConfigs_;
+
+  // Whether group keys must be orderable or be just comparable.
+  bool orderableGroupKeys_;
   const bool persistAndRunOnce_;
   const std::string reproPersistPath_;
 
@@ -287,6 +289,7 @@ class AggregationFuzzerBase {
   std::shared_ptr<memory::MemoryPool> writerPool_{
       rootPool_->addAggregateChild("aggregationFuzzerWriter")};
   VectorFuzzer vectorFuzzer_;
+  std::vector<TypePtr> supportedKeyTypes_;
 };
 
 // Returns true if the elapsed time is greater than or equal to
@@ -323,14 +326,6 @@ std::vector<std::string> makeNames(size_t n);
 void persistReproInfo(
     const std::vector<AggregationFuzzerBase::PlanWithSplits>& plans,
     const std::string& basePath);
-
-// Returns a PrestoQueryRunner instance if prestoUrl is non-empty. Otherwise,
-// returns a DuckQueryRunner instance and set disabled aggregation functions
-// properly.
-std::unique_ptr<ReferenceQueryRunner> setupReferenceQueryRunner(
-    const std::string& prestoUrl,
-    const std::string& runnerName,
-    const uint32_t& reqTimeoutMs);
 
 // Returns the function name used in a WindowNode. The input `node` should be a
 // pointer to a WindowNode.

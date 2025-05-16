@@ -33,6 +33,9 @@ namespace facebook::velox::exec::test {
 // expects all groups to be under 2e.
 class ApproxDistinctResultVerifier : public ResultVerifier {
  public:
+  explicit ApproxDistinctResultVerifier(bool isApproxSet = false)
+      : isApproxSet_(isApproxSet) {}
+
   bool supportsCompare() override {
     return false;
   }
@@ -44,12 +47,14 @@ class ApproxDistinctResultVerifier : public ResultVerifier {
   // Compute count(distinct x) over 'input'.
   void initialize(
       const std::vector<RowVectorPtr>& input,
+      const std::vector<core::ExprPtr>& projections,
       const std::vector<std::string>& groupingKeys,
       const core::AggregationNode::Aggregate& aggregate,
       const std::string& aggregateName) override {
     auto plan =
         PlanBuilder()
             .values(input)
+            .projectExpressions(projections)
             .singleAggregation(groupingKeys, {makeCountDistinctCall(aggregate)})
             .planNode();
 
@@ -63,6 +68,7 @@ class ApproxDistinctResultVerifier : public ResultVerifier {
   // Compute count_distinct(x) over 'input' over 'frame'.
   void initializeWindow(
       const std::vector<RowVectorPtr>& input,
+      const std::vector<core::ExprPtr>& projections,
       const std::vector<std::string>& partitionByKeys,
       const std::vector<SortingKeyAndOrder>& /*sortingKeysAndOrders*/,
       const core::WindowNode::Function& function,
@@ -70,6 +76,7 @@ class ApproxDistinctResultVerifier : public ResultVerifier {
       const std::string& windowName) override {
     auto plan = PlanBuilder()
                     .values(input)
+                    .projectExpressions(projections)
                     .window({makeCountDistinctWindowCall(function, frame)})
                     .planNode();
 
@@ -95,11 +102,21 @@ class ApproxDistinctResultVerifier : public ResultVerifier {
                               .values({expected_})
                               .appendColumns({"'expected' as label"})
                               .planNode();
-
-    auto actualSource = PlanBuilder(planNodeIdGenerator)
-                            .values({result})
-                            .appendColumns({"'actual' as label"})
-                            .planNode();
+    core::PlanNodePtr actualSource;
+    if (isApproxSet_) {
+      auto projectColumns =
+          makeProjectColumnsForApproxSet(asRowType(result->type())->names());
+      actualSource = PlanBuilder(planNodeIdGenerator)
+                         .values({result})
+                         .project(projectColumns)
+                         .appendColumns({"'actual' as label"})
+                         .planNode();
+    } else {
+      actualSource = PlanBuilder(planNodeIdGenerator)
+                         .values({result})
+                         .appendColumns({"'actual' as label"})
+                         .planNode();
+    }
 
     if (verifyWindow_) {
       return verifyWindow(
@@ -122,8 +139,18 @@ class ApproxDistinctResultVerifier : public ResultVerifier {
 
     std::vector<double> largeGaps;
     for (auto i = 0; i < numGroups; ++i) {
-      VELOX_CHECK(!actual->isNullAt(i))
-      VELOX_CHECK(!expected->isNullAt(i))
+      VELOX_CHECK(!expected->isNullAt(i));
+      // Different behavior between approx_distinct and approx_set.
+      // approx_set(null) returns 0, while cardinality(approx_set(null)) returns
+      // NULL.
+      if (isApproxSet_) {
+        if (actual->isNullAt(i)) {
+          VELOX_CHECK_EQ(expected->valueAt(i), 0);
+          continue;
+        }
+      } else {
+        VELOX_CHECK(!actual->isNullAt(i));
+      }
 
       const auto actualCnt = actual->valueAt(i);
       const auto expectedCnt = expected->valueAt(i);
@@ -158,7 +185,7 @@ class ApproxDistinctResultVerifier : public ResultVerifier {
       return largeGaps.size() <= 3;
     }
 
-    return largeGaps.empty();
+    return numGroups == 1 || largeGaps.empty();
   }
 
   // For approx_distinct in window operations, input sets for rows in the same
@@ -231,7 +258,7 @@ class ApproxDistinctResultVerifier : public ResultVerifier {
       return largeGaps.size() <= 0.05 * numGroups;
     }
 
-    return largeGaps.empty();
+    return numGroups == 1 || largeGaps.empty();
   }
 
   void reset() override {
@@ -260,10 +287,10 @@ class ApproxDistinctResultVerifier : public ResultVerifier {
   static std::string makeCountDistinctCall(
       const core::AggregationNode::Aggregate& aggregate) {
     const auto& args = aggregate.call->inputs();
-    VELOX_CHECK_GE(args.size(), 1)
+    VELOX_CHECK_GE(args.size(), 1);
 
     auto inputField = core::TypedExprs::asFieldAccess(args[0]);
-    VELOX_CHECK_NOT_NULL(inputField)
+    VELOX_CHECK_NOT_NULL(inputField);
 
     std::string countDistinctCall =
         fmt::format("count(distinct {})", inputField->name());
@@ -280,10 +307,10 @@ class ApproxDistinctResultVerifier : public ResultVerifier {
       const core::WindowNode::Function& function,
       const std::string& frame) {
     const auto& args = function.functionCall->inputs();
-    VELOX_CHECK_GE(args.size(), 1)
+    VELOX_CHECK_GE(args.size(), 1);
 
     auto inputField = core::TypedExprs::asFieldAccess(args[0]);
-    VELOX_CHECK_NOT_NULL(inputField)
+    VELOX_CHECK_NOT_NULL(inputField);
 
     std::string countDistinctCall =
         fmt::format("\"$internal$count_distinct\"({})", inputField->name());
@@ -296,10 +323,23 @@ class ApproxDistinctResultVerifier : public ResultVerifier {
     return countDistinctCall;
   }
 
+  std::vector<std::string> makeProjectColumnsForApproxSet(
+      const std::vector<std::string>& columnNames) const {
+    std::vector<std::string> projectColumns = columnNames;
+    for (auto& projectColumn : projectColumns) {
+      if (projectColumn == name_) {
+        projectColumn =
+            fmt::format("coalesce(cardinality({}), 0) as {}", name_, name_);
+      }
+    }
+    return projectColumns;
+  }
+
   RowVectorPtr expected_;
   std::vector<std::string> groupingKeys_;
   std::string name_;
   double error_;
+  bool isApproxSet_;
   bool verifyWindow_{false};
 };
 

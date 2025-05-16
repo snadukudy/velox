@@ -29,7 +29,7 @@ using namespace facebook::velox;
 
 int main(int argc, char** argv) {
   folly::Init init(&argc, &argv);
-  memory::MemoryManager::initialize({});
+  memory::MemoryManager::initialize(memory::MemoryManager::Options{});
   facebook::velox::functions::prestosql::registerAllScalarFunctions();
 
   ExpressionBenchmarkBuilder benchmarkBuilder;
@@ -37,9 +37,6 @@ int main(int argc, char** argv) {
   VectorFuzzer::Options options;
   options.vectorSize = 1'000;
   options.nullRatio = 0.01;
-
-  auto* pool = benchmarkBuilder.pool();
-  auto& vm = benchmarkBuilder.vectorMaker();
 
   // Compare regexp_replace with fixed and lambda replacement.
   benchmarkBuilder.addBenchmarkSet("lambda_one_group", ROW({"c0"}, {VARCHAR()}))

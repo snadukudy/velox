@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_library(
+velox_add_library(
   velox_aggregates
   ApproxDistinctAggregate.cpp
   ApproxMostFrequentAggregate.cpp
@@ -24,11 +24,11 @@ add_library(
   BitwiseXorAggregate.cpp
   BoolAggregates.cpp
   CentralMomentsAggregates.cpp
-  Compare.cpp
   CountAggregate.cpp
   CountIfAggregate.cpp
   CovarianceAggregates.cpp
   ChecksumAggregate.cpp
+  ClassificationAggregation.cpp
   EntropyAggregates.cpp
   GeometricMeanAggregate.cpp
   HistogramAggregate.cpp
@@ -36,18 +36,21 @@ add_library(
   MapUnionAggregate.cpp
   MapUnionSumAggregate.cpp
   MaxSizeForStatsAggregate.cpp
+  MergeAggregate.cpp
   MinMaxAggregates.cpp
-  MinMaxByAggregates.cpp
+  MaxByAggregate.cpp
+  MinByAggregate.cpp
   MultiMapAggAggregate.cpp
   PrestoHasher.cpp
   ReduceAgg.cpp
   RegisterAggregateFunctions.cpp
+  NoisyCountIfGaussianAggregate.cpp
   SetAggregates.cpp
   SumAggregate.cpp
   SumDataSizeForStatsAggregate.cpp
   VarianceAggregates.cpp)
 
-target_link_libraries(
+velox_link_libraries(
   velox_aggregates
   velox_common_hyperloglog
   velox_exec
@@ -56,6 +59,7 @@ target_link_libraries(
   velox_functions_aggregates
   velox_functions_lib
   velox_functions_util
+  velox_presto_types
   Folly::folly)
 
 if(${VELOX_BUILD_TESTING})

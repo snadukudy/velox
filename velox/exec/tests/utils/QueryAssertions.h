@@ -18,8 +18,8 @@
 
 #include "velox/common/testutil/TestValue.h"
 #include "velox/core/PlanNode.h"
+#include "velox/exec/Cursor.h"
 #include "velox/exec/Operator.h"
-#include "velox/exec/tests/utils/Cursor.h"
 #include "velox/vector/ComplexVector.h"
 
 #include <duckdb.hpp> // @manual
@@ -92,11 +92,13 @@ class DuckDbQueryRunner {
 /// 'abortPct' is 20 and 'maxInjections' is 10, continuous calls to
 /// testingMaybeTriggerAbort() will keep rolling the dice that has a chance of
 /// 20% triggering until 10 triggers have been invoked.
+/// 'hook' will be invoked whenever abort is triggered, if not nullptr.
 class TestScopedAbortInjection {
  public:
   explicit TestScopedAbortInjection(
       int32_t abortPct,
-      int32_t maxInjections = std::numeric_limits<int32_t>::max());
+      int32_t maxInjections = std::numeric_limits<int32_t>::max(),
+      std::function<void(Task*)> hook = nullptr);
 
   ~TestScopedAbortInjection();
 };
@@ -174,7 +176,13 @@ bool testingMaybeTriggerAbort(exec::Task* task);
 
 std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>> readCursor(
     const CursorParameters& params,
-    std::function<void(exec::Task*)> addSplits,
+    std::function<void(TaskCursor*)> addSplits =
+        [](TaskCursor* taskCursor) {
+          if (taskCursor->noMoreSplits()) {
+            return;
+          }
+          taskCursor->setNoMoreSplits();
+        },
     uint64_t maxWaitMicros = 5'000'000);
 
 /// The Task can return results before the Driver is finished executing.
@@ -213,12 +221,6 @@ bool waitForTaskStateChange(
 /// during this wait call. This is for testing purpose for now.
 void waitForAllTasksToBeDeleted(uint64_t maxWaitUs = 3'000'000);
 
-/// Similar to above test utility except waiting for a specific number of
-/// tasks to be deleted.
-void waitForAllTasksToBeDeleted(
-    uint64_t expectedDeletedTasks,
-    uint64_t maxWaitUs);
-
 std::shared_ptr<Task> assertQuery(
     const core::PlanNodePtr& plan,
     const std::string& duckDbSql,
@@ -227,20 +229,23 @@ std::shared_ptr<Task> assertQuery(
 
 std::shared_ptr<Task> assertQuery(
     const core::PlanNodePtr& plan,
-    std::function<void(exec::Task*)> addSplits,
+    std::function<void(exec::TaskCursor*)> addSplits,
     const std::string& duckDbSql,
     DuckDbQueryRunner& duckDbQueryRunner,
     std::optional<std::vector<uint32_t>> sortingKeys = std::nullopt);
 
 std::shared_ptr<Task> assertQuery(
     const CursorParameters& params,
-    std::function<void(exec::Task*)> addSplits,
+    std::function<void(exec::TaskCursor*)> addSplits,
     const std::string& duckDbSql,
     DuckDbQueryRunner& duckDbQueryRunner,
     std::optional<std::vector<uint32_t>> sortingKeys = std::nullopt);
 
 std::shared_ptr<Task> assertQueryReturnsEmptyResult(
     const core::PlanNodePtr& plan);
+
+std::shared_ptr<Task> assertQueryReturnsEmptyResult(
+    const CursorParameters& params);
 
 void assertEmptyResults(const std::vector<RowVectorPtr>& results);
 
@@ -287,7 +292,7 @@ velox::variant readSingleValue(
 /// floating-point column in each set. Verifying arbitrary result sets with
 /// epsilon comparison would require more advanced algorithms such as maximum
 /// bipartite matching. Hence we leave them as future work. Check out
-/// https://github.com/facebookincubator/velox/issues/3493 for more dicsussion.
+/// https://github.com/facebookincubator/velox/issues/3493 for more discussion.
 bool assertEqualResults(
     const std::vector<RowVectorPtr>& expected,
     const std::vector<RowVectorPtr>& actual);

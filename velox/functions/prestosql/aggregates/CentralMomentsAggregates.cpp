@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/functions/prestosql/aggregates/CentralMomentsAggregates.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/functions/lib/aggregates/CentralMomentsAggregatesBase.h"
 #include "velox/functions/prestosql/aggregates/AggregateNames.h"
@@ -103,7 +104,7 @@ exec::AggregateRegistrationResult registerCentralMoments(
               VELOX_UNSUPPORTED(
                   "Unsupported input type: {}. "
                   "Expected SMALLINT, INTEGER, BIGINT, DOUBLE or REAL.",
-                  inputType->toString())
+                  inputType->toString());
           }
         } else {
           checkAccumulatorRowType(

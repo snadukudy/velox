@@ -21,7 +21,7 @@ namespace facebook::velox {
 StreamArena::StreamArena(memory::MemoryPool* pool) : pool_(pool) {}
 
 void StreamArena::newRange(
-    int32_t bytes,
+    int64_t bytes,
     ByteRange* /*lastRange*/,
     ByteRange* range) {
   VELOX_CHECK_GT(bytes, 0, "StreamArena::newRange can't be zero length");
@@ -54,7 +54,7 @@ void StreamArena::newRange(
   }
   auto run = allocation_.runAt(currentRun_);
   range->buffer = run.data() + currentOffset_;
-  const int32_t availableBytes = run.numBytes() - currentOffset_;
+  const int64_t availableBytes = run.numBytes() - currentOffset_;
   range->size = std::min(bytes, availableBytes);
   range->position = 0;
   currentOffset_ += range->size;
@@ -65,17 +65,6 @@ void StreamArena::newRange(
   }
 }
 
-void StreamArena::newTinyRange(
-    int32_t bytes,
-    ByteRange* /*lastRange*/,
-    ByteRange* range) {
-  VELOX_CHECK_GT(bytes, 0, "StreamArena::newTinyRange can't be zero length");
-  tinyRanges_.emplace_back();
-  tinyRanges_.back().resize(bytes);
-  range->position = 0;
-  range->buffer = reinterpret_cast<uint8_t*>(tinyRanges_.back().data());
-  range->size = bytes;
-}
 void StreamArena::clear() {
   allocations_.clear();
   pool_->freeNonContiguous(allocation_);
@@ -83,7 +72,6 @@ void StreamArena::clear() {
   currentOffset_ = 0;
   largeAllocations_.clear();
   size_ = 0;
-  tinyRanges_.clear();
 }
 
 } // namespace facebook::velox

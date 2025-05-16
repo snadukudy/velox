@@ -125,10 +125,6 @@ class SequenceVector : public SimpleVector<T> {
     return sequenceValues_;
   }
 
-  VectorPtr& valueVector() override {
-    return sequenceValues_;
-  }
-
   BufferPtr getSequenceLengths() const {
     return sequenceLengths_;
   }
@@ -144,7 +140,7 @@ class SequenceVector : public SimpleVector<T> {
     return sequenceValues_->size();
   }
 
-  BufferPtr wrapInfo() const override {
+  const BufferPtr& wrapInfo() const override {
     return sequenceLengths_;
   }
 
@@ -198,12 +194,14 @@ class SequenceVector : public SimpleVector<T> {
     return false;
   }
 
-  VectorPtr copyPreserveEncodings() const override {
+  VectorPtr copyPreserveEncodings(
+      velox::memory::MemoryPool* pool = nullptr) const override {
+    auto selfPool = pool ? pool : BaseVector::pool_;
     return std::make_shared<SequenceVector<T>>(
-        BaseVector::pool_,
+        selfPool,
         BaseVector::length_,
         sequenceValues_->copyPreserveEncodings(),
-        AlignedBuffer::copy(BaseVector::pool_, sequenceLengths_),
+        AlignedBuffer::copy(selfPool, sequenceLengths_),
         SimpleVector<T>::stats_,
         BaseVector::distinctValueCount_,
         BaseVector::nullCount_,

@@ -21,6 +21,8 @@
 #include <limits>
 #include <sstream>
 
+#include "velox/common/base/SuccinctPrinter.h"
+
 namespace facebook::velox {
 
 struct RuntimeCounter {
@@ -59,10 +61,7 @@ struct RuntimeMetric {
 
   void merge(const RuntimeMetric& other);
 
-  std::string toString() const {
-    return fmt::format(
-        "sum:{}, count:{}, min:{}, max:{}", sum, count, min, max);
-  }
+  std::string toString() const;
 };
 
 /// Simple interface to implement writing of runtime stats to Velox Operator
@@ -113,7 +112,8 @@ class RuntimeStatWriterScopeGuard {
 } // namespace facebook::velox
 template <>
 struct fmt::formatter<facebook::velox::RuntimeCounter::Unit> : formatter<int> {
-  auto format(facebook::velox::RuntimeCounter::Unit s, format_context& ctx) {
+  auto format(facebook::velox::RuntimeCounter::Unit s, format_context& ctx)
+      const {
     return formatter<int>::format(static_cast<int>(s), ctx);
   }
 };

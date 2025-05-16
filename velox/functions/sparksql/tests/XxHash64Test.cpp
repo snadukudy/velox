@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/common/testutil/OptionalEmpty.h"
 #include "velox/functions/sparksql/tests/SparkFunctionBaseTest.h"
 
 #include <stdint.h>
@@ -41,15 +42,22 @@ class XxHash64Test : public SparkFunctionBaseTest {
       int unSelectedRows = 0) {
     // Generate 'size' flat vector to test SIMD code path.
     // We use same value in the vector to make comparing the results easier.
-    std::vector<T> inputData;
-    inputData.reserve(size);
     std::vector<int64_t> resultData;
     resultData.reserve(size);
     for (auto i = 0; i < size; ++i) {
-      inputData.emplace_back(value);
       resultData.emplace_back(expectedResult);
     }
-    auto input = makeFlatVector<T>(inputData);
+    VectorPtr input;
+    if constexpr (std::is_same_v<T, UnknownValue>) {
+      input = makeAllNullFlatVector<T>(size);
+    } else {
+      std::vector<T> inputData;
+      inputData.reserve(size);
+      for (auto i = 0; i < size; ++i) {
+        inputData.emplace_back(value);
+      }
+      input = makeFlatVector<T>(inputData);
+    }
     SelectivityVector rows(size);
     rows.setValidRange(0, unSelectedRows, false);
     auto result =
@@ -237,7 +245,9 @@ TEST_F(XxHash64Test, map) {
       xxhash64(mapOfArrays));
 
   auto mapWithNullArrays = createMapOfArraysVector<int64_t, int64_t>(
-      {{{1, std::nullopt}}, {{2, {{4, 5, std::nullopt}}}}, {{3, {{}}}}});
+      {{{1, std::nullopt}},
+       {{2, {{4, 5, std::nullopt}}}},
+       {{3, common::testutil::optionalEmpty}}});
   assertEqualVectors(
       makeFlatVector<int64_t>(
           {-7001672635703045582, 7217681953522744649, 3188756510806108107}),
@@ -267,6 +277,36 @@ TEST_F(XxHash64Test, row) {
 
   row->setNull(1, true);
   assertEqualVectors(makeFlatVector<int64_t>({42, 42}), xxhash64(row));
+}
+
+TEST_F(XxHash64Test, unknown) {
+  assertEqualVectors(
+      makeFlatVector<int64_t>({42, 42, 42}),
+      xxhash64(makeAllNullFlatVector<UnknownValue>(3)));
+
+  assertEqualVectors(
+      makeFlatVector<int64_t>({42, 42}),
+      xxhash64(makeNullableArrayVector<UnknownValue>({
+          {std::nullopt, std::nullopt},
+          {std::nullopt, std::nullopt, std::nullopt},
+      })));
+
+  auto mapVector = makeNullableMapVector<UnknownValue, UnknownValue>({
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+  });
+  assertEqualVectors(
+      makeFlatVector<int64_t>({42, 42, 42}), xxhash64(mapVector));
+
+  auto row = makeRowVector({
+      makeFlatVector<int64_t>({1, 3, 4}),
+      makeAllNullFlatVector<UnknownValue>(3),
+  });
+  assertEqualVectors(
+      makeFlatVector<int64_t>(
+          {-7001672635703045582, 3188756510806108107, 404280023041566627}),
+      xxhash64(row));
 }
 
 TEST_F(XxHash64Test, hashSeed) {
@@ -322,6 +362,7 @@ TEST_F(XxHash64Test, simd) {
   runSIMDHashAndAssert<int64_t>(-1, 3858142552250413010, 1024, 1023);
   runSIMDHashAndAssert<int64_t>(-1, 3858142552250413010, 1024, 512);
   runSIMDHashAndAssert<int64_t>(-1, 3858142552250413010, 1024, 3);
+  runSIMDHashAndAssert<UnknownValue>(UnknownValue(), 42, 10);
 }
 
 } // namespace

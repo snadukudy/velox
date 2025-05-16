@@ -18,7 +18,7 @@
 #include <folly/container/F14Set.h>
 
 #include <velox/type/Filter.h>
-#include "velox/common/base/RawVector.h"
+#include "velox/common/memory/RawVector.h"
 #include "velox/exec/Operator.h"
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/VectorTypeUtils.h"
@@ -457,7 +457,7 @@ class VectorHasher {
     }
 
     bool inRange = true;
-    rows.template testSelected([&](vector_size_t row) {
+    rows.testSelected([&](vector_size_t row) {
       auto int64Value = toInt64(values[row]);
       if (int64Value > max_ || int64Value < min_) {
         inRange = false;
@@ -540,7 +540,7 @@ class VectorHasher {
     return *reinterpret_cast<const T*>(group + offset);
   }
 
-  template <TypeKind Kind>
+  template <bool typeProvidesCustomComparison, TypeKind Kind>
   void hashValues(const SelectivityVector& rows, bool mix, uint64_t* result);
 
   const column_index_t channel_;
@@ -671,7 +671,7 @@ inline bool VectorHasher::tryMapToRange(
     const bool* values,
     const SelectivityVector& rows,
     uint64_t* result) {
-  rows.template applyToSelected([&](vector_size_t row) {
+  rows.applyToSelected([&](vector_size_t row) {
     auto hash = valueId(values[row]);
     result[row] = multiplier_ == 1 ? hash : result[row] + multiplier_ * hash;
   });
@@ -708,6 +708,10 @@ bool VectorHasher::makeValueIdsDecoded<bool, false>(
 std::vector<std::unique_ptr<VectorHasher>> createVectorHashers(
     const RowTypePtr& rowType,
     const std::vector<core::FieldAccessTypedExprPtr>& keys);
+
+std::vector<std::unique_ptr<VectorHasher>> createVectorHashers(
+    const RowTypePtr& rowType,
+    const std::vector<column_index_t>& keyChannels);
 
 } // namespace facebook::velox::exec
 

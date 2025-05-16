@@ -31,19 +31,27 @@ SelectiveDecimalColumnReader<DataT>::SelectiveDecimalColumnReader(
   } else {
     scale_ = requestedType_->asLongDecimal().scale();
   }
-  version_ = convertRleVersion(stripe.getEncoding(encodingKey).kind());
-  auto data = encodingKey.forKind(proto::Stream_Kind_DATA);
+  version_ = convertRleVersion(stripe, encodingKey);
+  auto data = StripeStreamsUtil::getStreamForKind(
+      stripe,
+      encodingKey,
+      proto::Stream_Kind_DATA,
+      proto::orc::Stream_Kind_DATA);
   valueDecoder_ = createDirectDecoder</*isSigned*/ true>(
       stripe.getStream(data, params.streamLabels().label(), true),
       stripe.getUseVInts(data),
       sizeof(DataT));
 
   // [NOTICE] DWRF's NANO_DATA has the same enum value as ORC's SECONDARY
-  auto secondary = encodingKey.forKind(proto::Stream_Kind_NANO_DATA);
+  auto secondary = StripeStreamsUtil::getStreamForKind(
+      stripe,
+      encodingKey,
+      proto::Stream_Kind_NANO_DATA,
+      proto::orc::Stream_Kind_SECONDARY);
   scaleDecoder_ = createRleDecoder</*isSigned*/ true>(
       stripe.getStream(secondary, params.streamLabels().label(), true),
       version_,
-      memoryPool_,
+      *memoryPool_,
       stripe.getUseVInts(secondary),
       LONG_BYTE_SIZE);
 }
@@ -57,7 +65,7 @@ uint64_t SelectiveDecimalColumnReader<DataT>::skip(uint64_t numValues) {
 }
 
 template <typename DataT>
-void SelectiveDecimalColumnReader<DataT>::seekToRowGroup(uint32_t index) {
+void SelectiveDecimalColumnReader<DataT>::seekToRowGroup(int64_t index) {
   SelectiveColumnReader::seekToRowGroup(index);
   auto positionsProvider = formatData_->seekToRowGroup(index);
   valueDecoder_->seekToRowGroup(positionsProvider);
@@ -86,7 +94,7 @@ void SelectiveDecimalColumnReader<DataT>::readHelper(RowSet rows) {
   }
 
   // copy scales into scaleBuffer_
-  ensureCapacity<int64_t>(scaleBuffer_, numValues_, &memoryPool_);
+  ensureCapacity<int64_t>(scaleBuffer_, numValues_, memoryPool_);
   scaleBuffer_->setSize(numValues_ * sizeof(int64_t));
   memcpy(
       scaleBuffer_->asMutable<char>(),
@@ -108,10 +116,11 @@ void SelectiveDecimalColumnReader<DataT>::readHelper(RowSet rows) {
 
 template <typename DataT>
 void SelectiveDecimalColumnReader<DataT>::read(
-    vector_size_t offset,
-    RowSet rows,
+    int64_t offset,
+    const RowSet& rows,
     const uint64_t* incomingNulls) {
   VELOX_CHECK(!scanSpec_->filter());
+  VELOX_CHECK(!scanSpec_->valueHook());
   prepareRead<int64_t>(offset, rows, incomingNulls);
   bool isDense = rows.back() == rows.size() - 1;
   if (isDense) {
@@ -123,7 +132,7 @@ void SelectiveDecimalColumnReader<DataT>::read(
 
 template <typename DataT>
 void SelectiveDecimalColumnReader<DataT>::getValues(
-    RowSet rows,
+    const RowSet& rows,
     VectorPtr* result) {
   auto nullsPtr =
       resultNulls() ? resultNulls()->template as<uint64_t>() : nullptr;

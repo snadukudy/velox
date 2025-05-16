@@ -154,7 +154,7 @@ class ArrayWriterBenchmark : public functions::test::FunctionBenchmarkBase {
   }
 
   vector_size_t size = 1'000;
-  size_t totalItemsCount = (size) * (size + 1) / 2;
+  size_t totalItemsCount = static_cast<size_t>((size) * (size + 1) / 2);
 
   auto makeInput() {
     std::vector<int64_t> inputData(size, 0);
@@ -276,7 +276,8 @@ BENCHMARK_MULTI(std_reference) {
 
 int main(int argc, char** argv) {
   folly::Init init{&argc, &argv};
-  facebook::velox::memory::MemoryManager::initialize({});
+  facebook::velox::memory::MemoryManager::initialize(
+      facebook::velox::memory::MemoryManager::Options{});
 
   facebook::velox::exec::ArrayWriterBenchmark benchmark;
   benchmark.test();

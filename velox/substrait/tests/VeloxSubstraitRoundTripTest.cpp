@@ -28,6 +28,7 @@
 
 using namespace facebook::velox;
 using namespace facebook::velox::test;
+using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
 using namespace facebook::velox::substrait;
 
@@ -78,8 +79,7 @@ class VeloxSubstraitRoundTripTest : public OperatorTestBase {
       const std::string& expectedErrorMessage) {
     CursorParameters params;
     params.planNode = plan;
-    VELOX_ASSERT_THROW(
-        readCursor(params, [](auto /*task*/) {}), expectedErrorMessage);
+    VELOX_ASSERT_THROW(readCursor(params), expectedErrorMessage);
 
     // Convert Velox Plan to Substrait Plan.
     google::protobuf::Arena arena;
@@ -90,8 +90,7 @@ class VeloxSubstraitRoundTripTest : public OperatorTestBase {
 
     // Assert velox again.
     params.planNode = samePlan;
-    VELOX_ASSERT_THROW(
-        readCursor(params, [](auto /*task*/) {}), expectedErrorMessage);
+    VELOX_ASSERT_THROW(readCursor(params), expectedErrorMessage);
   }
 
   std::shared_ptr<VeloxToSubstraitPlanConvertor> veloxConvertor_ =

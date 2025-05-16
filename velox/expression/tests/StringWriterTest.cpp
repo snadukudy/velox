@@ -18,6 +18,7 @@
 #include <glog/logging.h>
 #include "folly/Range.h"
 #include "gtest/gtest.h"
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/expression/VectorWriters.h"
 #include "velox/functions/prestosql/tests/utils/FunctionBaseTest.h"
 
@@ -28,7 +29,7 @@ class StringWriterTest : public functions::test::FunctionBaseTest {};
 
 TEST_F(StringWriterTest, append) {
   auto vector = makeFlatVector<StringView>(2);
-  auto writer = exec::StringWriter<>(vector.get(), 0);
+  auto writer = exec::StringWriter(vector.get(), 0);
   writer.append("1 "_sv);
   writer.append(std::string_view("2 "));
   writer.append("3 "_sv);
@@ -42,7 +43,7 @@ TEST_F(StringWriterTest, append) {
 
 TEST_F(StringWriterTest, plusOperator) {
   auto vector = makeFlatVector<StringView>(1);
-  auto writer = exec::StringWriter<>(vector.get(), 0);
+  auto writer = exec::StringWriter(vector.get(), 0);
   writer += "1 "_sv;
   writer += "2 ";
   writer += std::string_view("3 ");
@@ -57,19 +58,19 @@ TEST_F(StringWriterTest, plusOperator) {
 TEST_F(StringWriterTest, assignment) {
   auto vector = makeFlatVector<StringView>(4);
 
-  auto writer0 = exec::StringWriter<>(vector.get(), 0);
+  auto writer0 = exec::StringWriter(vector.get(), 0);
   writer0 = "string0"_sv;
   writer0.finalize();
 
-  auto writer1 = exec::StringWriter<>(vector.get(), 1);
+  auto writer1 = exec::StringWriter(vector.get(), 1);
   writer1 = std::string("string1");
   writer1.finalize();
 
-  auto writer2 = exec::StringWriter<>(vector.get(), 2);
+  auto writer2 = exec::StringWriter(vector.get(), 2);
   writer2 = std::string_view("string2");
   writer2.finalize();
 
-  auto writer3 = exec::StringWriter<>(vector.get(), 3);
+  auto writer3 = exec::StringWriter(vector.get(), 3);
   writer3 = folly::StringPiece("string3");
   writer3.finalize();
 
@@ -81,7 +82,7 @@ TEST_F(StringWriterTest, assignment) {
 
 TEST_F(StringWriterTest, copyFromStringView) {
   auto vector = makeFlatVector<StringView>(1);
-  auto writer = exec::StringWriter<>(vector.get(), 0);
+  auto writer = exec::StringWriter(vector.get(), 0);
   writer.copy_from("1 2 3 4 5 "_sv);
   writer.finalize();
 
@@ -90,7 +91,7 @@ TEST_F(StringWriterTest, copyFromStringView) {
 
 TEST_F(StringWriterTest, copyFromStdString) {
   auto vector = makeFlatVector<StringView>(1);
-  auto writer = exec::StringWriter<>(vector.get(), 0);
+  auto writer = exec::StringWriter(vector.get(), 0);
   writer.copy_from(std::string("1 2 3 4 5 "));
   writer.finalize();
 
@@ -99,11 +100,20 @@ TEST_F(StringWriterTest, copyFromStdString) {
 
 TEST_F(StringWriterTest, copyFromCString) {
   auto vector = makeFlatVector<StringView>(4);
-  auto writer = exec::StringWriter<>(vector.get(), 0);
+  auto writer = exec::StringWriter(vector.get(), 0);
   writer.copy_from("1 2 3 4 5 ");
   writer.finalize();
 
   ASSERT_EQ(vector->valueAt(0), "1 2 3 4 5 "_sv);
+}
+
+TEST_F(StringWriterTest, CheckSizeLimit) {
+  auto vector = makeFlatVector<StringView>(4);
+  auto writer = exec::StringWriter(vector.get(), 0);
+
+  size_t limit = (size_t)INT32_MAX + 1;
+  writer.resize(limit);
+  VELOX_ASSERT_THROW(writer.finalize(), "(2147483648 vs. 2147483647)");
 }
 
 TEST_F(StringWriterTest, vectorWriter) {

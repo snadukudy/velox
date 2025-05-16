@@ -18,20 +18,19 @@
 #include <random>
 #include "velox/common/base/SpillConfig.h"
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/memory/tests/SharedArbitratorTestUtil.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/dwio/common/Options.h"
 #include "velox/dwio/common/Statistics.h"
-#include "velox/dwio/common/TypeWithId.h"
 #include "velox/dwio/common/encryption/TestProvider.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/dwio/common/tests/utils/MapBuilder.h"
 #include "velox/dwio/dwrf/common/Config.h"
+#include "velox/dwio/dwrf/reader/ColumnReader.h"
 #include "velox/dwio/dwrf/reader/DwrfReader.h"
 #include "velox/dwio/dwrf/test/OrcTest.h"
 #include "velox/dwio/dwrf/test/utils/E2EWriterTestUtil.h"
-#include "velox/dwio/dwrf/writer/Writer.h"
 #include "velox/type/fbhive/HiveTypeParser.h"
-#include "velox/vector/FlatVector.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 #include "velox/vector/tests/utils/VectorMaker.h"
 
@@ -54,7 +53,7 @@ class E2EWriterTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
     TestValue::enable();
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   E2EWriterTest() {
@@ -62,7 +61,7 @@ class E2EWriterTest : public testing::Test {
     leafPool_ = rootPool_->addLeafChild("leaf");
   }
 
-  std::unique_ptr<dwrf::DwrfReader> createReader(
+  static std::unique_ptr<dwrf::DwrfReader> createReader(
       const MemorySink& sink,
       const dwio::common::ReaderOptions& opts) {
     std::string_view data(sink.data(), sink.size());
@@ -114,8 +113,8 @@ class E2EWriterTest : public testing::Test {
     for (int32_t i = 0; i < reader->getNumberOfStripes(); ++i) {
       auto stripeMetadata = dwrfRowReader->fetchStripe(i, preload);
       auto& footer = *stripeMetadata->footer;
-      for (int32_t j = 0; j < footer.encoding_size(); ++j) {
-        auto encoding = footer.encoding(j);
+      for (int32_t j = 0; j < footer.columnEncodingSize(); ++j) {
+        auto encoding = footer.columnEncodingDwrf(j);
         if (encoding.kind() ==
             dwrf::proto::ColumnEncoding_Kind::ColumnEncoding_Kind_MAP_FLAT) {
           actualNodeIds.insert(encoding.node());
@@ -576,8 +575,8 @@ TEST_F(E2EWriterTest, PresentStreamIsSuppressedOnFlatMap) {
   for (int i = 0; i < reader->getNumberOfStripes(); ++i) {
     auto stripeMetadata = dwrfRowReader->fetchStripe(i, preload);
     auto& footer = *stripeMetadata->footer;
-    for (int j = 0; j < footer.streams_size(); ++j) {
-      auto stream = footer.streams(j);
+    for (int j = 0; j < footer.streamsSize(); ++j) {
+      auto stream = footer.streamDwrf(j);
       ASSERT_NE(stream.kind(), dwrf::proto::Stream_Kind::Stream_Kind_PRESENT);
     }
   }
@@ -606,7 +605,7 @@ TEST_F(E2EWriterTest, TooManyFlatMapKeys) {
   config->set(dwrf::Config::MAP_FLAT_COLS, {0});
   config->set(dwrf::Config::MAP_FLAT_MAX_KEYS, keyLimit);
 
-  EXPECT_THROW(
+  VELOX_ASSERT_THROW(
       dwrf::E2EWriterTestUtil::testWriter(
           *pool,
           type,
@@ -614,7 +613,7 @@ TEST_F(E2EWriterTest, TooManyFlatMapKeys) {
           1,
           1,
           config),
-      exception::LoggedException);
+      "");
 }
 
 TEST_F(E2EWriterTest, FlatMapBackfill) {
@@ -846,8 +845,7 @@ TEST_F(E2EWriterTest, FlatMapConfigNotMapColumn) {
       "map_val:map<bigint,double>,"
       ">");
 
-  EXPECT_THROW(
-      { testFlatMapConfig(type, {0}, {}); }, exception::LoggedException);
+  VELOX_ASSERT_THROW(testFlatMapConfig(type, {0}, {}), "");
 }
 
 TEST_F(E2EWriterTest, mapStatsSingleStride) {
@@ -1146,7 +1144,7 @@ class E2EEncryptionTest : public E2EWriterTest {
 
   const DecryptionHandler& getDecryptionHandler(
       const ::facebook::velox::dwrf::DwrfReader& reader) const {
-    return reader.testingReaderBase()->getDecryptionHandler();
+    return reader.testingReaderBase()->decryptionHandler();
   }
 
   void validateFileContent(
@@ -1229,9 +1227,9 @@ TEST_F(E2EEncryptionTest, EncryptRoot) {
   for (int32_t i = 0; i < reader->getNumberOfStripes(); ++i) {
     auto stripeMetadata = dwrfRowReader->fetchStripe(i, preload);
     auto& sf = *stripeMetadata->footer;
-    ASSERT_EQ(sf.encoding_size(), 0);
-    ASSERT_EQ(sf.streams_size(), 0);
-    ASSERT_EQ(sf.encryptiongroups_size(), 1);
+    ASSERT_EQ(sf.columnEncodingSize(), 0);
+    ASSERT_EQ(sf.streamsSize(), 0);
+    ASSERT_EQ(sf.encryptiongroupsSize(), 1);
   }
 
   validateFileContent(*reader);
@@ -1310,10 +1308,10 @@ TEST_F(E2EEncryptionTest, EncryptSelectedFields) {
   for (int32_t i = 0; i < reader->getNumberOfStripes(); ++i) {
     auto stripeMetadata = dwrfRowReader->fetchStripe(i, preload);
     auto& sf = *stripeMetadata->footer;
-    for (auto& enc : sf.encoding()) {
+    for (const auto& enc : sf.columnEncodingsDwrf()) {
       ASSERT_TRUE(encryptedNodes.find(enc.node()) == encryptedNodes.end());
     }
-    for (auto& stream : sf.streams()) {
+    for (const auto& stream : sf.streamsDwrf()) {
       ASSERT_TRUE(encryptedNodes.find(stream.node()) == encryptedNodes.end());
     }
   }
@@ -1367,8 +1365,7 @@ TEST_F(E2EEncryptionTest, ReadWithoutKey) {
     RowReaderOptions rowReaderOpts;
     rowReaderOpts.select(
         std::make_shared<ColumnSelector>(type, std::vector<uint64_t>{1}));
-    ASSERT_THROW(
-        reader->createRowReader(rowReaderOpts), exception::LoggedException);
+    VELOX_ASSERT_THROW(reader->createRowReader(rowReaderOpts), "");
   }
 }
 
@@ -1735,7 +1732,10 @@ DEBUG_ONLY_TEST_F(E2EWriterTest, memoryReclaimOnWrite) {
     const auto oldCapacity = writerPool->capacity();
     const auto oldReservedBytes = writerPool->reservedBytes();
     const auto oldUsedBytes = writerPool->usedBytes();
-    writerPool->reclaim(1L << 30, 0, stats);
+    {
+      memory::ScopedMemoryArbitrationContext arbitrationCtx(writerPool.get());
+      writerPool->reclaim(1L << 30, 0, stats);
+    }
     ASSERT_EQ(stats.numNonReclaimableAttempts, 0);
     // We don't expect the capacity change by memory reclaim but only the used
     // or reserved memory change.
@@ -1771,8 +1771,11 @@ DEBUG_ONLY_TEST_F(E2EWriterTest, memoryReclaimOnWrite) {
       ASSERT_EQ(stats.numNonReclaimableAttempts, 1);
       writer->testingNonReclaimableSection() = false;
       stats.numNonReclaimableAttempts = 0;
-      const auto reclaimedBytes = writerPool->reclaim(1L << 30, 0, stats);
-      ASSERT_GT(reclaimedBytes, 0);
+      {
+        memory::ScopedMemoryArbitrationContext arbitrationCtx(writerPool.get());
+        const auto reclaimedBytes = writerPool->reclaim(1L << 30, 0, stats);
+        ASSERT_GT(reclaimedBytes, 0);
+      }
       ASSERT_EQ(stats.numNonReclaimableAttempts, 0);
       ASSERT_GT(stats.reclaimedBytes, 0);
       ASSERT_GT(stats.reclaimExecTimeUs, 0);
@@ -1955,7 +1958,6 @@ TEST_F(E2EWriterTest, memoryReclaimAfterClose) {
     VELOX_ASSERT_THROW(writer->flush(), "Writer is not running");
 
     memory::MemoryReclaimer::Stats stats;
-    const auto oldCapacity = writerPool->capacity();
     writerPool->reclaim(1L << 30, 0, stats);
     if (testData.abort || !testData.canReclaim) {
       ASSERT_EQ(stats.numNonReclaimableAttempts, 0);
@@ -2046,8 +2048,8 @@ DEBUG_ONLY_TEST_F(E2EWriterTest, memoryReclaimThreshold) {
   SCOPED_TESTVALUE_SET(
       "facebook::velox::dwrf::Writer::MemoryReclaimer::reclaimableBytes",
       std::function<void(dwrf::Writer*)>([&](dwrf::Writer* writer) {
-        // Release before reclaim to make it not able to reclaim from reserved
-        // memory.
+        // Release before reclaim to make it not able to reclaim from
+        // reserved memory.
         writer->getContext().releaseMemoryReservation();
       }));
   const auto type = ROW(
@@ -2110,14 +2112,20 @@ DEBUG_ONLY_TEST_F(E2EWriterTest, memoryReclaimThreshold) {
       ASSERT_TRUE(writerPool->reclaimer()->reclaimableBytes(
           *writerPool, reclaimableBytes));
       ASSERT_GT(reclaimableBytes, 0);
-      ASSERT_GT(writerPool->reclaim(1L << 30, 0, stats), 0);
+      {
+        memory::ScopedMemoryArbitrationContext arbitrationCtx(writerPool.get());
+        ASSERT_GT(writerPool->reclaim(1L << 30, 0, stats), 0);
+      }
       ASSERT_GT(stats.reclaimExecTimeUs, 0);
       ASSERT_GT(stats.reclaimedBytes, 0);
     } else {
       ASSERT_FALSE(writerPool->reclaimer()->reclaimableBytes(
           *writerPool, reclaimableBytes));
       ASSERT_EQ(reclaimableBytes, 0);
-      ASSERT_EQ(writerPool->reclaim(1L << 30, 0, stats), 0);
+      {
+        memory::ScopedMemoryArbitrationContext arbitrationCtx(writerPool.get());
+        ASSERT_EQ(writerPool->reclaim(1L << 30, 0, stats), 0);
+      }
       ASSERT_EQ(stats.numNonReclaimableAttempts, 0);
       ASSERT_EQ(stats.reclaimExecTimeUs, 0);
       ASSERT_EQ(stats.reclaimedBytes, 0);

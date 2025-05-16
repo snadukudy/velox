@@ -101,7 +101,7 @@ void HashStringAllocator::clear() {
     new (&state_.freeLists()[i]) CompactDoubleList();
   }
 
-#ifdef NDEBUG
+#ifndef NDEBUG
   static const auto kHugePageSize = memory::AllocationTraits::kHugePageSize;
   for (auto i = 0; i < state_.pool().numRanges(); ++i) {
     const auto range = state_.pool().rangeAt(i);
@@ -163,31 +163,6 @@ void HashStringAllocator::freeToPool(void* ptr, size_t size) {
   state_.sizeFromPool() -= size;
   state_.currentBytes() -= size;
   pool()->free(ptr, size);
-}
-
-// static
-ByteInputStream HashStringAllocator::prepareRead(
-    const Header* begin,
-    size_t maxBytes) {
-  std::vector<ByteRange> ranges;
-  auto* header = const_cast<Header*>(begin);
-
-  size_t totalBytes{0};
-  for (;;) {
-    ranges.push_back(ByteRange{
-        reinterpret_cast<uint8_t*>(header->begin()), header->usableSize(), 0});
-    totalBytes += ranges.back().size;
-    if (!header->isContinued()) {
-      break;
-    }
-
-    if (totalBytes >= maxBytes) {
-      break;
-    }
-
-    header = header->nextContinued();
-  }
-  return ByteInputStream(std::move(ranges));
 }
 
 HashStringAllocator::Position HashStringAllocator::newWrite(
@@ -271,8 +246,8 @@ HashStringAllocator::finishWrite(
   // and the block was extended. Calculate the new position.
   if (state_.startPosition().header->isContinued()) {
     auto* header = state_.startPosition().header;
-    const auto offset = state_.startPosition().offset();
-    const auto extra = offset - header->usableSize();
+    const auto offset_2 = state_.startPosition().offset();
+    const auto extra = offset_2 - header->usableSize();
     if (extra > 0) {
       auto* newHeader = header->nextContinued();
       auto* newPosition = newHeader->begin() + extra;
@@ -308,7 +283,7 @@ void HashStringAllocator::newSlab() {
 }
 
 void HashStringAllocator::newRange(
-    int32_t bytes,
+    int64_t bytes,
     ByteRange* lastRange,
     ByteRange* range,
     bool contiguous) {
@@ -341,7 +316,7 @@ void HashStringAllocator::newRange(
 }
 
 void HashStringAllocator::newRange(
-    int32_t bytes,
+    int64_t bytes,
     ByteRange* lastRange,
     ByteRange* range) {
   newRange(bytes, lastRange, range, false);
@@ -363,9 +338,9 @@ StringView HashStringAllocator::contiguousString(
     return view;
   }
 
-  auto stream = prepareRead(headerOf(view.data()));
+  InputStream stream(headerOf(view.data()));
   storage.resize(view.size());
-  stream.readBytes(storage.data(), view.size());
+  stream.ByteInputStream::readBytes(storage.data(), view.size());
   return StringView(storage);
 }
 
@@ -396,7 +371,7 @@ void HashStringAllocator::removeFromFreeList(Header* header) {
 }
 
 HashStringAllocator::Header* HashStringAllocator::allocate(
-    int32_t size,
+    int64_t size,
     bool exactSize) {
   if (size > kMaxAlloc && exactSize) {
     VELOX_CHECK_LE(size, Header::kSizeMask);
@@ -793,10 +768,4 @@ int64_t HashStringAllocator::checkConsistency() const {
 bool HashStringAllocator::isEmpty() const {
   return state_.sizeFromPool() == 0 && checkConsistency() == 0;
 }
-
-void HashStringAllocator::checkEmpty() const {
-  VELOX_CHECK_EQ(0, state_.sizeFromPool());
-  VELOX_CHECK_EQ(0, checkConsistency());
-}
-
 } // namespace facebook::velox

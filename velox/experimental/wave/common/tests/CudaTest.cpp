@@ -73,6 +73,11 @@ DEFINE_string(mode, "all", "Mode for reduce test memory transfers.");
 
 DEFINE_bool(enable_bm, false, "Enable custom and long running tests");
 
+DEFINE_int32(
+    num_random_ints,
+    16 << 20,
+    "Number of random integers for add random tests");
+
 DEFINE_string(
     roundtrip_ops,
     "",
@@ -578,6 +583,7 @@ class RoundtripThread {
     kAddBranch,
     kAddFuncStore,
     kAddSwitch,
+    kAddMultiStream,
     kAddRandom,
     kAddRandomEmptyWarps,
     kAddRandomEmptyThreads,
@@ -692,6 +698,26 @@ class RoundtripThread {
             stats.numAdds += op.param1 * op.param2 * 256;
             break;
 
+          case OpCode::kAddMultiStream:
+            VELOX_CHECK_LE(op.param1, kNumKB);
+            if (stats.isCpu) {
+              addOneCpu(op.param1 * 256, op.param2);
+            } else {
+              auto [numStreams, numPerStream] = ensureStreams(op.param1);
+              for (int32_t i = 0; i < numStreams; i++) {
+                streams_[i]->addOne(
+                    deviceBuffer_->as<int32_t>() + i * numPerStream,
+                    op.param1 * 256 / numStreams,
+                    op.param2,
+                    op.param3);
+                events_[i]->record(*streams_[i]);
+                events_[i]->wait(*stream_);
+              }
+              stream_->wait();
+            }
+            stats.numAdds += op.param1 * op.param2 * 256;
+            break;
+
           case OpCode::kAddFuncStore:
             VELOX_CHECK_LE(op.param1, kNumKB);
             if (stats.isCpu) {
@@ -720,6 +746,7 @@ class RoundtripThread {
             stats.numAdds += op.param1 * op.param2 * 256;
             break;
 
+#ifndef VELOX_SKIP_WAVE_BRANCH_KERNEL_TEST
           case OpCode::kAddBranch:
             VELOX_CHECK_LE(op.param1, kNumKB);
             if (stats.isCpu) {
@@ -733,6 +760,7 @@ class RoundtripThread {
             }
             stats.numAdds += op.param1 * op.param2 * 256;
             break;
+#endif // !VELOX_SKIP_WAVE_BRANCH_KERNEL_TEST
 
           case OpCode::kAdd4x64:
             VELOX_CHECK_LE(op.param1, kNumKB);
@@ -884,6 +912,9 @@ class RoundtripThread {
           } else if (str[position] == 'w') {
             op.opCode = OpCode::kAddSwitch;
             ++position;
+          } else if (str[position] == 'm') {
+            op.opCode = OpCode::kAddMultiStream;
+            ++position;
           }
           op.param1 = parseInt(str, position, 1);
           op.param2 = parseInt(str, position, 1);
@@ -987,6 +1018,21 @@ class RoundtripThread {
     return result;
   }
 
+  // Returns number of streams, number of items per stream for multi-stream
+  // execution over 'kb' KB of input. Ensures enough streams and events in
+  // 'streams_' and 'events_'. Take min 4KB per TB.
+  std::pair<int32_t, int32_t> ensureStreams(int32_t kb) {
+    VELOX_CHECK_EQ(kb & 3, 0);
+    int32_t numStreams = kb / 4;
+    if (streams_.size() < numStreams) {
+      for (auto i = streams_.size(); i < numStreams; ++i) {
+        streams_.push_back(std::make_unique<TestStream>());
+        events_.push_back(std::make_unique<Event>());
+      }
+    }
+    return {numStreams, kb / numStreams / 256};
+  }
+
   ArenaSet* const arenas_;
   Device* device_{nullptr};
   WaveBufferPtr deviceBuffer_;
@@ -996,6 +1042,10 @@ class RoundtripThread {
   std::unique_ptr<int32_t[]> hostInts_;
   std::unique_ptr<TestStream> stream_;
   std::unique_ptr<Event> event_;
+
+  std::vector<std::unique_ptr<TestStream>> streams_;
+  std::vector<std::unique_ptr<Event>> events_;
+
   int32_t serial_{0};
   static inline std::atomic<int32_t> serialCounter_{0};
 };
@@ -1022,7 +1072,7 @@ class CudaTest : public testing::Test {
       return;
     }
     inited = true;
-    memory::MemoryManagerOptions options;
+    memory::MemoryManager::Options options;
     options.useMmapAllocator = true;
     options.allocatorCapacity = capacity;
     memory::MemoryManager::initialize(options);
@@ -1464,7 +1514,7 @@ TEST_F(CudaTest, reduceMatrix) {
     return;
   }
 
-  std::vector<std::string> modes = {/*"unified", "device",*/ "devicecoalesced"};
+  std::vector<std::string> modes = {"unified", "device", "devicecoalesced"};
   std::vector<int32_t> batchMBValues = {30, 100};
   std::vector<int32_t> numThreadsValues = {1, 2, 3};
   std::vector<int32_t> workPerThreadValues = {2, 4};
@@ -1590,34 +1640,34 @@ TEST_F(CudaTest, roundtripMatrix) {
 }
 
 TEST_F(CudaTest, addRandom) {
-  constexpr int32_t kNumInts = 16 << 20;
+  int32_t numInts = FLAGS_num_random_ints;
   auto arenas = getArenas();
   auto stream = std::make_unique<TestStream>();
-  auto indices = arenas->unified->allocate<int32_t>(kNumInts);
-  auto sourceBuffer = arenas->unified->allocate<int32_t>(kNumInts);
+  auto indices = arenas->unified->allocate<int32_t>(numInts);
+  auto sourceBuffer = arenas->unified->allocate<int32_t>(numInts);
   auto rawIndices = indices->as<int32_t>();
-  for (auto i = 0; i < kNumInts; ++i) {
+  for (auto i = 0; i < numInts; ++i) {
     rawIndices[i] = i + 1;
   }
   stream->prefetch(getDevice(), rawIndices, indices->capacity());
-  auto ints1 = arenas->unified->allocate<int32_t>(kNumInts);
+  auto ints1 = arenas->unified->allocate<int32_t>(numInts);
   auto rawInts1 = ints1->as<int32_t>();
-  auto ints2 = arenas->unified->allocate<int32_t>(kNumInts);
+  auto ints2 = arenas->unified->allocate<int32_t>(numInts);
   auto rawInts2 = ints2->as<int32_t>();
-  auto ints3 = arenas->unified->allocate<int32_t>(kNumInts);
+  auto ints3 = arenas->unified->allocate<int32_t>(numInts);
   auto rawInts3 = ints3->as<int32_t>();
-  memset(rawInts1, 0, kNumInts * sizeof(int32_t));
-  memset(rawInts2, 0, kNumInts * sizeof(int32_t));
-  memset(rawInts3, 0, kNumInts * sizeof(int32_t));
+  memset(rawInts1, 0, numInts * sizeof(int32_t));
+  memset(rawInts2, 0, numInts * sizeof(int32_t));
+  memset(rawInts3, 0, numInts * sizeof(int32_t));
   stream->prefetch(getDevice(), rawInts1, ints1->capacity());
   stream->prefetch(getDevice(), rawInts2, ints2->capacity());
   stream->prefetch(getDevice(), rawInts3, ints3->capacity());
   // Let prefetch finish.
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   // warm up.
-  stream->addOneRandom(rawInts1, rawIndices, kNumInts, 20, 10240);
-  stream->addOneRandom(rawInts2, rawIndices, kNumInts, 20, 10240, true);
-  stream->addOneRandom(rawInts3, rawIndices, kNumInts, 20, 10240, false, true);
+  stream->addOneRandom(rawInts1, rawIndices, numInts, 20, 10240);
+  stream->addOneRandom(rawInts2, rawIndices, numInts, 20, 10240, true);
+  stream->addOneRandom(rawInts3, rawIndices, numInts, 20, 10240, false, true);
   stream->wait();
 
   uint64_t time1 = 0;
@@ -1626,18 +1676,18 @@ TEST_F(CudaTest, addRandom) {
   for (auto count = 0; count < 20; ++count) {
     {
       MicrosecondTimer t(&time1);
-      stream->addOneRandom(rawInts1, rawIndices, kNumInts, 20, 10240);
+      stream->addOneRandom(rawInts1, rawIndices, numInts, 20, 10240);
       stream->wait();
     }
     {
       MicrosecondTimer t(&time2);
-      stream->addOneRandom(rawInts2, rawIndices, kNumInts, 20, 10240, true);
+      stream->addOneRandom(rawInts2, rawIndices, numInts, 20, 10240, true);
       stream->wait();
     }
     {
       MicrosecondTimer t(&time3);
       stream->addOneRandom(
-          rawInts3, rawIndices, kNumInts, 20, 10240, false, true);
+          rawInts3, rawIndices, numInts, 20, 10240, false, true);
       stream->wait();
     }
   }
@@ -1649,8 +1699,8 @@ TEST_F(CudaTest, addRandom) {
   stream->prefetch(nullptr, rawInts2, ints2->capacity());
   stream->prefetch(nullptr, rawInts3, ints3->capacity());
 
-  EXPECT_EQ(0, memcmp(rawInts1, rawInts2, kNumInts * sizeof(int32_t)));
-  EXPECT_EQ(0, memcmp(rawInts1, rawInts3, kNumInts * sizeof(int32_t)));
+  EXPECT_EQ(0, memcmp(rawInts1, rawInts2, numInts * sizeof(int32_t)));
+  EXPECT_EQ(0, memcmp(rawInts1, rawInts3, numInts * sizeof(int32_t)));
 }
 
 int main(int argc, char** argv) {

@@ -41,6 +41,7 @@ class ApproxPercentileResultVerifier : public ResultVerifier {
   // Compute the range of percentiles represented by each of the input values.
   void initialize(
       const std::vector<RowVectorPtr>& input,
+      const std::vector<core::ExprPtr>& projections,
       const std::vector<std::string>& groupingKeys,
       const core::AggregationNode::Aggregate& aggregate,
       const std::string& aggregateName) override {
@@ -60,17 +61,18 @@ class ApproxPercentileResultVerifier : public ResultVerifier {
     extractPercentileAndAccuracy(aggregate.call, input);
 
     // Compute percentiles for all values.
-    allRanges_ =
-        computePercentiles(input, valueField, weightField, aggregate.mask);
+    allRanges_ = computePercentiles(
+        input, projections, valueField, weightField, aggregate.mask);
     VELOX_CHECK_LE(allRanges_->size(), numInputs);
   }
 
   void initializeWindow(
       const std::vector<RowVectorPtr>& input,
+      const std::vector<core::ExprPtr>& projections,
       const std::vector<std::string>& partitionByKeys,
       const std::vector<SortingKeyAndOrder>& sortingKeysAndOrders,
       const core::WindowNode::Function& function,
-      const std::string& /*frame*/,
+      const std::string& frame,
       const std::string& windowName) override {
     VELOX_CHECK(!input.empty());
     verifyWindow_ = true;
@@ -85,10 +87,11 @@ class ApproxPercentileResultVerifier : public ResultVerifier {
 
     allRanges_ = computePercentilesForWindow(
         input,
+        projections,
         valueField,
         weightField,
         sortingKeysAndOrders,
-        function.frame,
+        frame,
         function.functionCall->type(),
         isArrayPercentile);
   }
@@ -238,10 +241,11 @@ class ApproxPercentileResultVerifier : public ResultVerifier {
   // followed by min_pct and max_pct columns.
   RowVectorPtr computePercentiles(
       const std::vector<RowVectorPtr>& input,
+      const std::vector<core::ExprPtr>& inputProjections,
       const std::string& valueField,
       const std::optional<std::string>& weightField,
       const core::FieldAccessTypedExprPtr& mask) {
-    VELOX_CHECK(!input.empty())
+    VELOX_CHECK(!input.empty());
     const auto rowType = asRowType(input[0]->type());
 
     std::vector<std::string> projections = groupingKeys_;
@@ -251,7 +255,7 @@ class ApproxPercentileResultVerifier : public ResultVerifier {
         weightField.has_value() ? weightField.value() : "1::bigint"));
 
     PlanBuilder planBuilder;
-    planBuilder.values(input);
+    planBuilder.values(input).projectExpressions(inputProjections);
 
     if (mask != nullptr) {
       planBuilder.filter(mask->name());
@@ -301,37 +305,6 @@ class ApproxPercentileResultVerifier : public ResultVerifier {
 
     auto plan = planBuilder.planNode();
     return AssertQueryBuilder(plan).copyResults(input[0]->pool());
-  }
-
-  std::string getFrameClause(const core::WindowNode::Frame& frame) {
-    std::stringstream ss;
-    ss << core::WindowNode::windowTypeName(frame.type) << " between ";
-    if (frame.startValue) {
-      ss << frame.startValue->toString() << " ";
-    }
-    ss << core::WindowNode::boundTypeName(frame.startType) << " and ";
-    if (frame.endValue) {
-      ss << frame.endValue->toString() << " ";
-    }
-    ss << core::WindowNode::boundTypeName(frame.endType);
-    return ss.str();
-  }
-
-  std::string getOrderByClause(
-      const std::vector<SortingKeyAndOrder>& sortingKeysAndOrders) {
-    if (sortingKeysAndOrders.empty()) {
-      return "";
-    }
-    std::stringstream ss;
-    ss << "order by ";
-    for (auto i = 0; i < sortingKeysAndOrders.size(); ++i) {
-      if (i > 0) {
-        ss << ", ";
-      }
-      ss << sortingKeysAndOrders[i].key_ << " "
-         << sortingKeysAndOrders[i].sortOrder_.toString();
-    }
-    return ss.str();
   }
 
   std::string getPartitionByClause(
@@ -453,13 +426,14 @@ class ApproxPercentileResultVerifier : public ResultVerifier {
   //      row_num
   RowVectorPtr computePercentilesForWindow(
       const std::vector<RowVectorPtr>& input,
+      const std::vector<core::ExprPtr>& inputProjections,
       const std::string& valueField,
       const std::optional<std::string>& weightField,
       const std::vector<SortingKeyAndOrder>& sortingKeysAndOrders,
-      const core::WindowNode::Frame& frame,
+      const std::string& frame,
       const TypePtr& resultType,
       bool isArray) {
-    VELOX_CHECK(!input.empty())
+    VELOX_CHECK(!input.empty());
     const auto rowType = asRowType(input[0]->type());
     const bool weighted = weightField.has_value();
 
@@ -473,18 +447,26 @@ class ApproxPercentileResultVerifier : public ResultVerifier {
     projections.push_back(fmt::format("{} as x", valueField));
     projections.push_back(
         fmt::format("{} as w", weighted ? weightField.value() : "1::bigint"));
+    // Names of columns, which could be offset columns in case of kRange frames,
+    // or frame bounds, should be projected.
+    static const std::unordered_set<std::string> kKBoundColumnNames = {
+        "k0", "k1", "off0", "off1"};
+    for (const auto& child : rowType->names()) {
+      if (kKBoundColumnNames.count(child) != 0) {
+        projections.push_back(child);
+      }
+    }
 
     PlanBuilder planBuilder;
-    planBuilder.values(input).project(projections).filter("w > 0");
+    planBuilder.values(input)
+        .projectExpressions(inputProjections)
+        .project(projections)
+        .filter("w > 0");
 
     auto partitionByKeysWithRowNumber =
         getPartitionByClause(append(groupingKeys_, {"row_number"}));
     planBuilder
-        .window({fmt::format(
-            "multimap_agg(x, w) over ({} {} {}) as bucket",
-            getPartitionByClause(groupingKeys_),
-            getOrderByClause(sortingKeysAndOrders),
-            getFrameClause(frame))})
+        .window({fmt::format("multimap_agg(x, w) over ({}) as bucket", frame)})
         .project(append(
             groupingKeys_,
             {"row_number",

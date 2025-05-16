@@ -13,13 +13,14 @@
 # limitations under the License.
 
 add_subdirectory(specialforms)
-add_library(
-  velox_functions_spark
+velox_add_library(
+  velox_functions_spark_impl
   ArrayGetFunction.cpp
   ArraySort.cpp
-  Bitwise.cpp
   Comparisons.cpp
+  ConcatWs.cpp
   DecimalArithmetic.cpp
+  DecimalCeil.cpp
   DecimalCompare.cpp
   Hash.cpp
   In.cpp
@@ -27,33 +28,23 @@ add_library(
   MakeTimestamp.cpp
   Map.cpp
   RegexFunctions.cpp
-  Register.cpp
-  RegisterArithmetic.cpp
-  RegisterCompare.cpp
   Size.cpp
-  SplitFunctions.cpp
   String.cpp
   UnscaledValueFunction.cpp)
 
-# GCC 12 has a bug where it does not respect "pragma ignore" directives and ends
-# up failing compilation in an openssl header included by a hash-related
-# function.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  target_compile_options(velox_functions_spark
-                         PRIVATE -Wno-deprecated-declarations)
-endif()
-
-target_link_libraries(
-  velox_functions_spark
+velox_link_libraries(
+  velox_functions_spark_impl
   velox_functions_lib
   velox_functions_prestosql_impl
   velox_functions_spark_specialforms
-  velox_is_null_functions
   velox_functions_util
-  Folly::folly)
+  Folly::folly
+  simdjson::simdjson)
 
-set_property(TARGET velox_functions_spark PROPERTY JOB_POOL_COMPILE
-                                                   high_memory_pool)
+if(NOT VELOX_MONO_LIBRARY)
+  set_property(TARGET velox_functions_spark_impl PROPERTY JOB_POOL_COMPILE
+                                                          high_memory_pool)
+endif()
 
 add_subdirectory(window)
 
@@ -70,3 +61,5 @@ endif()
 if(${VELOX_ENABLE_BENCHMARKS})
   add_subdirectory(benchmarks)
 endif()
+
+add_subdirectory(registration)

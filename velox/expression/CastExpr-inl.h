@@ -15,13 +15,10 @@
  */
 #pragma once
 
-#include <charconv>
-
 #include "velox/common/base/CountBits.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/core/CoreTypeSystem.h"
 #include "velox/expression/StringWriter.h"
-#include "velox/external/date/tz.h"
 #include "velox/type/Type.h"
 #include "velox/vector/SelectivityVector.h"
 
@@ -50,66 +47,6 @@ inline std::exception_ptr makeBadCastException(
       std::current_exception(),
       makeErrorMessage(input, row, resultType, errorDetails),
       false));
-}
-
-/// @brief Convert the unscaled value of a decimal to varchar and write to raw
-/// string buffer from start position.
-/// @tparam T The type of input value.
-/// @param unscaledValue The input unscaled value.
-/// @param scale The scale of decimal.
-/// @param maxVarcharSize The estimated max size of a varchar.
-/// @param startPosition The start position to write from.
-/// @return A string view.
-template <typename T>
-StringView convertToStringView(
-    T unscaledValue,
-    int32_t scale,
-    int32_t maxVarcharSize,
-    char* const startPosition) {
-  char* writePosition = startPosition;
-  if (unscaledValue == 0) {
-    *writePosition++ = '0';
-    if (scale > 0) {
-      *writePosition++ = '.';
-      // Append leading zeros.
-      std::memset(writePosition, '0', scale);
-      writePosition += scale;
-    }
-  } else {
-    if (unscaledValue < 0) {
-      *writePosition++ = '-';
-      unscaledValue = -unscaledValue;
-    }
-    auto [position, errorCode] = std::to_chars(
-        writePosition,
-        writePosition + maxVarcharSize,
-        unscaledValue / DecimalUtil::kPowersOfTen[scale]);
-    VELOX_DCHECK_EQ(
-        errorCode,
-        std::errc(),
-        "Failed to cast decimal to varchar: {}",
-        std::make_error_code(errorCode).message());
-    writePosition = position;
-
-    if (scale > 0) {
-      *writePosition++ = '.';
-      uint128_t fraction = unscaledValue % DecimalUtil::kPowersOfTen[scale];
-      // Append leading zeros.
-      int numLeadingZeros = std::max(scale - countDigits(fraction), 0);
-      std::memset(writePosition, '0', numLeadingZeros);
-      writePosition += numLeadingZeros;
-      // Append remaining fraction digits.
-      auto result = std::to_chars(
-          writePosition, writePosition + maxVarcharSize, fraction);
-      VELOX_DCHECK_EQ(
-          result.ec,
-          std::errc(),
-          "Failed to cast decimal to varchar: {}",
-          std::make_error_code(result.ec).message());
-      writePosition = result.ptr;
-    }
-  }
-  return StringView(startPosition, writePosition - startPosition);
 }
 
 } // namespace
@@ -265,7 +202,7 @@ void CastExpr::applyToSelectedNoThrowLocal(
     VectorPtr& result,
     Func&& func) {
   if (setNullInResultAtError()) {
-    rows.template applyToSelected([&](auto row) INLINE_LAMBDA {
+    rows.applyToSelected([&](auto row) INLINE_LAMBDA {
       try {
         func(row);
       } catch (const VeloxException& e) {
@@ -278,7 +215,7 @@ void CastExpr::applyToSelectedNoThrowLocal(
       }
     });
   } else {
-    rows.template applyToSelected([&](auto row) INLINE_LAMBDA {
+    rows.applyToSelected([&](auto row) INLINE_LAMBDA {
       try {
         func(row);
       } catch (const VeloxException& e) {
@@ -338,6 +275,49 @@ void CastExpr::applyCastKernel(
   try {
     auto inputRowValue = input->valueAt(row);
 
+    if constexpr (
+        (FromKind == TypeKind::TINYINT || FromKind == TypeKind::SMALLINT ||
+         FromKind == TypeKind::INTEGER || FromKind == TypeKind::BIGINT) &&
+        ToKind == TypeKind::TIMESTAMP) {
+      const auto castResult =
+          hooks_->castIntToTimestamp((int64_t)inputRowValue);
+      setResultOrError(castResult, row);
+      return;
+    }
+
+    if constexpr (
+        (FromKind == TypeKind::BOOLEAN) && ToKind == TypeKind::TIMESTAMP) {
+      const auto castResult = hooks_->castBooleanToTimestamp(inputRowValue);
+      setResultOrError(castResult, row);
+      return;
+    }
+
+    if constexpr (
+        (ToKind == TypeKind::TINYINT || ToKind == TypeKind::SMALLINT ||
+         ToKind == TypeKind::INTEGER || ToKind == TypeKind::BIGINT) &&
+        FromKind == TypeKind::TIMESTAMP) {
+      const auto castResult = hooks_->castTimestampToInt(inputRowValue);
+      setResultOrError(castResult, row);
+      return;
+    }
+
+    if constexpr (
+        (FromKind == TypeKind::DOUBLE || FromKind == TypeKind::REAL) &&
+        ToKind == TypeKind::TIMESTAMP) {
+      const auto castResult =
+          hooks_->castDoubleToTimestamp(static_cast<double>(inputRowValue));
+      if (castResult.hasError()) {
+        setError(castResult.error().message());
+      } else {
+        if (castResult.value().has_value()) {
+          result->set(row, castResult.value().value());
+        } else {
+          result->setNull(row, true);
+        }
+      }
+      return;
+    }
+
     // Optimize empty input strings casting by avoiding throwing exceptions.
     if constexpr (
         FromKind == TypeKind::VARCHAR || FromKind == TypeKind::VARBINARY) {
@@ -365,6 +345,19 @@ void CastExpr::applyCastKernel(
         setResultOrError(castResult, row);
         return;
       }
+
+      if constexpr (
+          ToKind == TypeKind::TINYINT || ToKind == TypeKind::SMALLINT ||
+          ToKind == TypeKind::INTEGER || ToKind == TypeKind::BIGINT ||
+          ToKind == TypeKind::HUGEINT) {
+        if constexpr (TPolicy::throwOnUnicode) {
+          if (!functions::stringCore::isAscii(
+                  inputRowValue.data(), inputRowValue.size())) {
+            VELOX_USER_FAIL(
+                "Unicode characters are not supported for conversion to integer types");
+          }
+        }
+      }
     }
 
     const auto castResult =
@@ -379,7 +372,7 @@ void CastExpr::applyCastKernel(
     if constexpr (
         ToKind == TypeKind::VARCHAR || ToKind == TypeKind::VARBINARY) {
       // Write the result output to the output vector
-      auto writer = exec::StringWriter<>(result, row);
+      auto writer = exec::StringWriter(result, row);
       writer.copy_from(output);
       writer.finalize();
     } else {
@@ -632,24 +625,14 @@ VectorPtr CastExpr::applyDecimalToVarcharCast(
   const auto simpleInput = input.as<SimpleVector<FromNativeType>>();
   int precision = getDecimalPrecisionScale(*fromType).first;
   int scale = getDecimalPrecisionScale(*fromType).second;
-  // A varchar's size is estimated with unscaled value digits, dot, leading
-  // zero, and possible minus sign.
-  int32_t rowSize = precision + 1;
-  if (scale > 0) {
-    ++rowSize; // A dot.
-  }
-  if (precision == scale) {
-    ++rowSize; // Leading zero.
-  }
-
+  auto rowSize = DecimalUtil::maxStringViewSize(precision, scale);
   auto flatResult = result->asFlatVector<StringView>();
   if (StringView::isInline(rowSize)) {
     char inlined[StringView::kInlineSize];
     applyToSelectedNoThrowLocal(context, rows, result, [&](vector_size_t row) {
-      flatResult->setNoCopy(
-          row,
-          convertToStringView<FromNativeType>(
-              simpleInput->valueAt(row), scale, rowSize, inlined));
+      auto actualSize = DecimalUtil::castToString<FromNativeType>(
+          simpleInput->valueAt(row), scale, rowSize, inlined);
+      flatResult->setNoCopy(row, StringView(inlined, actualSize));
     });
     return result;
   }
@@ -659,13 +642,13 @@ VectorPtr CastExpr::applyDecimalToVarcharCast(
   char* rawBuffer = buffer->asMutable<char>() + buffer->size();
 
   applyToSelectedNoThrowLocal(context, rows, result, [&](vector_size_t row) {
-    auto stringView = convertToStringView<FromNativeType>(
+    auto actualSize = DecimalUtil::castToString<FromNativeType>(
         simpleInput->valueAt(row), scale, rowSize, rawBuffer);
-    flatResult->setNoCopy(row, stringView);
-    if (!stringView.isInline()) {
+    flatResult->setNoCopy(row, StringView(rawBuffer, actualSize));
+    if (!StringView::isInline(actualSize)) {
       // If string view is inline, corresponding bytes on the raw string buffer
       // are not needed.
-      rawBuffer += stringView.size();
+      rawBuffer += actualSize;
     }
   });
   // Update the exact buffer size.

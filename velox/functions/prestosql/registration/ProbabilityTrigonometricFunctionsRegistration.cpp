@@ -52,8 +52,6 @@ void registerProbTrigFunctions(const std::string& prefix) {
       {prefix + "inverse_beta_cdf"});
   registerFunction<InverseNormalCDFFunction, double, double, double, double>(
       {prefix + "inverse_normal_cdf"});
-  registerFunction<PoissonCDFFunction, double, double, int64_t>(
-      {prefix + "poisson_cdf"});
   registerFunction<PoissonCDFFunction, double, double, int32_t>(
       {prefix + "poisson_cdf"});
   registerFunction<GammaCDFFunction, double, double, double, double>(
@@ -81,6 +79,16 @@ void registerProbTrigFunctions(const std::string& prefix) {
       {prefix + "inverse_cauchy_cdf"});
   registerFunction<InverseLaplaceCDFFunction, double, double, double, double>(
       {prefix + "inverse_laplace_cdf"});
+  registerFunction<InverseGammaCDFFunction, double, double, double, double>(
+      {prefix + "inverse_gamma_cdf"});
+  registerFunction<
+      InverseBinomialCDFFunction,
+      int32_t,
+      int32_t,
+      double,
+      double>({prefix + "inverse_binomial_cdf"});
+  registerFunction<InversePoissonCDFFunction, int32_t, double, double>(
+      {prefix + "inverse_poisson_cdf"});
 }
 
 } // namespace

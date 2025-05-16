@@ -59,7 +59,7 @@ class HashJoinBridgeTest : public testing::Test,
 
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
     filesystems::registerLocalFileSystem();
   }
 
@@ -120,19 +120,21 @@ class HashJoinBridgeTest : public testing::Test,
            rowType_,
            tempDir_->getPath() + "/Spill_" + std::to_string(fileId),
            1024,
-           1,
-           std::vector<CompareFlags>({}),
+           SpillState::makeSortingKeys(std::vector<CompareFlags>(1)),
            common::CompressionKind_NONE});
     }
     return files;
   }
 
-  SpillPartitionSet makeFakeSpillPartitionSet(uint8_t partitionBitOffset) {
+  SpillPartitionSet makeFakeSpillPartitionSet(
+      std::optional<SpillPartitionId> parent) {
     SpillPartitionSet partitionSet;
     const int32_t numPartitions =
         std::max<int32_t>(1, randInt(maxNumPartitions_));
     for (int32_t partition = 0; partition < numPartitions; ++partition) {
-      const SpillPartitionId id(partitionBitOffset, partition);
+      const SpillPartitionId id = parent.has_value()
+          ? SpillPartitionId(parent.value(), partition)
+          : SpillPartitionId(partition);
       partitionSet.emplace(
           id,
           std::make_unique<SpillPartition>(
@@ -171,13 +173,16 @@ TEST_P(HashJoinBridgeTest, withoutSpill) {
     // Can't call any other APIs except addBuilder() before start a join bridge
     // first.
     VELOX_ASSERT_THROW(
-        joinBridge->setHashTable(createFakeHashTable(), {}, false), "");
+        joinBridge->setHashTable(createFakeHashTable(), {}, false, nullptr),
+        "");
     VELOX_ASSERT_THROW(joinBridge->setAntiJoinHasNullKeys(), "");
     VELOX_ASSERT_THROW(joinBridge->probeFinished(), "");
     VELOX_ASSERT_THROW(joinBridge->tableOrFuture(&futures[0]), "");
     VELOX_ASSERT_THROW(joinBridge->spillInputOrFuture(&futures[0]), "");
     VELOX_ASSERT_THROW(
-        joinBridge->setSpilledHashTable(makeFakeSpillPartitionSet(0)), "");
+        joinBridge->appendSpilledHashTablePartitions(
+            makeFakeSpillPartitionSet(std::nullopt)),
+        "");
 
     // Can't start a bridge without any builders.
     VELOX_ASSERT_THROW(joinBridge->start(), "");
@@ -204,9 +209,10 @@ TEST_P(HashJoinBridgeTest, withoutSpill) {
     } else {
       auto table = createFakeHashTable();
       rawTable = table.get();
-      joinBridge->setHashTable(std::move(table), {}, false);
+      joinBridge->setHashTable(std::move(table), {}, false, nullptr);
       VELOX_ASSERT_THROW(
-          joinBridge->setHashTable(createFakeHashTable(), {}, false), "");
+          joinBridge->setHashTable(createFakeHashTable(), {}, false, nullptr),
+          "");
     }
     ASSERT_TRUE(helper.buildResult().has_value());
 
@@ -242,7 +248,8 @@ TEST_P(HashJoinBridgeTest, withoutSpill) {
     ASSERT_TRUE(futures[0].valid());
 
     // Probe side completion.
-    ASSERT_FALSE(joinBridge->probeFinished());
+    ASSERT_FALSE(joinBridge->testingHasMoreSpilledPartitions());
+    joinBridge->probeFinished();
     ASSERT_FALSE(helper.buildResult().has_value());
 
     futures[0].wait();
@@ -296,15 +303,15 @@ TEST_P(HashJoinBridgeTest, withSpill) {
       int32_t spillLevel = -1;
       if (restoringPartitionId.has_value()) {
         ++numRestoredPartitions;
-        spillLevel =
-            getSpillLevel(restoringPartitionId.value().partitionBitOffset());
+        spillLevel = getSpillLevel(partitionBitOffset(
+            restoringPartitionId.value(),
+            startPartitionBitOffset_,
+            numPartitionBits_));
         if (spillLevel < testData.spillLevel) {
-          spillPartitionSet = makeFakeSpillPartitionSet(
-              restoringPartitionId.value().partitionBitOffset() +
-              numPartitionBits_);
+          spillPartitionSet = makeFakeSpillPartitionSet(restoringPartitionId);
         }
       } else {
-        spillPartitionSet = makeFakeSpillPartitionSet(startPartitionBitOffset_);
+        spillPartitionSet = makeFakeSpillPartitionSet(std::nullopt);
       }
 
       bool spillByProber{false};
@@ -317,10 +324,13 @@ TEST_P(HashJoinBridgeTest, withSpill) {
         if (oneIn(2)) {
           spillPartitionIdSet = toSpillPartitionIdSet(spillPartitionSet);
           joinBridge->setHashTable(
-              createFakeHashTable(), std::move(spillPartitionSet), false);
+              createFakeHashTable(),
+              std::move(spillPartitionSet),
+              false,
+              nullptr);
         } else {
           spillByProber = !spillPartitionSet.empty();
-          joinBridge->setHashTable(createFakeHashTable(), {}, false);
+          joinBridge->setHashTable(createFakeHashTable(), {}, false, nullptr);
         }
         hasMoreSpill = numSpilledPartitions > numRestoredPartitions;
       }
@@ -348,19 +358,23 @@ TEST_P(HashJoinBridgeTest, withSpill) {
 
       if (spillByProber) {
         VELOX_ASSERT_THROW(
-            joinBridge->setSpilledHashTable({}),
+            joinBridge->appendSpilledHashTablePartitions({}),
             "Spilled table partitions can't be empty");
-        joinBridge->setSpilledHashTable(std::move(spillPartitionSet));
+        joinBridge->appendSpilledHashTablePartitions(
+            std::move(spillPartitionSet));
       }
 
       // Probe table.
-      ASSERT_EQ(hasMoreSpill, joinBridge->probeFinished());
+      ASSERT_EQ(hasMoreSpill, joinBridge->testingHasMoreSpilledPartitions());
+      joinBridge->probeFinished();
       // Probe can't set spilled table partitions after it finishes probe.
       VELOX_ASSERT_THROW(
-          joinBridge->setSpilledHashTable({}),
+          joinBridge->appendSpilledHashTablePartitions({}),
           "Spilled table partitions can't be empty");
       VELOX_ASSERT_THROW(
-          joinBridge->setSpilledHashTable(makeFakeSpillPartitionSet(0)), "");
+          joinBridge->appendSpilledHashTablePartitions(
+              makeFakeSpillPartitionSet(std::nullopt)),
+          "");
 
       if (!hasMoreSpill) {
         for (int32_t i = 0; i < numBuilders_; ++i) {
@@ -438,17 +452,27 @@ TEST_P(HashJoinBridgeTest, multiThreading) {
             if (oneIn(10)) {
               joinBridge->setAntiJoinHasNullKeys();
             } else {
-              auto partitionBitOffset = restoringPartitionId.has_value()
-                  ? restoringPartitionId->partitionBitOffset() +
+              auto bitOffset = restoringPartitionId.has_value()
+                  ? partitionBitOffset(
+                        restoringPartitionId.value(),
+                        startPartitionBitOffset_,
+                        numPartitionBits_) +
                       numPartitionBits_
                   : startPartitionBitOffset_;
-              if (partitionBitOffset < 64 && oneIn(2)) {
+              if (bitOffset < startPartitionBitOffset_ +
+                          numPartitionBits_ *
+                              (SpillPartitionId::kMaxSpillLevel + 1) &&
+                  oneIn(2)) {
                 auto spillPartitionSet =
-                    makeFakeSpillPartitionSet(partitionBitOffset);
+                    makeFakeSpillPartitionSet(restoringPartitionId);
                 joinBridge->setHashTable(
-                    createFakeHashTable(), std::move(spillPartitionSet), false);
+                    createFakeHashTable(),
+                    std::move(spillPartitionSet),
+                    false,
+                    nullptr);
               } else {
-                joinBridge->setHashTable(createFakeHashTable(), {}, false);
+                joinBridge->setHashTable(
+                    createFakeHashTable(), {}, false, nullptr);
               }
             }
             for (auto& promise : promises) {
@@ -519,7 +543,9 @@ TEST_P(HashJoinBridgeTest, multiThreading) {
           } else {
             proberBarrier.reset(new BarrierState());
             ASSERT_EQ(
-                joinBridge->probeFinished(), !spillPartitionIdSet.empty());
+                joinBridge->testingHasMoreSpilledPartitions(),
+                !spillPartitionIdSet.empty());
+            joinBridge->probeFinished();
             for (auto& promise : promises) {
               promise.setValue();
             }
@@ -531,10 +557,10 @@ TEST_P(HashJoinBridgeTest, multiThreading) {
       });
     }
 
-    for (auto& th : builderThreads) {
+    for (auto& th : proberThreads) {
       th.join();
     }
-    for (auto& th : proberThreads) {
+    for (auto& th : builderThreads) {
       th.join();
     }
   }
@@ -582,6 +608,90 @@ TEST(HashJoinBridgeTest, needRightSideJoin) {
       ASSERT_TRUE(needRightSideJoin(joinType));
     } else {
       ASSERT_FALSE(needRightSideJoin(joinType));
+    }
+  }
+}
+
+TEST_P(HashJoinBridgeTest, hashJoinTableType) {
+  core::TypedExprPtr filter{
+      std::make_shared<core::ConstantTypedExpr>(BOOLEAN(), true)};
+  struct TestSetting {
+    core::JoinType joinType;
+    RowTypePtr probeKeyType;
+    RowTypePtr buildKeyType;
+    RowTypePtr probeSourceType;
+    RowTypePtr buildSourceType;
+    std::string debugString() const {
+      return fmt::format(
+          "joinType {} probeKeyType {} buildKeyType {} probeSourceType {} buildSourceType {}",
+          joinType,
+          probeKeyType->toString(),
+          buildKeyType->toString(),
+          buildSourceType->toString(),
+          probeSourceType->toString());
+    }
+  };
+  std::vector<TestSetting> testSettings{
+      {core::JoinType::kInner,
+       ROW({"p0"}, {BIGINT()}),
+       ROW({"b0"}, {BIGINT()}),
+       ROW({"p0", "p1"}, {BIGINT(), BIGINT()}),
+       ROW({"b0", "b1"}, {BIGINT(), BIGINT()})},
+      {core::JoinType::kRight,
+       ROW({"p1", "p0"}, {BIGINT(), BIGINT()}),
+       ROW({"b1", "b0"}, {BIGINT(), BIGINT()}),
+       ROW({"p0", "p1"}, {BIGINT(), BIGINT()}),
+       ROW({"b0", "b1"}, {BIGINT(), BIGINT()})},
+      {core::JoinType::kLeft,
+       ROW({"p1"}, {BIGINT()}),
+       ROW({"b1"}, {BIGINT()}),
+       ROW({"p0", "p1"}, {BIGINT(), BIGINT()}),
+       ROW({"b0", "b1"}, {BIGINT(), BIGINT()})}};
+  for (const auto& testData : testSettings) {
+    SCOPED_TRACE(testData.debugString());
+    const auto emptyBuildVector = {std::make_shared<RowVector>(
+        pool_.get(),
+        testData.buildSourceType,
+        nullptr, // nulls
+        0,
+        std::vector<VectorPtr>{})};
+    const auto buildValueNode =
+        std::make_shared<core::ValuesNode>("buildValueNode", emptyBuildVector);
+
+    const auto emptyProbeVectors = {std::make_shared<RowVector>(
+        pool_.get(),
+        testData.probeSourceType,
+        nullptr, // nulls
+        0,
+        std::vector<VectorPtr>{})};
+    const auto probeValueNode =
+        std::make_shared<core::ValuesNode>("probeValueNode", emptyProbeVectors);
+
+    std::vector<core::FieldAccessTypedExprPtr> buildKeys;
+    std::vector<core::FieldAccessTypedExprPtr> probeKeys;
+    for (uint32_t i = 0; i < testData.buildKeyType->size(); i++) {
+      buildKeys.push_back(std::make_shared<core::FieldAccessTypedExpr>(
+          testData.buildKeyType->childAt(i), testData.buildKeyType->nameOf(i)));
+    }
+    for (uint32_t i = 0; i < testData.probeKeyType->size(); i++) {
+      probeKeys.push_back(std::make_shared<core::FieldAccessTypedExpr>(
+          testData.probeKeyType->childAt(i), testData.probeKeyType->nameOf(i)));
+    }
+    const auto joinNode = std::make_shared<core::HashJoinNode>(
+        "join-bridge-test",
+        testData.joinType,
+        false,
+        probeKeys,
+        buildKeys,
+        filter,
+        probeValueNode,
+        buildValueNode,
+        ROW({}));
+
+    auto tableType = hashJoinTableType(joinNode);
+    ASSERT_EQ(tableType->size(), testData.buildSourceType->size());
+    for (uint32_t i = 0; i < buildKeys.size(); i++) {
+      ASSERT_EQ(tableType->childAt(i), testData.buildKeyType->childAt(i));
     }
   }
 }

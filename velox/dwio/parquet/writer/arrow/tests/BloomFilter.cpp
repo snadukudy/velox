@@ -21,12 +21,11 @@
 #include <memory>
 
 #include "arrow/result.h"
-#include "arrow/util/logging.h"
 #include "arrow/util/macros.h"
 
+#include "velox/common/base/Exceptions.h"
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
-#include "velox/dwio/parquet/writer/arrow/generated/parquet_types.h"
 #include "velox/dwio/parquet/writer/arrow/tests/BloomFilter.h"
 #include "velox/dwio/parquet/writer/arrow/tests/XxHasher.h"
 
@@ -62,7 +61,7 @@ void BlockSplitBloomFilter::Init(uint32_t num_bytes) {
 }
 
 void BlockSplitBloomFilter::Init(const uint8_t* bitset, uint32_t num_bytes) {
-  DCHECK(bitset != nullptr);
+  VELOX_DCHECK_NOT_NULL(bitset);
 
   if (num_bytes < kMinimumBloomFilterBytes ||
       num_bytes > kMaximumBloomFilterBytes ||
@@ -80,7 +79,7 @@ void BlockSplitBloomFilter::Init(const uint8_t* bitset, uint32_t num_bytes) {
 static constexpr uint32_t kBloomFilterHeaderSizeGuess = 256;
 
 static ::arrow::Status ValidateBloomFilterHeader(
-    const format::BloomFilterHeader& header) {
+    const facebook::velox::parquet::thrift::BloomFilterHeader& header) {
   if (!header.algorithm.__isset.BLOCK) {
     return ::arrow::Status::Invalid(
         "Unsupported Bloom filter algorithm: ", header.algorithm, ".");
@@ -118,7 +117,7 @@ BlockSplitBloomFilter BlockSplitBloomFilter::Deserialize(
   // know the bloom filter data size, we can Read() the exact number of
   // remaining data bytes.
   ThriftDeserializer deserializer(properties);
-  format::BloomFilterHeader header;
+  facebook::velox::parquet::thrift::BloomFilterHeader header;
 
   // Read and deserialize bloom filter header
   PARQUET_ASSIGN_OR_THROW(
@@ -130,7 +129,7 @@ BlockSplitBloomFilter BlockSplitBloomFilter::Deserialize(
         reinterpret_cast<const uint8_t*>(header_buf->data()),
         &header_size,
         &header);
-    DCHECK_LE(header_size, header_buf->size());
+    VELOX_DCHECK_LE(header_size, header_buf->size());
   } catch (std::exception& e) {
     std::stringstream ss;
     ss << "Deserializing bloom filter header failed.\n" << e.what();
@@ -174,25 +173,27 @@ BlockSplitBloomFilter BlockSplitBloomFilter::Deserialize(
 }
 
 void BlockSplitBloomFilter::WriteTo(ArrowOutputStream* sink) const {
-  DCHECK(sink != nullptr);
+  VELOX_DCHECK_NOT_NULL(sink);
 
-  format::BloomFilterHeader header;
+  facebook::velox::parquet::thrift::BloomFilterHeader header;
   if (ARROW_PREDICT_FALSE(algorithm_ != BloomFilter::Algorithm::BLOCK)) {
     throw ParquetException(
         "BloomFilter does not support Algorithm other than BLOCK");
   }
-  header.algorithm.__set_BLOCK(format::SplitBlockAlgorithm());
+  header.algorithm.__set_BLOCK(
+      facebook::velox::parquet::thrift::SplitBlockAlgorithm());
   if (ARROW_PREDICT_FALSE(hash_strategy_ != HashStrategy::XXHASH)) {
     throw ParquetException(
         "BloomFilter does not support Hash other than XXHASH");
   }
-  header.hash.__set_XXHASH(format::XxHash());
+  header.hash.__set_XXHASH(facebook::velox::parquet::thrift::XxHash());
   if (ARROW_PREDICT_FALSE(
           compression_strategy_ != CompressionStrategy::UNCOMPRESSED)) {
     throw ParquetException(
         "BloomFilter does not support Compression other than UNCOMPRESSED");
   }
-  header.compression.__set_UNCOMPRESSED(format::Uncompressed());
+  header.compression.__set_UNCOMPRESSED(
+      facebook::velox::parquet::thrift::Uncompressed());
   header.__set_numBytes(num_bytes_);
 
   ThriftSerializer serializer;

@@ -18,10 +18,17 @@
 #include <type_traits>
 
 #include "velox/expression/ComplexViewTypes.h"
+#include "velox/expression/PrestoCastHooks.h"
 #include "velox/functions/Udf.h"
 #include "velox/functions/lib/CheckedArithmetic.h"
+#include "velox/functions/lib/ComparatorUtil.h"
+#include "velox/functions/prestosql/json/JsonStringUtil.h"
+#include "velox/functions/prestosql/json/SIMDJsonUtil.h"
+#include "velox/functions/prestosql/types/JsonType.h"
 #include "velox/type/Conversions.h"
 #include "velox/type/FloatingPointUtil.h"
+
+#include <queue>
 
 namespace facebook::velox::functions {
 
@@ -160,10 +167,70 @@ template <typename TExecCtx, typename T>
 struct ArrayJoinFunction {
   VELOX_DEFINE_FUNCTION_TYPES(TExecCtx);
 
+  FOLLY_ALWAYS_INLINE void initialize(
+      const std::vector<TypePtr>& inputTypes,
+      const core::QueryConfig& config,
+      const arg_type<velox::Array<T>>* /*arr*/,
+      const arg_type<Varchar>* /*delimiter*/) {
+    initialize(inputTypes, config, nullptr, nullptr, nullptr);
+  }
+
+  FOLLY_ALWAYS_INLINE void initialize(
+      const std::vector<TypePtr>& inputTypes,
+      const core::QueryConfig& config,
+      const arg_type<velox::Array<T>>* /*arr*/,
+      const arg_type<Varchar>* /*delimiter*/,
+      const arg_type<Varchar>* /*nullReplacement*/) {
+    const exec::PrestoCastHooks hooks{config};
+    options_ = hooks.timestampToStringOptions();
+    VELOX_CHECK(
+        inputTypes[0]->isArray(),
+        "Array join's first parameter type has to be array");
+    arrayElementType_ = inputTypes[0]->asArray().elementType();
+  }
+
   template <typename C>
   void writeValue(out_type<velox::Varchar>& result, const C& value) {
     // To VARCHAR converter never throws.
     result += util::Converter<TypeKind::VARCHAR>::tryCast(value).value();
+  }
+
+  void writeValue(out_type<velox::Varchar>& result, const StringView& value) {
+    // To VARCHAR converter never throws.
+    if (isJsonType(arrayElementType_)) {
+      std::string unescapedStr;
+      auto size =
+          unescapeSizeForJsonFunctions(value.data(), value.size(), true);
+      unescapedStr.resize(size);
+      unescapeForJsonFunctions(
+          value.data(), value.size(), unescapedStr.data(), true);
+      if (unescapedStr.size() >= 2 && *unescapedStr.begin() == '"' &&
+          *(unescapedStr.end() - 1) == '"') {
+        unescapedStr =
+            std::string_view(unescapedStr.data() + 1, unescapedStr.size() - 2);
+      }
+      result += unescapedStr;
+      return;
+    }
+    result += util::Converter<TypeKind::VARCHAR>::tryCast(value).value();
+  }
+
+  void writeValue(out_type<velox::Varchar>& result, const int32_t& value) {
+    if (arrayElementType_->isDate()) {
+      result += util::Converter<TypeKind::VARCHAR>::tryCast(
+                    DateType::get()->toString(value))
+                    .value();
+      return;
+    }
+    result += util::Converter<TypeKind::VARCHAR>::tryCast(value).value();
+  }
+
+  void writeValue(out_type<velox::Varchar>& result, const Timestamp& value) {
+    Timestamp inputValue{value};
+    if (options_.timeZone) {
+      inputValue.toTimezone(*(options_.timeZone));
+    }
+    result += inputValue.toString(options_);
   }
 
   template <typename C>
@@ -214,6 +281,10 @@ struct ArrayJoinFunction {
     createOutputString(result, inputArray, delim, nullReplacement.getString());
     return true;
   }
+
+ private:
+  TimestampToStringOptions options_;
+  TypePtr arrayElementType_;
 };
 
 /// Function Signature: combinations(array(T), n) -> array(array(T))
@@ -548,6 +619,21 @@ struct ArrayNormalizeFunction {
     VELOX_USER_CHECK_GE(
         p, 0, "array_normalize only supports non-negative p: {}", p);
 
+    // Ideally, we should not register this function with int types. However,
+    // in Presto, during plan conversion it's possible to create this function
+    // with int types. In that case, we want to have default NULL behavior for
+    // int types, which can be achieved by registering the function and failing
+    // it for non-null int values. Example: SELECT array_normalize(x, 2) from
+    // (VALUES NULL) t(x) creates a plan with `array_normalize :=
+    // array_normalize(CAST(field AS array(integer)), INTEGER'2') (1:37)` which
+    // ideally should fail saying the function is not registered with int types.
+    // But it falls back to default NULL behavior and returns NULL in Presto.
+    if constexpr (
+        std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t> ||
+        std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
+      VELOX_UNSUPPORTED("array_normalize only supports double and float types");
+    }
+
     // If the input array is empty, then the empty result should be returned,
     // same as Presto.
     if (inputArray.size() == 0) {
@@ -653,6 +739,153 @@ inline void checkIndexArrayTrim(int64_t size, int64_t arraySize) {
   }
 }
 
+/// This class implements the array_top_n function.
+///
+/// DEFINITION:
+/// array_top_n(array(T), int) -> array(T)
+/// Returns the top n elements of the array in descending order.
+template <typename T>
+struct ArrayTopNFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  // Definition for primitives.
+  template <typename TReturn, typename TInput>
+  FOLLY_ALWAYS_INLINE void
+  call(TReturn& result, const TInput& array, int32_t n) {
+    VELOX_USER_CHECK_GE(n, 0, "Parameter n: {} to ARRAY_TOP_N is negative", n);
+
+    // If top n is zero or input array is empty then exit early.
+    if (n == 0 || array.size() == 0) {
+      return;
+    }
+
+    // Define comparator that wraps built-in function for basic primitives or
+    // calls floating point handler for NaNs.
+    using facebook::velox::util::floating_point::NaNAwareGreaterThan;
+    struct GreaterThanComparator {
+      bool operator()(
+          const typename TInput::element_t& a,
+          const typename TInput::element_t& b) const {
+        if constexpr (
+            std::is_same_v<typename TInput::element_t, float> ||
+            std::is_same_v<typename TInput::element_t, double>) {
+          return NaNAwareGreaterThan<typename TInput::element_t>{}(a, b);
+        } else {
+          return std::greater<typename TInput::element_t>{}(a, b);
+        }
+      }
+    };
+
+    // Define min-heap to store the top n elements.
+    std::priority_queue<
+        typename TInput::element_t,
+        std::vector<typename TInput::element_t>,
+        GreaterThanComparator>
+        minHeap;
+
+    // Iterate through the array and push elements to the min-heap.
+    GreaterThanComparator comparator;
+    int numNull = 0;
+    for (const auto& item : array) {
+      if (item.has_value()) {
+        if (minHeap.size() < n) {
+          minHeap.push(item.value());
+        } else if (comparator(item.value(), minHeap.top())) {
+          minHeap.push(item.value());
+          minHeap.pop();
+        }
+      } else {
+        ++numNull;
+      }
+    }
+
+    // Reverse the min-heap to get the top n elements in descending order.
+    std::vector<typename TInput::element_t> reversed(minHeap.size());
+    auto index = minHeap.size();
+    while (!minHeap.empty()) {
+      reversed[--index] = minHeap.top();
+      minHeap.pop();
+    }
+
+    // Copy mutated vector to result vector up to minHeap's size items.
+    for (const auto& item : reversed) {
+      result.push_back(item);
+    }
+
+    // Backfill nulls if needed.
+    while (result.size() < n && numNull > 0) {
+      result.add_null();
+      --numNull;
+    }
+  }
+
+  // Generic implementation.
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<Array<Orderable<T1>>>& result,
+      const arg_type<Array<Orderable<T1>>>& array,
+      const int32_t n) {
+    VELOX_USER_CHECK_GE(n, 0, "Parameter n: {} to ARRAY_TOP_N is negative", n);
+
+    // If top n is zero or input array is empty then exit early.
+    if (n == 0 || array.size() == 0) {
+      return;
+    }
+
+    // Define comparator to compare complex types.
+    struct ComplexTypeComparator {
+      const arg_type<Array<Orderable<T1>>>& array;
+      ComplexTypeComparator(const arg_type<Array<Orderable<T1>>>& array)
+          : array(array) {}
+
+      bool operator()(const int32_t& a, const int32_t& b) const {
+        static constexpr CompareFlags kFlags = {
+            .nullHandlingMode =
+                CompareFlags::NullHandlingMode::kNullAsIndeterminate};
+        return array[a].value().compare(array[b].value(), kFlags).value() > 0;
+      }
+    };
+
+    // Define min-heap to store the top n elements.
+    std::priority_queue<int32_t, std::vector<int32_t>, ComplexTypeComparator>
+        minHeap(array);
+
+    // Iterate through the array and push elements to the min-heap.
+    ComplexTypeComparator comparator(array);
+    int numNull = 0;
+    for (int i = 0; i < array.size(); ++i) {
+      if (array[i].has_value()) {
+        if (minHeap.size() < n) {
+          minHeap.push(i);
+        } else if (comparator(i, minHeap.top())) {
+          minHeap.push(i);
+          minHeap.pop();
+        }
+      } else {
+        ++numNull;
+      }
+    }
+
+    // Reverse the min-heap to get the top n elements in descending order.
+    std::vector<int32_t> reversed(minHeap.size());
+    auto index = minHeap.size();
+    while (!minHeap.empty()) {
+      reversed[--index] = minHeap.top();
+      minHeap.pop();
+    }
+
+    // Copy mutated vector to result vector up to minHeap's size items.
+    for (const auto& index : reversed) {
+      result.push_back(array[index].value());
+    }
+
+    // Backfill nulls if needed.
+    while (result.size() < n && numNull > 0) {
+      result.add_null();
+      --numNull;
+    }
+  }
+};
+
 template <typename T>
 struct ArrayTrimFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
@@ -702,51 +935,6 @@ struct ArrayTrimFunctionString {
         newItem.setNoCopy(inputArray[i].value());
       } else {
         out.add_null();
-      }
-    }
-  }
-};
-
-template <typename T>
-struct ArrayRemoveNullFunction {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  // Fast path for primitives.
-  template <typename Out, typename In>
-  FOLLY_ALWAYS_INLINE void call(Out& out, const In& inputArray) {
-    for (int i = 0; i < inputArray.size(); ++i) {
-      if (inputArray[i].has_value()) {
-        out.push_back(inputArray[i].value());
-      }
-    }
-  }
-
-  // Generic implementation.
-  FOLLY_ALWAYS_INLINE void call(
-      out_type<Array<Generic<T1>>>& out,
-      const arg_type<Array<Generic<T1>>>& inputArray) {
-    for (int i = 0; i < inputArray.size(); ++i) {
-      if (inputArray[i].has_value()) {
-        out.push_back(inputArray[i].value());
-      }
-    }
-  }
-};
-
-template <typename T>
-struct ArrayRemoveNullFunctionString {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
-
-  static constexpr int32_t reuse_strings_from_arg = 0;
-
-  // String version that avoids copy of strings.
-  FOLLY_ALWAYS_INLINE void call(
-      out_type<Array<Varchar>>& out,
-      const arg_type<Array<Varchar>>& inputArray) {
-    for (int i = 0; i < inputArray.size(); ++i) {
-      if (inputArray[i].has_value()) {
-        auto& newItem = out.add_item();
-        newItem.setNoCopy(inputArray[i].value());
       }
     }
   }
@@ -946,7 +1134,7 @@ struct ArrayRemoveFunction {
       auto result = element.compare(item.value(), kFlags);
       VELOX_USER_CHECK(
           result.has_value(),
-          "array_remove does not support arrays with elements that are null or contain null")
+          "array_remove does not support arrays with elements that are null or contain null");
       if (result.value()) {
         toCopyItems.push_back(item.value());
       }

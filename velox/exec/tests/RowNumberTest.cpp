@@ -29,8 +29,8 @@ class RowNumberTest : public OperatorTestBase {
   RowNumberTest() {
     filesystems::registerLocalFileSystem();
     rowType_ = ROW(
-        {{"c0", INTEGER()},
-         {"c1", INTEGER()},
+        {{"c0", BIGINT()},
+         {"c1", BIGINT()},
          {"c2", VARCHAR()},
          {"c3", VARCHAR()}});
     fuzzerOpts_.vectorSize = 1024;
@@ -390,6 +390,8 @@ DEBUG_ONLY_TEST_F(RowNumberTest, spillOnlyDuringInputOrOutput) {
           }
 
           testingRunArbitration(op->pool(), 0);
+          // We expect all the memory to be freed after the spill.
+          ASSERT_EQ(op->pool()->usedBytes(), 40960);
         })));
 
     core::PlanNodeId rowNumberPlanNodeId;

@@ -31,6 +31,54 @@
 
 namespace facebook::velox::exec {
 
+/// Base class for views that need comparison. Default comparison is forbidden
+/// and this class requires specialization. For now, defaulting the
+/// == flag to be kNullAsValue and other comparison flag to be
+/// kNullAsIndeterminate. Can adjust in the future to be more configurable.
+template <typename T>
+struct ViewWithComparison {
+  friend bool operator==(const T& lhs, const T& rhs) {
+    static constexpr auto kEqualValueAtFlags =
+        CompareFlags::equality(CompareFlags::NullHandlingMode::kNullAsValue);
+    return compareOrThrow(lhs, rhs, kEqualValueAtFlags) == 0;
+  }
+
+  friend bool operator!=(const T& lhs, const T& rhs) {
+    return !(lhs == rhs);
+  }
+
+  friend bool operator<(const T& lhs, const T& rhs) {
+    return compareOrThrow(lhs, rhs) < 0;
+  }
+
+  friend bool operator>(const T& lhs, const T& rhs) {
+    return rhs < lhs;
+  }
+
+  friend bool operator<=(const T& lhs, const T& rhs) {
+    return !(lhs > rhs);
+  }
+
+  friend bool operator>=(const T& lhs, const T& rhs) {
+    return !(lhs < rhs);
+  }
+
+ private:
+  static int32_t compareOrThrow(
+      const T& lhs,
+      const T& rhs,
+      CompareFlags flags = CompareFlags{
+          .nullHandlingMode =
+              CompareFlags::NullHandlingMode::kNullAsIndeterminate}) {
+    auto result = lhs.compare(rhs, flags);
+    // Will throw if it encounters null elements before result is determined.
+    VELOX_DCHECK(
+        result.has_value(),
+        "Compare should have thrown when null is encountered in child.");
+    return result.value();
+  }
+};
+
 template <typename T>
 struct VectorReader;
 
@@ -927,7 +975,8 @@ class DynamicRowView {
 };
 
 template <bool returnsOptionalValues, typename... T>
-class RowView {
+class RowView
+    : public ViewWithComparison<RowView<returnsOptionalValues, T...>> {
   using reader_t = std::tuple<std::unique_ptr<VectorReader<T>>...>;
   using types = std::tuple<T...>;
 
@@ -967,9 +1016,39 @@ class RowView {
     return result;
   }
 
+  std::optional<int32_t> compare(const RowView& other, const CompareFlags flags)
+      const {
+    return compareImpl(other, flags);
+  }
+
  private:
   void initialize() {
     initializeImpl(std::index_sequence_for<T...>());
+  }
+
+  template <std::size_t Is = 0>
+  std::optional<int32_t> compareImpl(
+      const RowView& other,
+      const CompareFlags flags) const {
+    if constexpr (Is < sizeof...(T)) {
+      auto result =
+          std::get<Is>(*childReaders_)
+              ->baseVector()
+              ->compare(
+                  std::get<Is>(*other.childReaders_)->baseVector(),
+                  std::get<Is>(*childReaders_)->index(offset_),
+                  std::get<Is>(*other.childReaders_)->index(other.offset_),
+                  flags);
+      if (!result.has_value()) {
+        return std::nullopt;
+      }
+      if (result.value() != 0) {
+        return result;
+      }
+
+      return compareImpl<Is + 1>(other, flags);
+    }
+    return 0;
   }
 
   using children_types = std::tuple<T...>;
@@ -1068,7 +1147,7 @@ struct AllGenericExceptTop<Row<T...>> {
   }
 };
 
-class GenericView {
+class GenericView : public ViewWithComparison<GenericView> {
  public:
   GenericView(
       const DecodedVector& decoded,
@@ -1092,16 +1171,11 @@ class GenericView {
     return decoded_.base();
   }
 
-  bool operator==(const GenericView& other) const {
-    return decoded_.base()->equalValueAt(
-        other.decoded_.base(), decodedIndex(), other.decodedIndex());
-  }
-
   vector_size_t decodedIndex() const {
     return decoded_.index(index_);
   }
 
-  std::optional<int64_t> compare(
+  std::optional<int32_t> compare(
       const GenericView& other,
       const CompareFlags flags) const {
     return decoded_.base()->compare(
@@ -1208,12 +1282,70 @@ class GenericView {
   vector_size_t index_;
 };
 
+template <typename T>
+class CustomTypeWithCustomComparisonView {
+ public:
+  CustomTypeWithCustomComparisonView(
+      const T& value,
+      const std::shared_ptr<
+          const CanProvideCustomComparisonType<SimpleTypeTrait<T>::typeKind>>&
+          type)
+      : value_(value), type_(type) {}
+
+  bool operator!=(const CustomTypeWithCustomComparisonView<T>& other) const {
+    return type_->compare(value_, other.value_) != 0;
+  }
+
+  bool operator==(const CustomTypeWithCustomComparisonView<T>& other) const {
+    return type_->compare(value_, other.value_) == 0;
+  }
+
+  bool operator<(const CustomTypeWithCustomComparisonView<T>& other) const {
+    return type_->compare(value_, other.value_) < 0;
+  }
+
+  bool operator>(const CustomTypeWithCustomComparisonView<T>& other) const {
+    return type_->compare(value_, other.value_) > 0;
+  }
+
+  bool operator<=(const CustomTypeWithCustomComparisonView<T>& other) const {
+    return type_->compare(value_, other.value_) <= 0;
+  }
+
+  bool operator>=(const CustomTypeWithCustomComparisonView<T>& other) const {
+    return type_->compare(value_, other.value_) >= 0;
+  }
+
+  uint64_t hash() const {
+    return type_->hash(value_);
+  }
+
+  T operator*() const {
+    return value_;
+  }
+
+ private:
+  const T value_;
+  const std::shared_ptr<
+      const CanProvideCustomComparisonType<SimpleTypeTrait<T>::typeKind>>
+      type_;
+};
+
 } // namespace facebook::velox::exec
 
 namespace std {
 template <>
 struct hash<facebook::velox::exec::GenericView> {
   size_t operator()(const facebook::velox::exec::GenericView& x) const {
+    return x.hash();
+  }
+};
+
+template <typename T>
+struct hash<facebook::velox::exec::CustomTypeWithCustomComparisonView<T>> {
+  size_t operator()(
+      const facebook::velox::exec::CustomTypeWithCustomComparisonView<T>& x)
+      const {
     return x.hash();
   }
 };

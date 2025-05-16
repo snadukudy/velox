@@ -21,6 +21,13 @@
 namespace facebook::velox {
 
 namespace {
+// This is a struct used for computing the string offset in the string buffers.
+// See 'writeStringViews' for more
+struct BufferMetadata {
+  const char* start;
+  const char* end;
+  int64_t indexInStringBuffers;
+};
 
 enum class Encoding : int8_t {
   kFlat = 0,
@@ -31,7 +38,7 @@ enum class Encoding : int8_t {
 
 template <typename T>
 void write(const T& value, std::ostream& out) {
-  out.write((char*)&value, sizeof(T));
+  out.write(reinterpret_cast<const char*>(&value), sizeof(T));
 }
 
 template <>
@@ -48,7 +55,7 @@ void write<std::string>(const std::string& value, std::ostream& out) {
 template <typename T>
 T read(std::istream& in) {
   T value;
-  in.read((char*)&value, sizeof(T));
+  in.read(reinterpret_cast<char*>(&value), sizeof(T));
   return value;
 }
 
@@ -73,16 +80,16 @@ void writeEncoding(VectorEncoding::Simple encoding, std::ostream& out) {
     case VectorEncoding::Simple::ROW:
     case VectorEncoding::Simple::ARRAY:
     case VectorEncoding::Simple::MAP:
-      write<int32_t>((int8_t)Encoding::kFlat, out);
+      write<int32_t>(static_cast<int8_t>(Encoding::kFlat), out);
       return;
     case VectorEncoding::Simple::CONSTANT:
-      write<int32_t>((int8_t)Encoding::kConstant, out);
+      write<int32_t>(static_cast<int8_t>(Encoding::kConstant), out);
       return;
     case VectorEncoding::Simple::DICTIONARY:
-      write<int32_t>((int8_t)Encoding::kDictionary, out);
+      write<int32_t>(static_cast<int8_t>(Encoding::kDictionary), out);
       return;
     case VectorEncoding::Simple::LAZY:
-      write<int32_t>((int8_t)Encoding::kLazy, out);
+      write<int32_t>(static_cast<int8_t>(Encoding::kLazy), out);
       return;
     default:
       VELOX_UNSUPPORTED("Unsupported encoding: {}", mapSimpleToName(encoding));
@@ -102,11 +109,15 @@ Encoding readEncoding(std::istream& in) {
   }
 }
 
+/// Serializes a BufferPtr into binary format and writes it to the
+/// provided output stream. 'buffer' must be non-null.
 void writeBuffer(const BufferPtr& buffer, std::ostream& out) {
   write<int32_t>(buffer->size(), out);
   out.write(buffer->as<char>(), buffer->size());
 }
 
+/// Serializes a optional BufferPtr into binary format and writes it to the
+/// provided output stream.
 void writeOptionalBuffer(const BufferPtr& buffer, std::ostream& out) {
   if (buffer) {
     write<bool>(true, out);
@@ -116,6 +127,8 @@ void writeOptionalBuffer(const BufferPtr& buffer, std::ostream& out) {
   }
 }
 
+/// Deserializes a BufferPtr serialized by 'writeBuffer' from the provided
+/// input stream.
 BufferPtr readBuffer(std::istream& in, memory::MemoryPool* pool) {
   auto numBytes = read<int32_t>(in);
   auto buffer = AlignedBuffer::allocate<char>(numBytes, pool);
@@ -124,6 +137,8 @@ BufferPtr readBuffer(std::istream& in, memory::MemoryPool* pool) {
   return buffer;
 }
 
+/// Deserializes a optional BufferPtr serialized by 'writeOptionalBuffer' from
+/// the provided input stream.
 BufferPtr readOptionalBuffer(std::istream& in, memory::MemoryPool* pool) {
   bool hasBuffer = read<bool>(in);
   if (hasBuffer) {
@@ -152,10 +167,10 @@ VectorPtr createFlat(
       std::move(stringBuffers));
 }
 
-int32_t computeStringOffset(
+int64_t computeStringOffset(
     StringView value,
     const std::vector<BufferPtr>& stringBuffers) {
-  int32_t offset = 0;
+  int64_t offset = 0;
   for (const auto& buffer : stringBuffers) {
     auto start = buffer->as<char>();
 
@@ -166,6 +181,30 @@ int32_t computeStringOffset(
     offset += buffer->size();
   }
 
+  VELOX_FAIL("String view points outside of the string buffers");
+}
+
+int64_t computeStringOffsetWithBisect(
+    StringView value,
+    const std::vector<BufferPtr>& stringBuffers,
+    const std::vector<int64_t>& offsetSum,
+    const std::vector<BufferMetadata>& sortedStringBuffers) {
+  const char* valueData = value.data();
+  int64_t lo = 0;
+  int64_t hi = offsetSum.size() - 1;
+  while (lo <= hi) {
+    int64_t mid = lo + (hi - lo) / 2;
+    const auto& buffer = sortedStringBuffers[mid];
+    if (valueData >= buffer.start) {
+      if (valueData < buffer.end) {
+        return (valueData - buffer.start) +
+            offsetSum[buffer.indexInStringBuffers];
+      }
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
   VELOX_FAIL("String view points outside of the string buffers");
 }
 
@@ -192,6 +231,50 @@ void writeStringViews(
     std::ostream& out) {
   write<int32_t>(strings->size(), out);
 
+  // Compute the offset prefix sum in the stringBuffer based on their original
+  // position in stringBuffers
+  std::vector<int64_t> offsetSum;
+  offsetSum.reserve(stringBuffers.size());
+  int64_t cumulativeOffsetSum = 0;
+  for (const auto& buffer : stringBuffers) {
+    offsetSum.push_back(cumulativeOffsetSum);
+    cumulativeOffsetSum += buffer->size();
+  }
+
+  // Create a sorted list of the string buffer based on their start position.
+  // Track (start, end) of the buffer and the original index in 'stringBuffers'.
+  // The index is tracked to compute the offset prefix sum.
+  std::vector<BufferMetadata> sortedStringBuffers;
+  sortedStringBuffers.reserve(stringBuffers.size());
+  for (int64_t i = 0; i < stringBuffers.size(); ++i) {
+    sortedStringBuffers.push_back(BufferMetadata{
+        stringBuffers[i]->as<char>(),
+        stringBuffers[i]->as<char>() + stringBuffers[i]->size(),
+        i});
+  }
+
+  std::sort(
+      sortedStringBuffers.begin(),
+      sortedStringBuffers.end(),
+      [](const auto& lhs, const auto& rhs) { return lhs.start < rhs.start; });
+
+  bool canUseFastPath = false;
+  // Check for any overlapping ranges in the 'sortedStringBuffers'. If there
+  // are, we might as well take the slow path since we want to find the first
+  // element in 'stringBuffers' which contains the string view.
+  if (!sortedStringBuffers.empty()) {
+    auto maxEnd = sortedStringBuffers.front().end;
+    bool containsOverlappingRanges = false;
+    for (size_t i = 1; i < sortedStringBuffers.size(); ++i) {
+      if (sortedStringBuffers[i].start < maxEnd) {
+        containsOverlappingRanges = true;
+        break;
+      }
+      maxEnd = std::max(maxEnd, sortedStringBuffers[i].end);
+    }
+    canUseFastPath = !containsOverlappingRanges;
+  }
+
   auto rawBytes = strings->as<char>();
   auto rawValues = strings->as<StringView>();
   for (auto i = 0; i < size; ++i) {
@@ -207,7 +290,10 @@ void writeStringViews(
       write<int32_t>(0, out);
 
       // Offset.
-      auto offset = computeStringOffset(stringView, stringBuffers);
+      auto offset = canUseFastPath
+          ? computeStringOffsetWithBisect(
+                stringView, stringBuffers, offsetSum, sortedStringBuffers)
+          : computeStringOffset(stringView, stringBuffers);
       write<int64_t>(offset, out);
     }
   }
@@ -301,7 +387,7 @@ void writeScalarConstant(const BaseVector& vector, std::ostream& out) {
   using T = typename TypeTraits<kind>::NativeType;
 
   auto value = vector.as<ConstantVector<T>>()->valueAt(0);
-  out.write((const char*)&value, sizeof(T));
+  out.write(reinterpret_cast<const char*>(&value), sizeof(T));
 
   if constexpr (std::is_same_v<T, StringView>) {
     if (!value.isInline()) {
@@ -572,7 +658,6 @@ VectorPtr readLazyVector(
   return std::make_shared<LazyVector>(
       pool, type, size, std::make_unique<LoadedVectorShim>(loadedVector));
 }
-
 } // namespace
 
 void saveType(const TypePtr& type, std::ostream& out) {
@@ -641,6 +726,8 @@ void saveStringToFile(const std::string& content, const char* filePath) {
 }
 
 VectorPtr restoreVector(std::istream& in, memory::MemoryPool* pool) {
+  VELOX_CHECK_NOT_NULL(pool);
+
   // Encoding.
   auto encoding = readEncoding(in);
 
@@ -717,39 +804,6 @@ std::optional<std::string> generateFolderPath(
   return path;
 }
 
-template <typename T>
-void saveStdVectorToFile(const std::vector<T>& list, const char* filePath) {
-  std::ofstream outputFile(filePath, std::ofstream::binary);
-  // Size of the vector
-  write<int32_t>(list.size(), outputFile);
-
-  outputFile.write(
-      reinterpret_cast<const char*>(list.data()), list.size() * sizeof(T));
-  outputFile.close();
-}
-
-template void saveStdVectorToFile<column_index_t>(
-    const std::vector<column_index_t>& list,
-    const char* filePath);
-template void saveStdVectorToFile<int>(
-    const std::vector<int>& list,
-    const char* filePath);
-
-template <typename T>
-std::vector<T> restoreStdVectorFromFile(const char* filePath) {
-  std::ifstream in(filePath, std::ifstream::binary);
-  auto size = read<int32_t>(in);
-  std::vector<T> vec(size);
-
-  in.read(reinterpret_cast<char*>(vec.data()), size * sizeof(T));
-  in.close();
-  return vec;
-}
-
-template std::vector<column_index_t> restoreStdVectorFromFile<column_index_t>(
-    const char* filePath);
-template std::vector<int> restoreStdVectorFromFile<int>(const char* filePath);
-
 void saveSelectivityVector(const SelectivityVector& rows, std::ostream& out) {
   auto range = rows.asRange();
 
@@ -774,11 +828,26 @@ SelectivityVector restoreSelectivityVector(std::istream& in) {
   return rows;
 }
 
+void saveSelectivityVectorToFile(
+    const SelectivityVector& rows,
+    const char* filePath) {
+  std::ofstream outputFile(filePath, std::ofstream::binary);
+  saveSelectivityVector(rows, outputFile);
+  outputFile.close();
+}
+
+SelectivityVector restoreSelectivityVectorFromFile(const char* filePath) {
+  std::ifstream inputFile(filePath, std::ifstream::binary);
+  VELOX_CHECK(!inputFile.fail(), "Cannot open file: {}", filePath);
+  auto result = restoreSelectivityVector(inputFile);
+  inputFile.close();
+  return result;
+}
 } // namespace facebook::velox
 
 template <>
 struct fmt::formatter<facebook::velox::Encoding> : formatter<int> {
-  auto format(facebook::velox::Encoding s, format_context& ctx) {
+  auto format(facebook::velox::Encoding s, format_context& ctx) const {
     return formatter<int>::format(static_cast<int>(s), ctx);
   }
 };

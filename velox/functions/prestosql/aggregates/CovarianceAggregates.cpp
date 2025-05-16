@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/functions/prestosql/aggregates/CovarianceAggregates.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/functions/prestosql/aggregates/AggregateNames.h"
@@ -94,9 +95,10 @@ struct CovarAccumulator {
     double deltaMeanX = meanXOther - meanX();
     double deltaMeanY = meanYOther - meanY();
     c2_ += c2Other +
-        deltaMeanX * deltaMeanY * count() * countOther / (double)newCount;
-    meanX_ += deltaMeanX * countOther / (double)newCount;
-    meanY_ += deltaMeanY * countOther / (double)newCount;
+        deltaMeanX * deltaMeanY * count() * countOther /
+            static_cast<double>(newCount);
+    meanX_ += deltaMeanX * countOther / static_cast<double>(newCount);
+    meanY_ += deltaMeanY * countOther / static_cast<double>(newCount);
     count_ = newCount;
   }
 
@@ -674,7 +676,7 @@ class CovarianceAggregate : public exec::Aggregate {
         auto* accumulator = this->accumulator(group);
         if (TResultAccessor::hasResult(*accumulator)) {
           clearNull(rawNulls, i);
-          rawValues[i] = (T)TResultAccessor::result(*accumulator);
+          rawValues[i] = static_cast<T>(TResultAccessor::result(*accumulator));
         } else {
           vector->setNull(i, true);
         }
@@ -780,7 +782,7 @@ exec::AggregateRegistrationResult registerCovariance(
           default:
             VELOX_UNSUPPORTED(
                 "Unsupported raw input type: {}. Expected DOUBLE or REAL.",
-                rawInputType->toString())
+                rawInputType->toString());
         }
       },
       withCompanionFunctions,

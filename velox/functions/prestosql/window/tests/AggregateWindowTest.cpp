@@ -46,7 +46,7 @@ class AggregateWindowTest : public WindowTestBase {
   explicit AggregateWindowTest(const AggregateWindowTestParam& testParam)
       : function_(testParam.function), overClause_(testParam.overClause) {}
 
-  explicit AggregateWindowTest() : function_(""), overClause_("") {}
+  explicit AggregateWindowTest() {}
 
   void SetUp() override {
     WindowTestBase::SetUp();
@@ -420,6 +420,27 @@ TEST_F(AggregateWindowTest, zeroRangeFrame) {
   expected = makeFlatVector<int64_t>({3, 3, 1, 4, 2});
   test("range between k preceding and unbounded following", expected);
   test("range between k following and unbounded following", expected);
+}
+
+TEST_F(AggregateWindowTest, singlePartitionColumnForPrefixSort) {
+  auto size = 100;
+  auto input = makeRowVector(
+      {makeRandomInputVector(VARCHAR(), size, 0.0),
+       makeFlatVector<int64_t>(size, [](auto row) { return row; }),
+       makeFlatVector<int64_t>(size, [](auto row) { return row; })});
+  // Single partition with varchar column triggers window sorting to use
+  // std::sort instead of Prefix sort used for multi-key partition/order by
+  // cases.
+  WindowTestBase::testWindowFunction(
+      {input},
+      "sum(c2)",
+      {"partition by c0"},
+      {"rows between unbounded preceding and unbounded following"});
+  WindowTestBase::testWindowFunction(
+      {input},
+      "min(c2)",
+      {"partition by c0"},
+      {"rows between unbounded preceding and unbounded following"});
 }
 
 }; // namespace

@@ -24,7 +24,7 @@ using namespace facebook::velox::test;
 class EnsureWritableVectorTest : public testing::Test, public VectorTestBase {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 };
 
@@ -241,7 +241,7 @@ struct VectorPointersBase {
   }
 
   void assertUnique(const VectorPtr& vector) {
-    ASSERT_TRUE(vector.unique());
+    ASSERT_EQ(vector.use_count(), 1);
 
     auto* typedVector = vector->as<T>();
     ASSERT_EQ(nullsUnique, typedVector->nulls()->unique());
@@ -299,7 +299,7 @@ struct ArrayVectorPointers : public VectorPointersBase<ArrayVector> {
     VectorPointersBase<ArrayVector>::assertUnique(vector);
 
     auto* arrayVector = vector->as<ArrayVector>();
-    ASSERT_EQ(elementsUnique, arrayVector->elements().unique());
+    ASSERT_EQ(elementsUnique, (arrayVector->elements().use_count() == 1));
   }
 
   void assertPointers(const VectorPtr& vector) {
@@ -338,8 +338,8 @@ struct MapVectorPointers : public VectorPointersBase<MapVector> {
     VectorPointersBase<MapVector>::assertUnique(vector);
 
     auto* mapVector = vector->as<MapVector>();
-    ASSERT_EQ(keysUnique, mapVector->mapKeys().unique());
-    ASSERT_EQ(valuesUnique, mapVector->mapValues().unique());
+    ASSERT_EQ(keysUnique, (mapVector->mapKeys().use_count() == 1));
+    ASSERT_EQ(valuesUnique, (mapVector->mapValues().use_count() == 1));
   }
 
   void assertPointers(const VectorPtr& vector) {
@@ -476,11 +476,11 @@ TEST_F(EnsureWritableVectorTest, array) {
 
   // Multiply-referenced vector
   auto resultCopy = result;
-  ASSERT_FALSE(result.unique());
+  ASSERT_FALSE(result.use_count() == 1);
 
   auto oddRows = selectOddRows(size);
   BaseVector::ensureWritable(oddRows, result->type(), pool(), result);
-  ASSERT_TRUE(result.unique());
+  ASSERT_TRUE(result.use_count() == 1);
   ASSERT_NE(resultCopy.get(), result.get());
 
   // Verify that even rows were copied over
@@ -601,11 +601,11 @@ TEST_F(EnsureWritableVectorTest, map) {
 
   // Multiply-referenced vector
   auto resultCopy = result;
-  ASSERT_FALSE(result.unique());
+  ASSERT_FALSE(result.use_count() == 1);
 
   auto oddRows = selectOddRows(size);
   BaseVector::ensureWritable(oddRows, result->type(), pool(), result);
-  ASSERT_TRUE(result.unique());
+  ASSERT_TRUE(result.use_count() == 1);
   ASSERT_NE(resultCopy.get(), result.get());
 
   // Verify that even rows were copied over
@@ -919,5 +919,24 @@ TEST_F(EnsureWritableVectorTest, dataDependentFlags) {
         createVector, ensureWritableInstance, SelectivityVector{1});
     test::checkVectorFlagsReset(
         createVector, ensureWritableStatic, SelectivityVector{1});
+  }
+}
+
+TEST_F(EnsureWritableVectorTest, lazyMap) {
+  // Check that the flattened vector has the correct size.
+  {
+    const vector_size_t size = 100;
+    VectorPtr lazy = std::make_shared<LazyVector>(
+        pool(),
+        BIGINT(),
+        size,
+        std::make_unique<test::SimpleVectorLoader>([&](auto) {
+          return BaseVector::createConstant(
+              BIGINT(), variant::create<TypeKind::BIGINT>(123), size, pool());
+        }));
+    BaseVector::ensureWritable(
+        SelectivityVector::empty(), BIGINT(), pool(), lazy);
+    EXPECT_EQ(VectorEncoding::Simple::FLAT, lazy->encoding());
+    EXPECT_EQ(size, lazy->size());
   }
 }

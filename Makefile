@@ -13,6 +13,7 @@
 # limitations under the License.
 .PHONY: all cmake build clean debug release unit
 
+SHELL=/bin/bash
 BUILD_BASE_DIR=_build
 BUILD_DIR=release
 BUILD_TYPE=Release
@@ -20,6 +21,9 @@ BENCHMARKS_BASIC_DIR=$(BUILD_BASE_DIR)/$(BUILD_DIR)/velox/benchmarks/basic/
 BENCHMARKS_DUMP_DIR=dumps
 TREAT_WARNINGS_AS_ERRORS ?= 1
 ENABLE_WALL ?= 1
+PYTHON_VENV ?= .venv
+PIP ?= $(shell command -v uv > /dev/null 2>&1 && echo "uv pip" || echo "python3 -m pip")
+VENV ?= $(shell command -v uv > /dev/null 2>&1 && echo "uv venv" || echo "python3 -m venv")
 
 # Option to make a minimal build. By default set to "OFF"; set to
 # "ON" to only build a minimal set of components. This may override
@@ -81,7 +85,7 @@ CPU_TARGET ?= "avx"
 FUZZER_SEED ?= 123456
 FUZZER_DURATION_SEC ?= 60
 
-PYTHON_EXECUTABLE ?= $(shell which python)
+PYTHON_EXECUTABLE ?= $(shell which python3)
 
 all: release			#: Build the release version
 
@@ -96,15 +100,18 @@ cmake:					#: Use CMake to create a Makefile build system
 		$(GENERATOR) \
 		${EXTRA_CMAKE_FLAGS}
 
-cmake-gpu:
-	$(MAKE) EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_ENABLE_GPU=ON" cmake
+cmake-wave:
+	$(MAKE) EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_ENABLE_WAVE=ON" cmake
+
+cmake-cudf:
+	$(MAKE) EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_ENABLE_CUDF=ON" cmake
 
 build:					#: Build the software based in BUILD_DIR and BUILD_TYPE variables
 	cmake --build $(BUILD_BASE_DIR)/$(BUILD_DIR) -j $(NUM_THREADS)
 
 debug:					#: Build with debugging symbols
 	$(MAKE) cmake BUILD_DIR=debug BUILD_TYPE=Debug
-	$(MAKE) build BUILD_DIR=debug -j ${NUM_THREADS}
+	$(MAKE) build BUILD_DIR=debug
 
 release:				#: Build the release version
 	$(MAKE) cmake BUILD_DIR=release BUILD_TYPE=Release && \
@@ -120,12 +127,20 @@ minimal:				 #: Minimal build
 	$(MAKE) cmake BUILD_DIR=release BUILD_TYPE=release EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_BUILD_MINIMAL=ON"
 	$(MAKE) build BUILD_DIR=release
 
-gpu:						 #: Build with GPU support
-	$(MAKE) cmake BUILD_DIR=release BUILD_TYPE=release EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_ENABLE_GPU=ON"
+wave:			   	         #: Build with Wave GPU support
+	$(MAKE) cmake-wave BUILD_DIR=release BUILD_TYPE=release
 	$(MAKE) build BUILD_DIR=release
 
-gpu_debug:			 #: Build with debugging symbols and GPU support
-	$(MAKE) cmake BUILD_DIR=debug BUILD_TYPE=debug EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_ENABLE_GPU=ON"
+cudf:			   	         #: Build with cuDF GPU support
+	$(MAKE) cmake-cudf BUILD_DIR=release BUILD_TYPE=release
+	$(MAKE) build BUILD_DIR=release
+
+wave-debug:			 #: Build with debugging symbols and Wave GPU support
+	$(MAKE) cmake-wave BUILD_DIR=debug BUILD_TYPE=debug
+	$(MAKE) build BUILD_DIR=debug
+
+cudf-debug:			 #: Build with debugging symbols and cuDF GPU support
+	$(MAKE) cmake-cudf BUILD_DIR=debug BUILD_TYPE=debug
 	$(MAKE) build BUILD_DIR=debug
 
 dwio:						#: Minimal build with dwio enabled.
@@ -141,12 +156,14 @@ dwio_debug:			#: Minimal build with dwio debugging symbols.
 benchmarks-basic-build:
 	$(MAKE) release EXTRA_CMAKE_FLAGS=" ${EXTRA_CMAKE_FLAGS} \
                                             -DVELOX_BUILD_TESTING=OFF \
-                                            -DVELOX_ENABLE_BENCHMARKS_BASIC=ON"
+                                            -DVELOX_ENABLE_BENCHMARKS_BASIC=ON \
+					    -DVELOX_BUILD_RUNNER=OFF"
 
 benchmarks-build:
 	$(MAKE) release EXTRA_CMAKE_FLAGS=" ${EXTRA_CMAKE_FLAGS} \
                                             -DVELOX_BUILD_TESTING=OFF \
-                                            -DVELOX_ENABLE_BENCHMARKS=ON"
+                                            -DVELOX_ENABLE_BENCHMARKS=ON \
+					    -DVELOX_BUILD_RUNNER=OFF"
 
 benchmarks-basic-run:
 	scripts/benchmark-runner.py run \
@@ -169,17 +186,33 @@ fuzzertest: debug
 			--minloglevel=0
 
 format-fix: 			#: Fix formatting issues in the main branch
+ifneq ("$(wildcard ${PYTHON_VENV}/pyvenv.cfg)","")
+	source ${PYTHON_VENV}/bin/activate; scripts/check.py format main --fix
+else
 	scripts/check.py format main --fix
+endif
 
 format-check: 			#: Check for formatting issues on the main branch
 	clang-format --version
+ifneq ("$(wildcard ${PYTHON_VENV}/pyvenv.cfg)","")
+	source ${PYTHON_VENV}/bin/activate; scripts/check.py format main
+else
 	scripts/check.py format main
+endif
 
-header-fix:				#: Fix license header issues in the current branch
+header-fix:			#: Fix license header issues in the current branch
+ifneq ("$(wildcard ${PYTHON_VENV}/pyvenv.cfg)","")
+	source ${PYTHON_VENV}/bin/activate; scripts/check.py header main --fix
+else
 	scripts/check.py header main --fix
+endif
 
 header-check:			#: Check for license header issues on the main branch
+ifneq ("$(wildcard ${PYTHON_VENV}/pyvenv.cfg)","")
+	source ${PYTHON_VENV}/bin/activate; scripts/check.py header main
+else
 	scripts/check.py header main
+endif
 
 circleci-container:			#: Build the linux container for CircleCi
 	$(MAKE) linux-container CONTAINER_NAME=circleci
@@ -199,12 +232,26 @@ help:					#: Show the help messages
 	awk '/^[-a-z]+:/' | \
 	awk -F: '{ printf("%-20s   %s\n", $$1, $$NF) }'
 
-python-clean:
-	DEBUG=1 ${PYTHON_EXECUTABLE} setup.py clean
+python-venv:
+	@if [ ! -f ${PYTHON_VENV}/pyvenv.cfg ]; then \
+		${VENV} $(PYTHON_VENV); \
+	fi
 
-python-build:
-	DEBUG=1 CMAKE_BUILD_PARALLEL_LEVEL=${NUM_THREADS} ${PYTHON_EXECUTABLE} -m pip install -e .$(extras) --verbose
+check-pip-version: python-venv # We need a recent pip for '-C'
+	@if [ "$(PIP)" == "uv pip" ]; then \
+		exit 0; \
+	fi; \
+	source .venv/bin/activate; \
+	pip_version=$$($(PIP) --version | sed -E 's/pip ([0-9]+)\.([0-9]+).*/\1/'); \
+	if [ "$$pip_version" -lt 25 ]; then \
+		$(PIP) install --upgrade pip; \
+	fi
 
-python-test:
-	$(MAKE) python-build extras="[tests]"
-	DEBUG=1 ${PYTHON_EXECUTABLE} -m unittest -v
+python-build: check-pip-version
+	source .venv/bin/activate; \
+	$(PIP) install pyarrow scikit_build_core setuptools_scm[toml]; \
+	${PIP} install --no-build-isolation -Ccmake.build-type=Debug -Cbuild.tool-args="-j${NUM_THREADS}" -v .
+
+python-test: python-build
+	source .venv/bin/activate; \
+	python3 -m unittest discover -v -s python/test

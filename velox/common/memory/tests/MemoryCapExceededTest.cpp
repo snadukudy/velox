@@ -68,14 +68,31 @@ TEST_P(MemoryCapExceededTest, singleDriver) {
   // We look for these lines separately, since their order can change (not sure
   // why).
   std::vector<std::string> expectedTexts = {
-      "Exceeded memory pool cap of 5.00MB with max 5.00MB when requesting "
-      "2.00MB, memory manager cap is 8.00GB, requestor "
-      "'op.2.0.0.Aggregation' with current usage 3.70MB"};
+      "Can't grow ",
+      "capacity with 2.00MB. This will exceed its max capacity 5.00MB, current "
+      "capacity 5.00MB.\n"
+      "ARBITRATOR[SHARED CAPACITY[6.00GB] STATS[numRequests 1 numRunning 1 "
+      "numSucceded 0 numAborted 0 numFailures 0 numNonReclaimableAttempts 0 "
+      "reclaimedFreeCapacity 0B reclaimedUsedCapacity 0B maxCapacity 6.00GB "
+      "freeCapacity 5.50GB freeReservedCapacity 0B] CONFIG[kind=SHARED;"
+      "capacity=6.00GB;arbitrationStateCheckCb=(set);"
+      "memory-pool-abort-capacity-limit=0B;memory-pool-min-reclaim-pct=0;"
+      "memory-pool-reserved-capacity=0B;"
+      "memory-pool-initial-capacity=536870912B;"
+      "global-arbitration-enabled=true;memory-pool-min-reclaim-bytes=0B;"
+      "reserved-capacity=0B;]]"
+      "\n\n"
+      "Memory Pool[",
+      " AGGREGATE root[",
+      "] parent[null] MALLOC track-usage thread-safe]<max capacity 5.00MB "
+      "capacity 5.00MB used 3.75MB available 0B reservation [used 0B, reserved "
+      "5.00MB, min 0B] counters [allocs 0, frees 0, reserves 0, releases 0, "
+      "collisions 0])>"};
   std::vector<std::string> expectedDetailedTexts = {
       "node.1 usage 12.00KB reserved 1.00MB peak 1.00MB",
       "op.1.0.0.FilterProject usage 12.00KB reserved 1.00MB peak 12.00KB",
-      "node.2 usage 3.70MB reserved 4.00MB peak 4.00MB",
-      "op.2.0.0.Aggregation usage 3.70MB reserved 4.00MB peak 3.70MB",
+      "node.2 usage 3.74MB reserved 4.00MB peak 4.00MB",
+      "op.2.0.0.Aggregation usage 3.74MB reserved 4.00MB peak 3.74MB",
       "Top 2 leaf memory pool usages:"};
 
   std::vector<RowVectorPtr> data;
@@ -103,25 +120,25 @@ TEST_P(MemoryCapExceededTest, singleDriver) {
   params.queryCtx = queryCtx;
   params.maxDrivers = 1;
   try {
-    readCursor(params, [](Task*) {});
+    readCursor(params);
     FAIL() << "Expected a MEM_CAP_EXCEEDED RuntimeException.";
   } catch (const VeloxException& e) {
     const auto errorMessage = e.message();
     for (const auto& expectedText : expectedTexts) {
       ASSERT_TRUE(errorMessage.find(expectedText) != std::string::npos)
-          << "Expected error message to contain '" << expectedText
-          << "', but received '" << errorMessage << "'.";
+          << "Expected error message to contain \n'" << expectedText
+          << "',\n but received \n'" << errorMessage << "'.";
     }
     for (const auto& expectedText : expectedDetailedTexts) {
       LOG(ERROR) << expectedText;
       if (!GetParam()) {
         ASSERT_TRUE(someLineMatches(errorMessage, expectedText))
-            << "Expected error message to contain '" << expectedText
-            << "', but received '" << errorMessage << "'.";
+            << "Expected error message to contain \n'" << expectedText
+            << "',\n but received \n'" << errorMessage << "'.";
       } else {
         ASSERT_TRUE(errorMessage.find(expectedText) == std::string::npos)
-            << "Unexpected error message to contain '" << expectedText
-            << "', but received '" << errorMessage << "'.";
+            << "Unexpected error message to contain \n'" << expectedText
+            << "',\n but received \n'" << errorMessage << "'.";
       }
     }
   }
@@ -163,7 +180,7 @@ TEST_P(MemoryCapExceededTest, multipleDrivers) {
   params.queryCtx = queryCtx;
   params.maxDrivers = numDrivers;
   try {
-    readCursor(params, [](Task*) {});
+    readCursor(params);
     FAIL() << "Expected a MEM_CAP_EXCEEDED RuntimeException.";
   } catch (const VeloxException& e) {
     const auto errorMessage = e.message();
@@ -191,22 +208,22 @@ TEST_P(MemoryCapExceededTest, allocatorCapacityExceededError) {
        false,
        std::vector<std::string>{
            "allocateContiguous failed with .* pages",
-           "max capacity 128.00MB unlimited capacity used .* available .*",
+           "max capacity 128.00MB capacity 128.00MB used .* available .*",
            ".* reservation .used .*MB, reserved .*MB, min 0B. counters",
            "allocs .*, frees .*, reserves .*, releases .*, collisions .*"}},
       {64LL << 20,
        true,
        std::vector<std::string>{
            "allocateContiguous failed with .* pages",
-           "max capacity 128.00MB unlimited capacity used .* available .*",
+           "max capacity 128.00MB capacity 128.00MB used .* available .*",
            ".* reservation .used .*MB, reserved .*MB, min .*B. counters",
            ".*, frees .*, reserves .*, releases .*, collisions .*"}}};
   for (const auto& testData : testSettings) {
-    memory::MemoryManager manager(
-        {.allocatorCapacity = (int64_t)testData.allocatorCapacity,
-         .useMmapAllocator = testData.useMmap,
-         .arbitratorCapacity = (int64_t)testData.allocatorCapacity,
-         .arbitratorReservedCapacity = 0});
+    memory::MemoryManager::Options options;
+    options.allocatorCapacity = (int64_t)testData.allocatorCapacity;
+    options.useMmapAllocator = testData.useMmap;
+    options.arbitratorCapacity = (int64_t)testData.allocatorCapacity;
+    memory::MemoryManager manager(options);
 
     vector_size_t size = 1'024;
     // This limit ensures that only the Aggregation Operator fails.
@@ -237,7 +254,7 @@ TEST_P(MemoryCapExceededTest, allocatorCapacityExceededError) {
     params.queryCtx = queryCtx;
     params.maxDrivers = 1;
     try {
-      readCursor(params, [](Task*) {});
+      readCursor(params);
       FAIL() << "Expected a MEM_CAP_EXCEEDED RuntimeException.";
     } catch (const VeloxException& e) {
       const auto errorMessage = e.message();

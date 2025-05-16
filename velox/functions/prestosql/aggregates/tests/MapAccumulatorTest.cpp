@@ -21,11 +21,12 @@ namespace facebook::velox::aggregate::prestosql {
 
 namespace {
 
-class MapAccumulatorTest : public testing::Test, public test::VectorTestBase {
+class MapAccumulatorTest : public testing::Test,
+                           public velox::test::VectorTestBase {
  protected:
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   // Takes a vector of unique keys and a matching vector of non-null values.

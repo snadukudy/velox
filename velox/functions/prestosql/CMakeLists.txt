@@ -15,7 +15,7 @@ add_subdirectory(json)
 add_subdirectory(types)
 add_subdirectory(window)
 
-add_library(
+velox_add_library(
   velox_functions_prestosql_impl
   ArrayConstructor.cpp
   ArrayContains.cpp
@@ -23,6 +23,7 @@ add_library(
   ArrayDuplicates.cpp
   ArrayIntersectExcept.cpp
   ArrayAndMapMatch.cpp
+  ArrayMinMaxBy.cpp
   ArrayPosition.cpp
   ArraySort.cpp
   ArraySum.cpp
@@ -45,7 +46,6 @@ add_library(
   RowFunction.cpp
   Sequence.cpp
   SimpleComparisonMatcher.cpp
-  Slice.cpp
   Split.cpp
   SplitToMap.cpp
   StringFunctions.cpp
@@ -55,28 +55,35 @@ add_library(
   TransformKeys.cpp
   TransformValues.cpp
   TypeOf.cpp
+  URIParser.cpp
   URLFunctions.cpp
-  Utf8Utils.cpp
   VectorArithmetic.cpp
   WidthBucketArray.cpp
   Zip.cpp
   ZipWith.cpp)
 
-target_link_libraries(
+velox_link_libraries(
   velox_functions_prestosql_impl
   velox_common_hyperloglog
   velox_functions_json
   velox_functions_lib
   velox_expression
-  md5
+  velox_external_md5
   velox_type_tz
   velox_presto_types
   velox_functions_util
   Folly::folly
   stemmer::stemmer)
 
-set_property(TARGET velox_functions_prestosql_impl PROPERTY JOB_POOL_COMPILE
-                                                            high_memory_pool)
+if(VELOX_ENABLE_GEO)
+  add_subdirectory(geospatial)
+  velox_link_libraries(velox_functions_prestosql_impl velox_functions_geo)
+endif()
+
+if(NOT VELOX_MONO_LIBRARY)
+  set_property(TARGET velox_functions_prestosql_impl PROPERTY JOB_POOL_COMPILE
+                                                              high_memory_pool)
+endif()
 
 if(${VELOX_ENABLE_AGGREGATES})
   add_subdirectory(aggregates)

@@ -58,7 +58,7 @@ void insertRandomData(int seed, int n, KllSketch<double>& kll, double* values) {
 class KllSketchTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 };
 
@@ -249,7 +249,6 @@ TEST_F(KllSketchTest, serialize) {
 }
 
 TEST_F(KllSketchTest, deserialize) {
-  constexpr int N = 1e5;
   constexpr int M = 1001;
   auto readFile = [](const std::string& path) {
     std::ifstream input(path);

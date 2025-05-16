@@ -38,6 +38,7 @@ class ArbitraryResultVerifier : public ResultVerifier {
 
   void initialize(
       const std::vector<RowVectorPtr>& input,
+      const std::vector<core::ExprPtr>& projections,
       const std::vector<std::string>& groupingKeys,
       const core::AggregationNode::Aggregate& aggregate,
       const std::string& aggregateName) override {
@@ -58,6 +59,7 @@ class ArbitraryResultVerifier : public ResultVerifier {
     auto plan =
         PlanBuilder(planNodeIdGenerator, input[0]->pool())
             .values(input)
+            .projectExpressions(projections)
             .singleAggregation(groupingKeys, {makeArrayAggCall(aggregate)})
             .project(projectColumns)
             .planNode();
@@ -133,10 +135,10 @@ class ArbitraryResultVerifier : public ResultVerifier {
   std::string makeArrayAggCall(
       const core::AggregationNode::Aggregate& aggregate) {
     const auto& args = aggregate.call->inputs();
-    VELOX_CHECK_GE(args.size(), 1)
+    VELOX_CHECK_GE(args.size(), 1);
 
     auto inputField = core::TypedExprs::asFieldAccess(args[0]);
-    VELOX_CHECK_NOT_NULL(inputField)
+    VELOX_CHECK_NOT_NULL(inputField);
 
     std::string arrayAggCall = fmt::format("array_agg({})", inputField->name());
 

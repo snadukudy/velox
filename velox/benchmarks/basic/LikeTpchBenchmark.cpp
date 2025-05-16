@@ -48,7 +48,7 @@ enum class TpchBenchmarkCase {
 
 template <>
 struct fmt::formatter<TpchBenchmarkCase> : fmt::formatter<int> {
-  auto format(const TpchBenchmarkCase& s, format_context& ctx) {
+  auto format(const TpchBenchmarkCase& s, format_context& ctx) const {
     return formatter<int>::format(static_cast<int>(s), ctx);
   }
 };
@@ -243,7 +243,7 @@ BENCHMARK(tpchQuery20) {
 
 int main(int argc, char* argv[]) {
   folly::Init init{&argc, &argv, true};
-  memory::MemoryManager::initialize({});
+  memory::MemoryManager::initialize(memory::MemoryManager::Options{});
   benchmark = std::make_unique<LikeFunctionsBenchmark>();
   folly::runBenchmarks();
   benchmark.reset();

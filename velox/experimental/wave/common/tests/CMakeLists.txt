@@ -17,21 +17,25 @@ add_executable(
   GpuArenaTest.cpp
   CudaTest.cpp
   CudaTest.cu
+  BreezeCudaTest.cu
+  CompileTest.cu
   BlockTest.cpp
   BlockTest.cu
   HashTableTest.cpp
   HashTestUtil.cpp)
 
 add_test(velox_wave_common_test velox_wave_common_test)
+set_tests_properties(velox_wave_common_test PROPERTIES LABELS cuda_driver)
 
+if(VELOX_SKIP_WAVE_BRANCH_KERNEL_TEST)
+  target_compile_definitions(velox_wave_common_test
+                             PRIVATE VELOX_SKIP_WAVE_BRANCH_KERNEL_TEST=1)
+endif()
 target_link_libraries(
   velox_wave_common_test
   velox_wave_common
-  velox_memory
-  velox_time
-  velox_exception
-  gtest
-  gtest_main
-  gflags::gflags
-  glog::glog
-  Folly::folly)
+  xsimd
+  GTest::gtest
+  GTest::gtest_main
+  CUDA::cudart
+  breeze_cuda)

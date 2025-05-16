@@ -14,203 +14,27 @@
  * limitations under the License.
  */
 #pragma once
+
 #include <folly/Synchronized.h>
-#include "velox/common/base/RuntimeMetrics.h"
-#include "velox/common/time/CpuWallTimer.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/JoinBridge.h"
-#include "velox/exec/Spiller.h"
+#include "velox/exec/OperatorStats.h"
+#include "velox/exec/OperatorTraceWriter.h"
 #include "velox/type/Filter.h"
 
 namespace facebook::velox::exec {
 
-// Represents a column that is copied from input to output, possibly
-// with cardinality change, i.e. values removed or duplicated.
+/// Represents a column that is copied from input to output, possibly
+/// with cardinality change, i.e. values removed or duplicated.
 struct IdentityProjection {
   IdentityProjection(
       column_index_t _inputChannel,
       column_index_t _outputChannel)
       : inputChannel(_inputChannel), outputChannel(_outputChannel) {}
 
-  const column_index_t inputChannel;
-  const column_index_t outputChannel;
-};
-
-struct MemoryStats {
-  uint64_t userMemoryReservation{0};
-  uint64_t revocableMemoryReservation{0};
-  uint64_t systemMemoryReservation{0};
-  uint64_t peakUserMemoryReservation{0};
-  uint64_t peakSystemMemoryReservation{0};
-  uint64_t peakTotalMemoryReservation{0};
-  uint64_t numMemoryAllocations{0};
-
-  void add(const MemoryStats& other) {
-    userMemoryReservation += other.userMemoryReservation;
-    revocableMemoryReservation += other.revocableMemoryReservation;
-    systemMemoryReservation += other.systemMemoryReservation;
-    peakUserMemoryReservation =
-        std::max(peakUserMemoryReservation, other.peakUserMemoryReservation);
-    peakSystemMemoryReservation = std::max(
-        peakSystemMemoryReservation, other.peakSystemMemoryReservation);
-    peakTotalMemoryReservation =
-        std::max(peakTotalMemoryReservation, other.peakTotalMemoryReservation);
-    numMemoryAllocations += other.numMemoryAllocations;
-  }
-
-  void clear() {
-    userMemoryReservation = 0;
-    revocableMemoryReservation = 0;
-    systemMemoryReservation = 0;
-    peakUserMemoryReservation = 0;
-    peakSystemMemoryReservation = 0;
-    peakTotalMemoryReservation = 0;
-    numMemoryAllocations = 0;
-  }
-
-  static MemoryStats memStatsFromPool(const memory::MemoryPool* pool) {
-    const auto poolStats = pool->stats();
-    MemoryStats memStats;
-    memStats.userMemoryReservation = poolStats.usedBytes;
-    memStats.systemMemoryReservation = 0;
-    memStats.peakUserMemoryReservation = poolStats.peakBytes;
-    memStats.peakSystemMemoryReservation = 0;
-    memStats.peakTotalMemoryReservation = poolStats.peakBytes;
-    memStats.numMemoryAllocations = poolStats.numAllocs;
-    return memStats;
-  }
-};
-
-/// Records the dynamic filter stats of an operator.
-struct DynamicFilterStats {
-  /// The set of plan node ids that produce the dynamic filter added to an
-  /// operator. If it is empty, then there is no dynamic filter added.
-  std::unordered_set<core::PlanNodeId> producerNodeIds;
-
-  void clear() {
-    producerNodeIds.clear();
-  }
-
-  void add(const DynamicFilterStats& other) {
-    producerNodeIds.insert(
-        other.producerNodeIds.begin(), other.producerNodeIds.end());
-  }
-
-  bool empty() const {
-    return producerNodeIds.empty();
-  }
-};
-
-struct OperatorStats {
-  /// Initial ordinal position in the operator's pipeline.
-  int32_t operatorId = 0;
-  int32_t pipelineId = 0;
-  core::PlanNodeId planNodeId;
-
-  /// Name for reporting. We use Presto compatible names set at
-  /// construction of the Operator where applicable.
-  std::string operatorType;
-
-  /// Number of splits (or chunks of work). Split can be a part of data file to
-  /// read.
-  int64_t numSplits{0};
-
-  /// Bytes read from raw source, e.g. compressed file or network connection.
-  uint64_t rawInputBytes = 0;
-  uint64_t rawInputPositions = 0;
-
-  CpuWallTiming addInputTiming;
-
-  /// Bytes of input in terms of retained size of input vectors.
-  uint64_t inputBytes = 0;
-  uint64_t inputPositions = 0;
-
-  /// Contains the dynamic filters stats if applied.
-  DynamicFilterStats dynamicFilterStats;
-
-  /// Number of input batches / vectors. Allows to compute an average batch
-  /// size.
-  uint64_t inputVectors = 0;
-
-  CpuWallTiming getOutputTiming;
-
-  /// Bytes of output in terms of retained size of vectors.
-  uint64_t outputBytes = 0;
-  uint64_t outputPositions = 0;
-
-  /// Number of output batches / vectors. Allows to compute an average batch
-  /// size.
-  uint64_t outputVectors = 0;
-
-  uint64_t physicalWrittenBytes = 0;
-
-  uint64_t blockedWallNanos = 0;
-
-  CpuWallTiming finishTiming;
-
-  // CPU time spent on background activities (activities that are not
-  // running on driver threads). Operators are responsible to report background
-  // CPU time at a reasonable time granularity.
-  CpuWallTiming backgroundTiming;
-
-  MemoryStats memoryStats;
-
-  // Total bytes in memory for spilling
-  uint64_t spilledInputBytes{0};
-
-  // Total bytes written to file for spilling.
-  uint64_t spilledBytes{0};
-
-  // Total rows written for spilling.
-  uint64_t spilledRows{0};
-
-  // Total spilled partitions.
-  uint32_t spilledPartitions{0};
-
-  // Total current spilled files.
-  uint32_t spilledFiles{0};
-
-  // Last recorded values for lazy loading times for loads triggered by 'this'.
-  int64_t lastLazyCpuNanos{0};
-  int64_t lastLazyWallNanos{0};
-
-  // Total null keys processed by the operator.
-  // Currently populated only by HashJoin/HashBuild.
-  // HashProbe doesn't populate numNullKeys when build side is empty.
-  int64_t numNullKeys{0};
-
-  std::unordered_map<std::string, RuntimeMetric> runtimeStats;
-
-  int numDrivers = 0;
-
-  OperatorStats() = default;
-
-  OperatorStats(
-      int32_t _operatorId,
-      int32_t _pipelineId,
-      std::string _planNodeId,
-      std::string _operatorType)
-      : operatorId(_operatorId),
-        pipelineId(_pipelineId),
-        planNodeId(std::move(_planNodeId)),
-        operatorType(std::move(_operatorType)) {}
-
-  void addInputVector(uint64_t bytes, uint64_t positions) {
-    inputBytes += bytes;
-    inputPositions += positions;
-    inputVectors += 1;
-  }
-
-  void addOutputVector(uint64_t bytes, uint64_t positions) {
-    outputBytes += bytes;
-    outputPositions += positions;
-    outputVectors += 1;
-  }
-
-  void addRuntimeStat(const std::string& name, const RuntimeCounter& value);
-  void add(const OperatorStats& other);
-  void clear();
+  column_index_t inputChannel;
+  column_index_t outputChannel;
 };
 
 class OperatorCtx {
@@ -243,7 +67,7 @@ class OperatorCtx {
     return planNodeId_;
   }
 
-  const int32_t operatorId() const {
+  int32_t operatorId() const {
     return operatorId_;
   }
 
@@ -330,9 +154,16 @@ class Operator : public BaseRuntimeStatWriter {
 
   /// The name of the runtime spill stats collected and reported by operators
   /// that support spilling.
+
+  /// This indicates the spill not supported for a spillable operator when the
+  /// spill config is enabled. This is due to the spill limitation in certain
+  /// plan node config such as unpartition window operator.
+  static inline const std::string kSpillNotSupported{"spillNotSupported"};
   /// The spill write stats.
   static inline const std::string kSpillFillTime{"spillFillWallNanos"};
   static inline const std::string kSpillSortTime{"spillSortWallNanos"};
+  static inline const std::string kSpillExtractVectorTime{
+      "spillExtractVectorWallNanos"};
   static inline const std::string kSpillSerializationTime{
       "spillSerializationWallNanos"};
   static inline const std::string kSpillFlushTime{"spillFlushWallNanos"};
@@ -347,6 +178,15 @@ class Operator : public BaseRuntimeStatWriter {
   static inline const std::string kSpillReadTime{"spillReadWallNanos"};
   static inline const std::string kSpillDeserializationTime{
       "spillDeserializationWallNanos"};
+
+  /// The vector serde kind used by an operator for shuffle. The recorded
+  /// runtime stats value is the corresponding enum value.
+  static inline const std::string kShuffleSerdeKind{"shuffleSerdeKind"};
+
+  /// The compression kind used by an operator for shuffle. The recorded
+  /// runtime stats value is the corresponding enum value.
+  static inline const std::string kShuffleCompressionKind{
+      "shuffleCompressionKind"};
 
   /// 'operatorId' is the initial index of the 'this' in the Driver's list of
   /// Operators. This is used as in index into OperatorStats arrays in the Task.
@@ -398,6 +238,29 @@ class Operator : public BaseRuntimeStatWriter {
     noMoreInput_ = true;
   }
 
+  /// Invoked by the driver to start draining output on this operator. The
+  /// function returns true if this operator has buffered output to drain.
+  /// Otherwise false and the driver directly proceeds to the next operator to
+  /// drain.
+  virtual bool startDrain() {
+    VELOX_NYI();
+    return false;
+  }
+
+  /// Returns true if this operator is draining output.
+  bool isDraining() const;
+
+  /// Returns true if this operator has drained all its buffered output, and the
+  /// associated driver is still draining.
+  bool hasDrained() const;
+
+  /// Returns true if this operator needs to drop output. This is used to
+  /// drop all the input processing for a draining operator which doesn't
+  /// need any more input to quickly finish the drain operation, e.g. a draining
+  /// merge join operator decides to drop inputs from both sides when it
+  /// can't produce any more match outputs.
+  bool shouldDropOutput() const;
+
   /// Returns a RowVector with the result columns. Returns nullptr if
   /// no more output can be produced without more input or if blocked
   /// for outside causes. isBlocked distinguishes between the
@@ -419,6 +282,12 @@ class Operator : public BaseRuntimeStatWriter {
   /// receives specified number of rows and HashProbe finishes early if the
   /// build side is empty.
   virtual bool isFinished() = 0;
+
+  /// Traces input batch of the operator.
+  virtual void traceInput(const RowVectorPtr&);
+
+  /// Finishes tracing of the operator.
+  virtual void finishTrace();
 
   /// Returns single-column dynamically generated filters to be pushed down to
   /// upstream operators. Used to push down filters on join keys from broadcast
@@ -453,23 +322,20 @@ class Operator : public BaseRuntimeStatWriter {
         toString());
   }
 
-  /// Returns a list of identify projections, e.g. columns that are projected
-  /// as-is possibly after applying a filter.
+  /// Returns a list of identity projections, e.g. columns that are projected
+  /// as-is possibly after applying a filter. Used to allow pushdown of dynamic
+  /// filters generated by HashProbe into the TableScan. Examples of identity
+  /// projections: all columns in FilterProject(only filters), group-by keys in
+  /// HashAggregation.
   const std::vector<IdentityProjection>& identityProjections() const {
     return identityProjections_;
   }
 
   /// Frees all resources associated with 'this'. No other methods
   /// should be called after this.
-  virtual void close() {
-    input_ = nullptr;
-    results_.clear();
-    recordSpillStats();
-    // Release the unused memory reservation on close.
-    operatorCtx_->pool()->release();
-  }
+  virtual void close();
 
-  // Returns true if 'this' never has more output rows than input rows.
+  /// Returns true if 'this' never has more output rows than input rows.
   virtual bool isFilter() const {
     return false;
   }
@@ -489,7 +355,7 @@ class Operator : public BaseRuntimeStatWriter {
     stats_.wlock()->addRuntimeStat(name, value);
   }
 
-  /// Returns reference to the operator stats synchronized object to gain bulck
+  /// Returns reference to the operator stats synchronized object to gain bulk
   /// read/write access to the stats.
   folly::Synchronized<OperatorStats>& stats() {
     return stats_;
@@ -499,7 +365,7 @@ class Operator : public BaseRuntimeStatWriter {
 
   virtual std::string toString() const;
 
-  /// Used in debug ednpoints.
+  /// Used in debug endpoints.
   virtual folly::dynamic toJson() const {
     folly::dynamic obj = folly::dynamic::object;
     obj["operator"] = toString();
@@ -540,11 +406,11 @@ class Operator : public BaseRuntimeStatWriter {
     return operatorCtx_->planNodeId();
   }
 
-  const int32_t operatorId() const {
+  int32_t operatorId() const {
     return operatorCtx_->operatorId();
   }
 
-  const uint32_t splitGroupId() const {
+  uint32_t splitGroupId() const {
     return operatorCtx_->driverCtx()->splitGroupId;
   }
 
@@ -638,9 +504,8 @@ class Operator : public BaseRuntimeStatWriter {
     const bool nonReclaimableSection_;
   };
 
-  /// Returns the operator context of this operator. This method is only used
-  /// for test.
-  const OperatorCtx* testingOperatorCtx() const {
+  /// Returns the operator context of this operator.
+  const OperatorCtx* operatorCtx() const {
     return operatorCtx_.get();
   }
 
@@ -689,7 +554,7 @@ class Operator : public BaseRuntimeStatWriter {
 
    protected:
     MemoryReclaimer(const std::shared_ptr<Driver>& driver, Operator* op)
-        : driver_(driver), op_(op) {
+        : memory::MemoryReclaimer(0), driver_(driver), op_(op) {
       VELOX_CHECK_NOT_NULL(op_);
     }
 
@@ -710,13 +575,17 @@ class Operator : public BaseRuntimeStatWriter {
   void maybeSetReclaimer();
 
   /// Returns true if this is a spillable operator and has configured spilling.
-  FOLLY_ALWAYS_INLINE bool canSpill() const {
+  FOLLY_ALWAYS_INLINE virtual bool canSpill() const {
     return spillConfig_.has_value();
   }
 
   const common::SpillConfig* spillConfig() const {
     return spillConfig_.has_value() ? &spillConfig_.value() : nullptr;
   }
+
+  /// Invoked to setup query data or split writer for this operator if the
+  /// associated query plan node is configured to collect trace.
+  void maybeSetTracer();
 
   /// Creates output vector from 'input_' and 'results' according to
   /// 'identityProjections_' and 'resultProjections_'. If 'mapping' is set to
@@ -733,14 +602,26 @@ class Operator : public BaseRuntimeStatWriter {
   /// 'identityProjections_' and 'resultProjections_'.
   RowVectorPtr fillOutput(vector_size_t size, const BufferPtr& mapping);
 
+  /// Invoked by the operator to notify driver that it has finished draining
+  /// output.
+  virtual void finishDrain();
+
   /// Returns the number of rows for the output batch. This uses averageRowSize
   /// to calculate how many rows fit in preferredOutputBatchBytes. It caps the
   /// number of rows at 10K and returns at least one row. The averageRowSize
   /// must not be negative. If the averageRowSize is 0 which is not advised,
   /// returns maxOutputBatchRows. If the averageRowSize is not given, returns
   /// preferredOutputBatchRows.
-  uint32_t outputBatchRows(
+  vector_size_t outputBatchRows(
       std::optional<uint64_t> averageRowSize = std::nullopt) const;
+
+  /// Load 'vector' if lazy. Potential large memory usage site that might
+  /// trigger arbitration. Hence this call is made reclaimable. This is often
+  /// used at the start of 'addInput()' call to load the input if needed.
+  ///
+  /// NOTE: Caller must make sure operator is in a reclaimable state when making
+  /// this call.
+  void loadLazyReclaimable(RowVectorPtr& vector);
 
   /// Invoked to record spill stats in operator stats.
   virtual void recordSpillStats();
@@ -755,6 +636,12 @@ class Operator : public BaseRuntimeStatWriter {
 
   folly::Synchronized<OperatorStats> stats_;
   folly::Synchronized<common::SpillStats> spillStats_;
+
+  /// NOTE: only one of the two could be set for an operator for tracing .
+  /// 'splitTracer_' is only set for table scan to record the processed split
+  /// for now.
+  std::unique_ptr<trace::OperatorTraceInputWriter> inputTracer_{nullptr};
+  std::unique_ptr<trace::OperatorTraceSplitWriter> splitTracer_{nullptr};
 
   /// Indicates if an operator is under a non-reclaimable execution section.
   /// This prevents the memory arbitrator from reclaiming memory from this
@@ -779,6 +666,12 @@ class Operator : public BaseRuntimeStatWriter {
 
   std::unordered_map<column_index_t, std::shared_ptr<common::Filter>>
       dynamicFilters_;
+
+ private:
+  // Setup 'inputTracer_' to record the processed input vectors.
+  void setupInputTracer(const std::string& traceDir);
+  // Setup 'splitTracer_' for table scan to record the processed split.
+  void setupSplitTracer(const std::string& traceDir);
 };
 
 /// Given a row type returns indices for the specified subset of columns.
@@ -797,7 +690,7 @@ std::vector<column_index_t> calculateOutputChannels(
     const RowTypePtr& targetInputType,
     const RowTypePtr& targetOutputType);
 
-// A first operator in a Driver, e.g. table scan or exchange client.
+/// A first operator in a Driver, e.g. table scan or exchange client.
 class SourceOperator : public Operator {
  public:
   SourceOperator(
@@ -829,7 +722,7 @@ class SourceOperator : public Operator {
 
 template <>
 struct fmt::formatter<std::thread::id> : formatter<std::string> {
-  auto format(std::thread::id s, format_context& ctx) {
+  auto format(std::thread::id s, format_context& ctx) const {
     std::ostringstream oss;
     oss << s;
     return formatter<std::string>::format(oss.str(), ctx);

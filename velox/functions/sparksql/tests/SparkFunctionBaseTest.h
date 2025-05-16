@@ -16,7 +16,7 @@
 #pragma once
 
 #include "velox/functions/prestosql/tests/utils/FunctionBaseTest.h"
-#include "velox/functions/sparksql/Register.h"
+#include "velox/functions/sparksql/registration/Register.h"
 #include "velox/parse/TypeResolver.h"
 
 namespace facebook::velox::functions::sparksql::test {
@@ -30,7 +30,7 @@ class SparkFunctionBaseTest : public FunctionBaseTest {
   static void SetUpTestCase() {
     parse::registerTypeResolver();
     sparksql::registerFunctions("");
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void setSparkPartitionId(int32_t partitionId) {

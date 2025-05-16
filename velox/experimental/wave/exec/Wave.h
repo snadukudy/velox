@@ -24,9 +24,44 @@
 
 #include "velox/experimental/wave/common/GpuArena.h"
 #include "velox/experimental/wave/exec/ExprKernel.h"
+#include "velox/experimental/wave/exec/ExprKernelStream.h"
 #include "velox/experimental/wave/vector/WaveVector.h"
 
+#include <folly/executors/CPUThreadPoolExecutor.h>
+
+#include <iostream>
+
+DECLARE_bool(wave_timing);
+DECLARE_bool(wave_transfer_timing);
+DECLARE_bool(wave_trace_stream);
+
+#define TR(str, msg)                                                   \
+  if (FLAGS_wave_trace_stream) {                                       \
+    (std::cout << fmt::format("St{}: {}\n", (str)->streamIdx(), msg)); \
+  }
+
+#define TR1(msg)                 \
+  if (FLAGS_wave_trace_stream) { \
+    std::cout << msg;            \
+  }
+
 namespace facebook::velox::wave {
+
+/// Scoped guard, prints the time spent inside if
+class PrintTime {
+ public:
+  PrintTime(const char* title);
+  ~PrintTime();
+
+  void setComment(std::string comment) {
+    comment_ = std::move(comment);
+  }
+
+ private:
+  const char* title_;
+  uint64_t start_;
+  std::string comment_;
+};
 
 /// A host side time point for measuring wait and launch prepare latency. Counts
 /// both wall microseconds and clocks.
@@ -34,12 +69,19 @@ struct WaveTime {
   size_t micros{0};
   uint64_t clocks{0};
 
+  static uint64_t getMicro() {
+    return FLAGS_wave_timing ? getCurrentTimeMicro() : 0;
+  }
+
   static WaveTime now() {
+    if (!FLAGS_wave_timing) {
+      return {0, 0};
+    }
     return {getCurrentTimeMicro(), folly::hardware_timestamp()};
   }
 
   WaveTime operator-(const WaveTime right) const {
-    return {right.micros - micros, right.clocks - clocks};
+    return {micros - right.micros, clocks - right.clocks};
   }
 
   WaveTime operator+(const WaveTime right) const {
@@ -99,6 +141,15 @@ struct WaveStats {
   /// Time a host thread waits for device.
   WaveTime waitTime;
 
+  /// Time a host thread is synchronously staging data to device. This is either
+  /// the wall time of multithreaded memcpy to pinned host or the wall time of
+  /// multithreaded GPU Direct NVME read. This does not include the time of
+  /// hostToDeviceAsync.
+  WaveTime stagingTime;
+
+  /// Optionally measured host to device transfer latency.
+  WaveTime transferWaitTime;
+
   void clear();
   void add(const WaveStats& other);
 };
@@ -116,6 +167,8 @@ struct Value {
     // Both exprs and subfields are deduplicated.
     return expr == other.expr && subfield == other.subfield;
   }
+
+  std::string toString() const;
 
   const exec::Expr* expr;
   const common::Subfield* subfield;
@@ -181,22 +234,120 @@ class WaveStream;
 class Program;
 
 /// Represents a device side operator state, like a join/group by hash table or
-/// repartition output. Can be scoped to a WaveStream or to a Program.
+/// repartition output. Can be scoped to a Task pipeline (all Drivers),
+/// WaveStream or to a Program.
 struct OperatorState {
+  OperatorState() = default;
+  OperatorState(std::shared_ptr<GpuArena> arena) : arena(std::move(arena)) {}
+
+  virtual ~OperatorState() = default;
+
+  template <typename T>
+  T* as() {
+    return reinterpret_cast<T*>(this);
+  }
+
+  /// Sets an error. Any thread calling enter() or enterExclusive() will throw
+  /// the error. The caller must have successfully called enterExclusive()
+  /// first.
+  void setError(std::exception_ptr _error) {
+    error = _error;
+  }
+
+  /// Device readable pointer to the state. If unified memory, should be aligned
+  /// to page boundary.
+  virtual void* devicePtr() const = 0;
+
   int32_t id;
+
+  // Arena holding all memory for the resource if the resource is shared between
+  // WaveDrivers.
+  std::shared_ptr<GpuArena> arena;
+
   /// Owns the device side data. Starting address of first is passed to the
   /// kernel. Layout depends on operator.
   std::vector<WaveBufferPtr> buffers;
+
+  std::exception_ptr error;
 };
 
 struct AggregateOperatorState : public OperatorState {
-  AbstractAggregation* instruction;
-  // True after first created.
+  AggregateOperatorState(std::shared_ptr<GpuArena> arena)
+      : OperatorState(std::move(arena)) {}
+
+  void allocateAggregateHeader(int32_t size, GpuArena& arena);
+
+  /// Sets the sizes in allocators so that the rows run out before the
+  /// table is full. In this way there is no need for a separate
+  /// rehash check or atomic rehash needed flag.
+  void setSizesToSafe();
+
+  void* devicePtr() const override {
+    return alignedHead;
+  }
+
+  bool isGrouped{false};
+  int32_t rowSize;
+  int32_t maxReadStreams{1};
+
+  /// Mutex to serialize allocating row ranges to different Drivers in a
+  /// multi-driver read.
+  std::mutex mutex;
+
+  // 4K aligned header. Must be full pages, pageable in unified memory without
+  // affecting surrounding data.
+  DeviceAggregation* alignedHead;
+
+  GpuHashTableBase* hashTable{nullptr};
+
+  // Used bytes counting from 'alignedHead'.
+  int32_t alignedHeadSize;
+
+  /// True after first created.
   bool isNew{true};
+
+  /// Number of allocators after hash GpuHashTable.
+  int32_t numPartitions{1};
+
+  /// Row ranges from filled allocators.
+  std::vector<AllocationRange> ranges;
+
+  /// Number of rows in 'ranges'.
+  int64_t numRows{0};
+
+  /// Device side bytes in the hash table and rows.
+  int64_t bytes{0};
+
+  /// Next range to be prepared for return.
+  int32_t rangeIdx{0};
+
+  /// Next row to return.
+  int32_t rowIdx{0};
+
+  /// Device side array of per-stream result rows.
+  WaveBufferPtr resultRowPointers;
+
+  /// Array of result rows for each streamId.
+  std::vector<WaveBufferPtr> resultRows;
+
+  /// A host pinned buffer for copying row pointer arrays to device.
+  WaveBufferPtr temp;
+};
+
+struct HashTableHolder : public AggregateOperatorState {
+  HashTableHolder(std::shared_ptr<GpuArena> arena)
+      : AggregateOperatorState(std::move(arena)) {}
+
+  void* devicePtr() const override {
+    return hashTable;
+  }
 };
 
 struct OperatorStateMap {
+  std::mutex mutex;
   folly::F14FastMap<int32_t, std::shared_ptr<OperatorState>> states;
+
+  void addIfNew(int32_t id, const std::shared_ptr<OperatorState>& state);
 };
 
 /// Represents a kernel or data transfer. Many executables can be in one kernel
@@ -247,8 +398,6 @@ struct Executable {
   // transfer or column read.
   std::shared_ptr<Program> programShared;
 
-  ThreadBlockProgram* program{nullptr};
-
   // Device memory if not owned by 'programShared_'.
   std::vector<WaveBufferPtr> deviceData;
 
@@ -271,10 +420,6 @@ struct Executable {
   // Map from wrapAt in AbstractOperand to device side 'indices' with one
   // int32_t* per thread block.
   folly::F14FastMap<int32_t, int32_t**> wraps;
-
-  // Host side array of literals. These refer to literal data in device side
-  // ThreadBlockProgram. These are copied at the end of 'operands' at launch.
-  const std::vector<Operand>* literals;
 
   // Backing memory for intermediate Operands. Free when 'this' arrives. If
   // scheduling follow up work that is synchronized with arrival of 'this', the
@@ -350,21 +495,52 @@ struct ContinuePoint {
 struct ProgramLaunch {
   Program* program{nullptr};
   bool isStaged{false};
+#if 0
   /// Device side buffer for status returning instructions.
   std::vector<void*> returnBuffers;
   /// Host side address 1:1 to 'returnBuffers'.
   std::vector<void*> hostReturnBuffers;
   /// Device side temp status for instructions.
   std::vector<void*> deviceBuffers;
-
-  /// Where to continue if previous execution was incomplete.
+#endif
+  /// Where to continue if previous execution was incomplete. The last advances
+  /// first and is popped off.
   AdvanceResult advance;
+};
+
+/// Identifies a compiled kernel. The text is the full description
+/// of the work. The operator ids are the ids in the plan making the
+/// lookup so that every placeholder in the text corresponds to one
+/// operand id.
+struct ProgramKey {
+  std::string text;
+  std::vector<AbstractOperand*> input;
+  std::vector<AbstractOperand*> local;
+  std::vector<AbstractOperand*> output;
 };
 
 class Program : public std::enable_shared_from_this<Program> {
  public:
+  Program() = default;
+
+  Program(
+      OperandSet input,
+      OperandSet local,
+      OperandSet output,
+      OperandSet extraWrap,
+      int32_t numBranches,
+      int32_t sharedSize,
+      const std::vector<std::unique_ptr<AbstractOperand>>& allOperands,
+      std::vector<std::unique_ptr<ProgramState>> operatorStates,
+      std::unique_ptr<CompiledKernel> kernel);
+
   void add(std::unique_ptr<AbstractInstruction> instruction) {
     instructions_.push_back(std::move(instruction));
+  }
+
+  const std::vector<std::unique_ptr<AbstractInstruction>>& instructions()
+      const {
+    return instructions_;
   }
 
   /// Specifies that Operand with 'id' is used by a dependent operation.
@@ -376,39 +552,15 @@ class Program : public std::enable_shared_from_this<Program> {
     return dependsOn_;
   }
 
-  void addSource(Program* source) {
-    if (std::find(dependsOn_.begin(), dependsOn_.end(), source) !=
-        dependsOn_.end()) {
-      return;
-    }
-    dependsOn_.push_back(source);
-  }
-
-  // Initializes executableImage and relocation information and places
-  // the result on device.
-  void prepareForDevice(GpuArena& arena);
-
   std::unique_ptr<Executable> getExecutable(
       int32_t maxRows,
       const std::vector<std::unique_ptr<AbstractOperand>>& operands);
 
-  ThreadBlockProgram* threadBlockProgram() {
-    return program_;
-  }
-
-  /// True if instructions can be added.
-  bool isMutable() const {
-    return isMutable_;
-  }
-
-  /// Disallows adding instructions to 'this'. For example, a program in an
-  /// operator before a cardinality chaning operator cannot get more
-  /// instructions from code after the cardinality change.
-  void freeze() {
-    isMutable_ = false;
-  }
-
   void releaseExe(std::unique_ptr<Executable>&& exe) {
+    std::lock_guard<std::mutex> l(mutex_);
+    // The exe being freed should not be the last reference to the Program.
+    VELOX_CHECK(!exe->programShared.unique());
+    exe->programShared = nullptr;
     prepared_.push_back(std::move(exe));
   }
 
@@ -419,6 +571,9 @@ class Program : public std::enable_shared_from_this<Program> {
   const folly::F14FastMap<AbstractOperand*, int32_t>& output() const {
     return output_;
   }
+
+  /// Calls pipelineFinished() on instructions.
+  void pipelineFinished(WaveStream& stream);
 
   const std::string& label() const {
     return label_;
@@ -431,6 +586,9 @@ class Program : public std::enable_shared_from_this<Program> {
   /// Fills 'ptrs' with device side global/stream states. Creates the states if
   /// necessary.
   void getOperatorStates(WaveStream& stream, std::vector<void*>& ptrs);
+  void setExtraWraps(std::vector<AbstractOperand*> operands) {
+    extraWraps_ = std::move(operands);
+  }
 
   /// True if begins with a source instruction, like reading and aggregate
   /// result or exchange.
@@ -438,6 +596,8 @@ class Program : public std::enable_shared_from_this<Program> {
     return !instructions_.empty() &&
         instructions_.front()->opCode == OpCode::kReadAggregate;
   }
+
+  exec::BlockingReason isBlocked(WaveStream& stream, ContinueFuture* future);
 
   /// If partially executed instructions in the call of 'control',
   /// returns the point where to pick up. If fully executed or not
@@ -450,36 +610,57 @@ class Program : public std::enable_shared_from_this<Program> {
   canAdvance(WaveStream& stream, LaunchControl* control, int32_t programIdx);
 
   /// True if last non-return instruction is a sink, e.g. build, repartition. No
-  /// output vectors,, synced on 'hostReturnEvent_'.
+  /// output vectors, synced on 'hostReturnEvent_'.
   bool isSink() const;
+
+  /// Records instruction return status. The status is accessed by canAdvance().
+  void interpretReturn(
+      WaveStream& stream,
+      LaunchControl* control,
+      int32_t programIdx);
+
+  void registerStatus(WaveStream& stream);
+
+  /// Runs the update callback in 'advance' with the right instruction.  E.g.
+  /// rehash device side table,. Caller synchronizes.
+  void callUpdateStatus(
+      WaveStream& stream,
+      const std::vector<WaveStream*>& otherStreams,
+      AdvanceResult& result);
+
+  CompiledKernel* kernel() const {
+    return kernel_.get();
+  }
+
+  OperandSet& extraWrap() {
+    return extraWrap_;
+  }
+
+  int32_t numBranches() const {
+    return numBranches_;
+  }
+
+  /// Register that 'entryPointIdx' in 'kernel' manages the state of the
+  /// instruction at with 'serial'.
+  void addEntryPointForSerial(int32_t serial, int32_t entryPointIdx) {
+    serialToEntryPoint_[serial] = entryPointIdx;
+  }
+
+  int32_t entryPointIdxBySerial(int32_t serial) {
+    auto it = serialToEntryPoint_.find(serial);
+    VELOX_CHECK(it != serialToEntryPoint_.end());
+    return it->second;
+  }
 
   std::string toString() const;
 
  private:
-  template <TypeKind kind>
-  int32_t addLiteralTyped(AbstractOperand* op);
-  /// Returns a starting offset to a constant with 'count' elements of T,
-  /// initialized from 'value[]' The values are copied to device side
-  /// ThreadBlockProgram.
-  template <typename T>
-  int32_t addLiteral(T* value, int32_t count);
-
-  void literalToOperand(AbstractOperand* abstractOp, Operand& op);
+  std::unique_ptr<CompiledKernel> kernel_;
 
   GpuArena* arena_{nullptr};
   std::vector<Program*> dependsOn_;
   DefinesMap produces_;
   std::vector<std::unique_ptr<AbstractInstruction>> instructions_;
-  bool isMutable_{true};
-
-  // Adds 'op' to 'input' if it is not produced by one in 'local'
-  void markInput(AbstractOperand* op);
-
-  // Adds 'op' to 'local_' or 'output_'.
-  void markResult(AbstractOperand* op);
-  void sortSlots();
-
-  OperandIndex operandIndex(AbstractOperand* op) const;
 
   // Input Operand  to offset in operands array.
   folly::F14FastMap<AbstractOperand*, int32_t> input_;
@@ -487,6 +668,8 @@ class Program : public std::enable_shared_from_this<Program> {
   /// Set of OperandIds for outputs. These must come after intermediates in
   /// Operands array.
   OperandSet outputIds_;
+
+  OperandSet extraWrap_;
 
   // Local Operand offset in operands array.
   folly::F14FastMap<AbstractOperand*, int32_t> local_;
@@ -499,30 +682,13 @@ class Program : public std::enable_shared_from_this<Program> {
   // Constant Operand  to offset in operands array.
   folly::F14FastMap<AbstractOperand*, int32_t> literal_;
 
-  // Offset of first unused constant area byte from start of constant area.
-  int32_t nextLiteral_{0};
-
-  // Binary data for constants to be embedded in ThreadBlockProgram. Must be
-  // relocatable, i.e. does not contain non-relative pointers within the
-  // constant area.
-  std::string literalArea_;
-
-  // Owns device side 'threadBlockProgram_'
-  WaveBufferPtr deviceData_;
-
-  // Device resident program.
-  ThreadBlockProgram* program_;
+  // Number of distinct code paths in the kernel. The
+  int32_t numBranches_{0};
 
   int32_t sharedMemorySize_{0};
 
-  // Host side image of device side Operands that reference 'constantArea_'.
-  // These are copied at the end of the operand block created at kernel launch.
-  std::vector<Operand> literalOperands_;
-
   std::string label_;
 
-  // Start of device side constant area.
-  char* deviceLiterals_{nullptr};
   // Serializes 'prepared_'. Access on WaveStrea, is single threaded but sharing
   // Programs across WaveDrivers makes sense, so make the preallocated resource
   // thread safe.
@@ -533,7 +699,22 @@ class Program : public std::enable_shared_from_this<Program> {
 
   // Globals accessed by id from instructions.
   std::vector<std::unique_ptr<ProgramState>> operatorStates_;
+
+  std::vector<AbstractOperand*> extraWraps_;
+
+  // Maps from AbstratcOperator::serial to the per-operator kernel entry point
+  // number, e.g. for rehashing a hash table.
+  folly::F14FastMap<int32_t, int32_t> serialToEntryPoint_;
 };
+
+inline int32_t instructionStatusSize(
+    InstructionStatus& status,
+    int32_t numBlocks) {
+  return bits::roundUp(
+      static_cast<uint32_t>(status.gridStateSize) +
+          numBlocks * static_cast<uint32_t>(status.blockState),
+      8);
+}
 
 using ProgramPtr = std::shared_ptr<Program>;
 
@@ -556,14 +737,18 @@ class WaveStream {
   };
 
   WaveStream(
-      GpuArena& arena,
-      GpuArena& hostArena,
+      std::shared_ptr<GpuArena> arena,
+      GpuArena& deviceArena,
       const std::vector<std::unique_ptr<AbstractOperand>>* operands,
-      OperatorStateMap* stateMap)
-      : arena_(arena),
-        hostArena_(hostArena),
+      OperatorStateMap* stateMap,
+      InstructionStatus state,
+      int16_t streamIdx)
+      : arena_(std::move(arena)),
+        deviceArena_(deviceArena),
         operands_(operands),
-        taskStateMap_(stateMap) {
+        taskStateMap_(stateMap),
+        instructionStatus_(state),
+        streamIdx_(streamIdx) {
     operandNullable_.resize(operands_->size(), true);
   }
 
@@ -577,7 +762,11 @@ class WaveStream {
       folly::Range<int32_t*> sizes);
 
   GpuArena& arena() {
-    return arena_;
+    return *arena_;
+  }
+
+  GpuArena& deviceArena() {
+    return deviceArena_;
   }
 
   /// Sets nullability of a source column. This is runtime, since may depend on
@@ -720,13 +909,7 @@ class WaveStream {
   void setLaunchControl(
       int32_t key,
       int32_t nth,
-      std::unique_ptr<LaunchControl> control) {
-    auto& controls = launchControl_[key];
-    if (controls.size() <= nth) {
-      controls.resize(nth + 1);
-    }
-    controls[nth] = std::move(control);
-  }
+      std::unique_ptr<LaunchControl> control);
 
   const AbstractOperand* operandAt(int32_t id) {
     VELOX_CHECK_LT(id, operands_->size());
@@ -742,6 +925,8 @@ class WaveStream {
     int32_t totalBytes{0};
     folly::F14FastMap<int32_t, int32_t**> inputWrap;
     folly::F14FastMap<int32_t, int32_t**> localWrap;
+    int32_t numExtraWrap{0};
+    int32_t firstExtraWrap{0};
     std::vector<void*> operatorStates;
   };
 
@@ -761,6 +946,10 @@ class WaveStream {
     return stats_;
   }
 
+  WaveStats& mutableStats() {
+    return stats_;
+  }
+
   WaveStats& stats() {
     return stats_;
   }
@@ -775,11 +964,17 @@ class WaveStream {
 
   OperatorState* operatorState(int32_t id);
 
+  std::shared_ptr<OperatorState> operatorStateShared(int32_t id);
+
   OperatorState* newState(ProgramState& init);
 
   /// Initializes 'state' to the device side state for 'inst'. Returns after
   /// 'state' is ready to use on device.
   void makeAggregate(AbstractAggregation& inst, AggregateOperatorState& state);
+
+  /// Initializes 'state' to the device side state for 'inst'. Returns after
+  /// 'state' is ready to use on device.
+  void makeHashBuild(AbstractHashBuild& inst, HashTableHolder& state);
 
   std::unique_ptr<Executable> recycleExecutable(
       Program* program,
@@ -802,16 +997,99 @@ class WaveStream {
   void releaseStreamsAndEvents();
 
   void setError() {
+    TR(this, "Setting error.");
     hasError_ = true;
   }
 
+  static folly::CPUThreadPoolExecutor* copyExecutor();
+  static folly::CPUThreadPoolExecutor* syncExecutor();
+
   std::string toString() const;
+
+  /// Reads the BlockStatus from device and marks programs that need to be
+  /// continued.
+  bool interpretArrival();
+
+  const InstructionStatus& instructionStatus() const {
+    return instructionStatus_;
+  }
+
+  /// Returns the grid level return status for instruction with 'status' or
+  /// nullptr if no status in place.
+  template <typename T>
+  T* gridStatus(const InstructionStatus& status) {
+    if (!hostBlockStatus_) {
+      VELOX_CHECK_NULL(deviceBlockStatus_);
+      return nullptr;
+    }
+    auto numBlocks = bits::roundUp(numRows_, kBlockSize) / kBlockSize;
+    return reinterpret_cast<T*>(
+        bits::roundUp(
+            reinterpret_cast<uintptr_t>(
+                &hostBlockStatus_->as<BlockStatus>()[numBlocks]),
+            8) +
+        status.gridState);
+  }
+
+  /// Asynchronously zeroes out the device side  copy of the grid status.
+  template <typename T>
+  void clearGridStatus(const InstructionStatus& status) {
+    if (!deviceBlockStatus_) {
+      return;
+    }
+    auto numBlocks = bits::roundUp(numRows_, kBlockSize) / kBlockSize;
+    auto deviceAddress =
+        bits::roundUp(
+            reinterpret_cast<uintptr_t>(&deviceBlockStatus_[numBlocks]), 8) +
+        status.gridState;
+    streams_[0]->memset(reinterpret_cast<char*>(deviceAddress), 0, sizeof(T));
+  }
+
+  BlockStatus* hostBlockStatus() const {
+    return hostBlockStatus_->as<BlockStatus>();
+  }
+
+  int16_t streamIdx() const {
+    return streamIdx_;
+  }
+
+  /// Integrity check for Executables in 'this'.
+  void checkExecutables() const;
+
+  /// Integrity check for error codes and row counts in host/device side
+  /// statuses.
+  void checkBlockStatuses() const;
+
+  /// calls 'action' on the error on 'this' if the error is non-empty.
+  void throwIfError(std::function<void(const KernelError*)> action);
+
+  /// Returns the Executable associated with 'this' whose Program contains
+  /// 'instruction'. nullptr if not found.
+  Executable* executableByInstruction(const AbstractInstruction* instruction);
+
+  OperatorStateMap* taskStateMap() const {
+    return taskStateMap_;
+  }
+
+  /// Mutable reference to flag indicating that
+  bool& mutableExclusiveProcessed() {
+    return exclusiveProcessed_;
+  }
+
+  const std::shared_ptr<GpuArena>& arenaShared() const {
+    return arena_;
+  }
 
  private:
   // true if 'op' is nullable in the context of 'this'.
   bool isNullable(const AbstractOperand& op) const;
 
   Event* newEvent();
+
+  LaunchControl* lastControl() const;
+
+  void
+  makeHashTable(AggregateOperatorState& state, int32_t rowSize, bool makeTable);
 
   static std::unique_ptr<Event> eventFromReserve();
   static void releaseEvent(std::unique_ptr<Event>&& event);
@@ -821,11 +1099,20 @@ class WaveStream {
   static std::vector<std::unique_ptr<Event>> eventsForReuse_;
   static std::vector<std::unique_ptr<Stream>> streamsForReuse_;
   static bool exitInited_;
+  static std::unique_ptr<folly::CPUThreadPoolExecutor> copyExecutor_;
+  static std::unique_ptr<folly::CPUThreadPoolExecutor> syncExecutor_;
 
   static void clearReusable();
 
-  GpuArena& arena_;
-  GpuArena& hostArena_;
+  static folly::CPUThreadPoolExecutor* getExecutor(
+      std::unique_ptr<folly::CPUThreadPoolExecutor>& ptr);
+
+  // Unified memory.
+  std::shared_ptr<GpuArena> arena_;
+
+  // Device memory.
+  GpuArena& deviceArena_;
+
   const std::vector<std::unique_ptr<AbstractOperand>>* const operands_;
   // True at '[i]' if in this stream 'operands_[i]' should have null flags.
   std::vector<bool> operandNullable_;
@@ -835,6 +1122,13 @@ class WaveStream {
 
   // Stream level states like small partial aggregates.
   OperatorStateMap streamStateMap_;
+
+  // Space reserved for per-instruction return state above BlockStatus array.
+  InstructionStatus instructionStatus_;
+
+  // Identifies 'this' within parallel streams in the same WaveDriver or
+  // parallll WaveDrivers in other Driver pipelines.
+  const int16_t streamIdx_;
 
   // Number of rows to allocate for top level vectors for the next kernel
   // launch.
@@ -883,13 +1177,23 @@ class WaveStream {
   // Host pinned memory to which 'deviceReturnData' is copied.
   WaveBufferPtr hostReturnData_;
 
-  // Pointer to statuses inside 'hostReturnData_'.
-  BlockStatus* hostStatus_{nullptr};
+  // Device/unified pointer to BlockStatus and memory for areas for
+  // instructionStatus_. Allocated before first launch and copied to
+  // 'hostBlockStatus_' after last kernel in pipeline.
+  BlockStatus* deviceBlockStatus_{nullptr};
+
+  // Host side copy of BlockStatus.
+  WaveBufferPtr hostBlockStatus_;
 
   // Time when host side activity last started on 'this'.
   WaveTime start_;
 
   State state_{State::kNotRunning};
+
+  // set to true if 'this' has an exclusieve section coming and
+  // another WaveStream has processed it. If so, the exclusive section
+  // of'this' ends without more action and the flag is reset.
+  bool exclusiveProcessed_{false};
 
   bool hasError_{false};
 

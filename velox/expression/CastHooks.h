@@ -35,6 +35,13 @@ class CastHooks {
   virtual Expected<Timestamp> castStringToTimestamp(
       const StringView& view) const = 0;
 
+  virtual Expected<Timestamp> castIntToTimestamp(int64_t seconds) const = 0;
+
+  virtual Expected<int64_t> castTimestampToInt(Timestamp timestamp) const = 0;
+
+  virtual Expected<std::optional<Timestamp>> castDoubleToTimestamp(
+      double seconds) const = 0;
+
   virtual Expected<int32_t> castStringToDate(
       const StringView& dateString) const = 0;
 
@@ -56,5 +63,8 @@ class CastHooks {
   virtual bool truncate() const = 0;
 
   virtual PolicyType getPolicy() const = 0;
+
+  // Converts boolean to timestamp type.
+  virtual Expected<Timestamp> castBooleanToTimestamp(bool seconds) const = 0;
 };
 } // namespace facebook::velox::exec

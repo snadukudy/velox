@@ -15,37 +15,54 @@
 add_executable(
   velox_functions_spark_test
   ArithmeticTest.cpp
+  ArrayAppendTest.cpp
+  ArrayConcatTest.cpp
   ArrayFlattenTest.cpp
   ArrayGetTest.cpp
+  ArrayInsertTest.cpp
   ArrayMaxTest.cpp
   ArrayMinTest.cpp
+  ArrayPrependTest.cpp
   ArraySortTest.cpp
   ArrayShuffleTest.cpp
-  ArgGeneratorTest.cpp
+  ArrayUnionTest.cpp
+  ArgTypesGeneratorTest.cpp
+  AtLeastNNonNullsTest.cpp
   BitwiseTest.cpp
   ComparisonsTest.cpp
+  ConcatWsTest.cpp
   DateTimeFunctionsTest.cpp
   DecimalArithmeticTest.cpp
   DecimalCompareTest.cpp
   DecimalRoundTest.cpp
   DecimalUtilTest.cpp
   ElementAtTest.cpp
+  FactorialTest.cpp
+  FromJsonTest.cpp
+  GetJsonObjectTest.cpp
+  GetStructFieldTest.cpp
   HashTest.cpp
   InTest.cpp
+  JsonArrayLengthTest.cpp
+  JsonObjectKeysTest.cpp
   LeastGreatestTest.cpp
+  LuhnCheckTest.cpp
   MakeDecimalTest.cpp
   MakeTimestampTest.cpp
+  MapConcatTest.cpp
   MapTest.cpp
+  MaskTest.cpp
   MightContainTest.cpp
   MonotonicallyIncreasingIdTest.cpp
   RaiseErrorTest.cpp
   RandTest.cpp
   RegexFunctionsTest.cpp
+  SliceTest.cpp
   SizeTest.cpp
   SortArrayTest.cpp
   SparkCastExprTest.cpp
   SparkPartitionIdTest.cpp
-  SplitFunctionsTest.cpp
+  SplitTest.cpp
   StringTest.cpp
   StringToMapTest.cpp
   UnscaledValueFunctionTest.cpp
@@ -62,7 +79,17 @@ target_link_libraries(
   velox_expression_fuzzer_test_utility
   velox_expression_fuzzer
   fmt::fmt
-  gtest
-  gtest_main
-  gmock
-  gflags::gflags)
+  GTest::gtest
+  GTest::gtest_main
+  GTest::gmock)
+
+add_executable(velox_spark_function_registry_test RegisterTest.cpp)
+
+add_test(velox_spark_function_registry_test velox_spark_function_registry_test)
+
+target_link_libraries(
+  velox_spark_function_registry_test
+  velox_expression
+  velox_functions_spark
+  GTest::gtest
+  GTest::gtest_main)

@@ -14,16 +14,19 @@
 
 add_library(
   velox_dwio_common_test_utils
-  BatchMaker.cpp DataFiles.cpp DataSetBuilder.cpp FilterGenerator.cpp
-  UnitLoaderTestTools.cpp E2EFilterTestBase.cpp)
+  BatchMaker.cpp
+  DataFiles.cpp
+  DataSetBuilder.cpp
+  FilterGenerator.cpp
+  UnitLoaderTestTools.cpp
+  E2EFilterTestBase.cpp)
 
 target_link_libraries(
   velox_dwio_common_test_utils
   Folly::folly
   fmt::fmt
   glog::glog
-  gflags::gflags
-  gtest
+  GTest::gtest
   velox_dwio_common
   velox_dwio_common_exception
   velox_exception

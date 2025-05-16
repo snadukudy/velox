@@ -16,6 +16,13 @@
 # github_checkout $REPO $VERSION $GIT_CLONE_PARAMS clones or re-uses an existing clone of the
 # specified repo, checking out the requested version.
 
+DEPENDENCY_DIR=${DEPENDENCY_DIR:-$(pwd)/deps-download}
+OS_CXXFLAGS=""
+NPROC=${BUILD_THREADS:-$(getconf _NPROCESSORS_ONLN)}
+
+CURL_OPTIONS=${CURL_OPTIONS:-""}
+CMAKE_OPTIONS=${CMAKE_OPTIONS:-""}
+
 function run_and_time {
   time "$@" || (echo "Failed to run $* ." ; exit 1 )
   { echo "+ Finished running $*"; } 2> /dev/null
@@ -82,15 +89,19 @@ function get_cxx_flags {
    if [ "$OS" = "Darwin" ]; then
      if [ "$MACHINE" = "arm64" ]; then
        CPU_ARCH="arm64"
-     else
-       CPU_ARCH="avx"
+     else # x86_64
+       local CPU_CAPABILITIES=$(sysctl -a | grep machdep.cpu.features | awk '{print tolower($0)}')
+       if [[ $CPU_CAPABILITIES =~ "avx" ]]; then
+         CPU_ARCH="avx"
+       else
+         CPU_ARCH="sse"
+       fi
      fi
    elif [ "$OS" = "Linux" ]; then
      if [ "$MACHINE" = "aarch64" ]; then
-           CPU_ARCH="aarch64"
-     else
+       CPU_ARCH="aarch64"
+     else # x86_64
        local CPU_CAPABILITIES=$(cat /proc/cpuinfo | grep flags | head -n 1| awk '{print tolower($0)}')
-       # Even though the default is avx, we need this check since avx machines support sse as well.
        if [[ $CPU_CAPABILITIES =~ "avx" ]]; then
            CPU_ARCH="avx"
        elif [[ $CPU_CAPABILITIES =~ "sse" ]]; then
@@ -104,15 +115,15 @@ function get_cxx_flags {
   case $CPU_ARCH in
 
     "arm64")
-      echo -n "-mcpu=apple-m1+crc -std=c++17 -fvisibility=hidden"
+      echo -n "-mcpu=apple-m1+crc"
     ;;
 
     "avx")
-      echo -n "-mavx2 -mfma -mavx -mf16c -mlzcnt -std=c++17 -mbmi2"
+      echo -n "-mavx2 -mfma -mavx -mf16c -mlzcnt  -mbmi2"
     ;;
 
     "sse")
-      echo -n "-msse4.2 -std=c++17"
+      echo -n "-msse4.2 "
     ;;
 
     "aarch64")
@@ -125,22 +136,25 @@ function get_cxx_flags {
       Neoverse_N1="d0c"
       Neoverse_N2="d49"
       Neoverse_V1="d40"
+      Neoverse_V2="d4f"
       if [ -f "$ARM_CPU_FILE" ]; then
         hex_ARM_CPU_DETECT=`cat $ARM_CPU_FILE`
         # PartNum, [15:4]: The primary part number such as Neoverse N1/N2 core.
         ARM_CPU_PRODUCT=${hex_ARM_CPU_DETECT: -4:3}
 
         if [ "$ARM_CPU_PRODUCT" = "$Neoverse_N1" ]; then
-          echo -n "-mcpu=neoverse-n1 -std=c++17"
+          echo -n "-mcpu=neoverse-n1 "
         elif [ "$ARM_CPU_PRODUCT" = "$Neoverse_N2" ]; then
-          echo -n "-mcpu=neoverse-n2 -std=c++17"
+          echo -n "-mcpu=neoverse-n2 "
         elif [ "$ARM_CPU_PRODUCT" = "$Neoverse_V1" ]; then
-          echo -n "-mcpu=neoverse-v1 -std=c++17"
+          echo -n "-mcpu=neoverse-v1 "
+        elif [ "$ARM_CPU_PRODUCT" = "$Neoverse_V2" ]; then
+          echo -n "-mcpu=neoverse-v2 "
         else
-          echo -n "-march=armv8-a+crc+crypto -std=c++17"
+          echo -n "-march=armv8-a+crc+crypto "
         fi
       else
-        echo -n "-std=c++17"
+        echo -n ""
       fi
     ;;
   *)
@@ -152,10 +166,30 @@ function get_cxx_flags {
 function wget_and_untar {
   local URL=$1
   local DIR=$2
+  mkdir -p "${DEPENDENCY_DIR}"
+  pushd "${DEPENDENCY_DIR}"
+  SUDO="${SUDO:-""}"
+  if [ -d "${DIR}" ]; then
+    if prompt "${DIR} already exists. Delete?"; then
+      ${SUDO} rm -rf "${DIR}"
+    else
+      popd
+      return
+    fi
+  fi
   mkdir -p "${DIR}"
   pushd "${DIR}"
-  curl -L "${URL}" > $2.tar.gz
+  curl ${CURL_OPTIONS} -L "${URL}" > $2.tar.gz
   tar -xz --strip-components=1 -f $2.tar.gz
+  popd
+  popd
+}
+
+function cmake_install_dir {
+  pushd "${DEPENDENCY_DIR}/$1"
+  # remove the directory argument
+  shift
+  cmake_install $@
   popd
 }
 
@@ -163,24 +197,30 @@ function cmake_install {
   local NAME=$(basename "$(pwd)")
   local BINARY_DIR=_build
   SUDO="${SUDO:-""}"
-  if [ -d "${BINARY_DIR}" ] && prompt "Do you want to rebuild ${NAME}?"; then
-    ${SUDO} rm -rf "${BINARY_DIR}"
+  if [ -d "${BINARY_DIR}" ]; then
+    if prompt "Do you want to rebuild ${NAME}?"; then
+      ${SUDO} rm -rf "${BINARY_DIR}"
+    else
+      return 0
+    fi
   fi
+
   mkdir -p "${BINARY_DIR}"
   COMPILER_FLAGS=$(get_cxx_flags)
+  # Add platform specific CXX flags if any
+  COMPILER_FLAGS+=${OS_CXXFLAGS}
 
   # CMAKE_POSITION_INDEPENDENT_CODE is required so that Velox can be built into dynamic libraries \
-  cmake -Wno-dev -B"${BINARY_DIR}" \
+  cmake -Wno-dev ${CMAKE_OPTIONS} -B"${BINARY_DIR}" \
     -GNinja \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -DCMAKE_CXX_STANDARD=17 \
     "${INSTALL_PREFIX+-DCMAKE_PREFIX_PATH=}${INSTALL_PREFIX-}" \
     "${INSTALL_PREFIX+-DCMAKE_INSTALL_PREFIX=}${INSTALL_PREFIX-}" \
     -DCMAKE_CXX_FLAGS="$COMPILER_FLAGS" \
     -DBUILD_TESTING=OFF \
     "$@"
   # Exit if the build fails.
-  cmake --build "${BINARY_DIR}" || { echo 'build failed' ; exit 1; }
+  cmake --build "${BINARY_DIR}" "-j ${NPROC}" || { echo 'build failed' ; exit 1; }
   ${SUDO} cmake --install "${BINARY_DIR}"
 }
 

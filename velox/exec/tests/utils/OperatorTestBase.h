@@ -24,13 +24,11 @@
 #include "velox/exec/HashProbe.h"
 #include "velox/exec/tests/utils/QueryAssertions.h"
 #include "velox/parse/ExpressionsParser.h"
-#include "velox/type/Variant.h"
-#include "velox/vector/FlatVector.h"
 #include "velox/vector/tests/utils/VectorMaker.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 namespace facebook::velox::exec::test {
-class OperatorTestBase : public testing::Test,
+class OperatorTestBase : public virtual testing::Test,
                          public velox::test::VectorTestBase {
  public:
   /// The following methods are used by google unit test framework to do
@@ -49,7 +47,9 @@ class OperatorTestBase : public testing::Test,
       int64_t arbitratorCapacity,
       int64_t arbitratorReservedCapacity,
       int64_t memoryPoolInitCapacity,
-      int64_t memoryPoolReservedCapacity);
+      int64_t memoryPoolReservedCapacity,
+      int64_t memoryPoolMinReclaimBytes,
+      int64_t memoryPoolAbortCapacityLimit);
 
   static void resetMemory();
 
@@ -87,7 +87,11 @@ class OperatorTestBase : public testing::Test,
       const std::string& duckDbSql,
       const std::vector<uint32_t>& sortingKeys) {
     return test::assertQuery(
-        params, [&](auto*) {}, duckDbSql, duckDbQueryRunner_, sortingKeys);
+        params,
+        [&](TaskCursor* taskCursor) { taskCursor->setNoMoreSplits(); },
+        duckDbSql,
+        duckDbQueryRunner_,
+        sortingKeys);
   }
 
   /// Assumes plan has a single leaf node. All splits are added to that node.
@@ -103,7 +107,10 @@ class OperatorTestBase : public testing::Test,
       const CursorParameters& params,
       const std::string& duckDbSql) {
     return test::assertQuery(
-        params, [&](exec::Task* /*task*/) {}, duckDbSql, duckDbQueryRunner_);
+        params,
+        [&](exec::TaskCursor* taskCursor) { taskCursor->setNoMoreSplits(); },
+        duckDbSql,
+        duckDbQueryRunner_);
   }
 
   std::shared_ptr<Task> assertQuery(
@@ -116,6 +123,12 @@ class OperatorTestBase : public testing::Test,
       const core::PlanNodePtr& plan,
       const RowVectorPtr& expectedResults) {
     return test::assertQuery(plan, {expectedResults});
+  }
+
+  std::shared_ptr<Task> assertQuery(
+      const CursorParameters& params,
+      const RowVectorPtr& expectedResults) {
+    return test::assertQuery(params, {expectedResults});
   }
 
   /// Assumes plan has a single leaf node. All splits are added to that node.

@@ -31,10 +31,11 @@
 
 namespace facebook::velox::parquet {
 
-class ParquetTestBase : public testing::Test, public test::VectorTestBase {
+class ParquetTestBase : public testing::Test,
+                        public velox::test::VectorTestBase {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
@@ -167,7 +168,7 @@ class ParquetTestBase : public testing::Test, public test::VectorTestBase {
     facebook::velox::parquet::WriterOptions options;
     options.memoryPool = rootPool_.get();
     options.flushPolicyFactory = flushPolicy;
-    options.compression = compressionKind;
+    options.compressionKind = compressionKind;
     return std::make_unique<facebook::velox::parquet::Writer>(
         std::move(sink), options, rowType);
   }

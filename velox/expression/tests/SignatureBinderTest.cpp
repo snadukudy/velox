@@ -18,7 +18,9 @@
 #include <velox/type/HugeInt.h>
 #include <vector>
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/functions/prestosql/types/TimestampWithTimeZoneRegistration.h"
 #include "velox/functions/prestosql/types/TimestampWithTimeZoneType.h"
+#include "velox/type/OpaqueCustomTypes.h"
 
 namespace facebook::velox::exec::test {
 namespace {
@@ -586,8 +588,7 @@ TEST(SignatureBinderTest, variableArity) {
   {
     auto signature = exec::FunctionSignatureBuilder()
                          .returnType("varchar")
-                         .argumentType("varchar")
-                         .variableArity()
+                         .variableArity("varchar")
                          .build();
 
     testSignatureBinder(signature, {}, VARCHAR());
@@ -602,8 +603,7 @@ TEST(SignatureBinderTest, variableArity) {
     auto signature = exec::FunctionSignatureBuilder()
                          .returnType("varchar")
                          .argumentType("integer")
-                         .argumentType("double")
-                         .variableArity()
+                         .variableArity("double")
                          .build();
 
     testSignatureBinder(signature, {INTEGER()}, VARCHAR());
@@ -617,8 +617,7 @@ TEST(SignatureBinderTest, variableArity) {
   {
     auto signature = exec::FunctionSignatureBuilder()
                          .returnType("varchar")
-                         .argumentType("any")
-                         .variableArity()
+                         .variableArity("any")
                          .build();
 
     testSignatureBinder(signature, {}, VARCHAR());
@@ -633,8 +632,7 @@ TEST(SignatureBinderTest, variableArity) {
     auto signature = exec::FunctionSignatureBuilder()
                          .returnType("timestamp")
                          .argumentType("integer")
-                         .argumentType("any")
-                         .variableArity()
+                         .variableArity("any")
                          .build();
 
     testSignatureBinder(signature, {INTEGER()}, TIMESTAMP());
@@ -683,8 +681,7 @@ TEST(SignatureBinderTest, unresolvable) {
   {
     auto signature = exec::FunctionSignatureBuilder()
                          .returnType("varchar")
-                         .argumentType("integer")
-                         .variableArity()
+                         .variableArity("integer")
                          .build();
 
     // wrong type
@@ -792,9 +789,7 @@ TEST(SignatureBinderTest, logicalType) {
 }
 
 TEST(SignatureBinderTest, customType) {
-  registerCustomType(
-      "timestamp with time zone",
-      std::make_unique<const TimestampWithTimeZoneTypeFactories>());
+  registerTimestampWithTimeZoneType();
 
   // Custom type as an argument type.
   {
@@ -808,7 +803,7 @@ TEST(SignatureBinderTest, customType) {
   }
 
   {
-    // timestamp with time zone -> bigint
+    // timestamp with time zone, varchar -> array(integer)
     auto signature = exec::FunctionSignatureBuilder()
                          .returnType("array(integer)")
                          .argumentType("timestamp with time zone")
@@ -821,7 +816,7 @@ TEST(SignatureBinderTest, customType) {
 
   // Custom type as a return type.
   {
-    // timestamp with time zone -> bigint
+    // integer -> timestamp with time zone
     auto signature = exec::FunctionSignatureBuilder()
                          .returnType("timestamp with time zone")
                          .argumentType("integer")
@@ -839,6 +834,59 @@ TEST(SignatureBinderTest, customType) {
       "Type doesn't exist: 'FANCY_TYPE'");
 }
 
+// Define a test custom opaque type and ensure signature binder can correctly
+// bind types.
+TEST(SignatureBinderTest, opaqueCustomType) {
+  // This is the C++ type registered within the opaque capsule. This could be
+  // anything.
+  struct Tuple {
+    int64_t x;
+    int64_t y;
+  };
+
+  // Custom type name.
+  static constexpr char kName[] = "my_custom_opaque";
+  using MyOpaqueRegister = OpaqueCustomTypeRegister<Tuple, kName>;
+
+  // Register type and build a TypePtr.
+  MyOpaqueRegister::registerType();
+  auto opaqueType = MyOpaqueRegister::get();
+
+  // Custom opaque type as an argument type.
+  {
+    // my_custom_opaque -> bigint
+    auto signature = exec::FunctionSignatureBuilder()
+                         .returnType("bigint")
+                         .argumentType("my_custom_opaque")
+                         .build();
+    testSignatureBinder(signature, {opaqueType}, BIGINT());
+  }
+  {
+    // varchar, my_custom_opaque, double -> real
+    auto signature = exec::FunctionSignatureBuilder()
+                         .returnType("real")
+                         .argumentType("varchar")
+                         .argumentType("my_custom_opaque")
+                         .argumentType("double")
+                         .build();
+    testSignatureBinder(signature, {VARCHAR(), opaqueType, DOUBLE()}, REAL());
+  }
+
+  // To make it more idiomatic for Velox's coding standards, one could also
+  // define this helper function somewhere:
+  auto MY_CUSTOM_OPAQUE = []() -> TypePtr { return MyOpaqueRegister::get(); };
+
+  // Custom opaque type as a return type.
+  {
+    // integer -> my_custom_opaque
+    auto signature = exec::FunctionSignatureBuilder()
+                         .returnType("my_custom_opaque")
+                         .argumentType("integer")
+                         .build();
+    testSignatureBinder(signature, {INTEGER()}, MY_CUSTOM_OPAQUE());
+  }
+}
+
 TEST(SignatureBinderTest, hugeIntType) {
   // Logical type as an argument type.
   {
@@ -851,9 +899,7 @@ TEST(SignatureBinderTest, hugeIntType) {
 }
 
 TEST(SignatureBinderTest, namedRows) {
-  registerCustomType(
-      "timestamp with time zone",
-      std::make_unique<const TimestampWithTimeZoneTypeFactories>());
+  registerTimestampWithTimeZoneType();
 
   // Simple named row field.
   {

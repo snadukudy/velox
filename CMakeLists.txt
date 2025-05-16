@@ -13,6 +13,10 @@
 # limitations under the License.
 cmake_minimum_required(VERSION 3.28)
 message(STATUS "Building using CMake version: ${CMAKE_VERSION}")
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
+set(CMAKE_CXX_EXTENSIONS ON) # Big Int is an extension
+message(STATUS "CXX standard: ${CMAKE_CXX_STANDARD}")
 
 # The policy allows us to change options without caching.
 cmake_policy(SET CMP0077 NEW)
@@ -45,13 +49,21 @@ if(DEFINED ENV{CONDA_PREFIX})
   endif()
 endif()
 
+if(DEFINED ENV{INSTALL_PREFIX})
+  message(STATUS "Dependency install directory set to: $ENV{INSTALL_PREFIX}")
+  list(APPEND CMAKE_PREFIX_PATH "$ENV{INSTALL_PREFIX}")
+endif()
+
 list(PREPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/CMake"
      "${PROJECT_SOURCE_DIR}/CMake/third-party")
 
 # Include our ThirdPartyToolchain dependencies macros
 include(ResolveDependency)
+include(VeloxUtils)
+include(CMakeDependentOption)
 
-set_with_default(VELOX_DEPENDENCY_SOURCE_DEFAULT VELOX_DEPENDENCY_SOURCE AUTO)
+velox_set_with_default(VELOX_DEPENDENCY_SOURCE_DEFAULT VELOX_DEPENDENCY_SOURCE
+                       AUTO)
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 
 # Add all options below
@@ -68,6 +80,32 @@ option(
   "Build a minimal set of components, including DWIO (file format readers/writers).
    This will override other build options."
   OFF)
+option(VELOX_MONO_LIBRARY "Build single unified library." OFF)
+option(ENABLE_ALL_WARNINGS "Enable -Wall and -Wextra compiler warnings." ON)
+option(VELOX_BUILD_SHARED "Build Velox as shared libraries." OFF)
+option(VELOX_SKIP_WAVE_BRANCH_KERNEL_TEST "Disable Wave branch kernel test."
+       OFF)
+# While it's possible to build both in one go we currently want to build either
+# static or shared.
+cmake_dependent_option(
+  VELOX_BUILD_STATIC
+  "Build Velox as static libraries."
+  ON
+  "NOT VELOX_BUILD_SHARED"
+  OFF)
+
+if(VELOX_BUILD_SHARED AND NOT VELOX_MONO_LIBRARY)
+  # The large number of targets currently in use within Velox make a shared
+  # build when not using the mono library brittle and labor intensive
+  set(VELOX_MONO_LIBRARY ON)
+endif()
+
+if(VELOX_BUILD_SHARED)
+  message(
+    WARNING
+      "When building Velox as a shared library it's recommended to build against a shared build of folly to avoid issues with linking of gflags."
+      "This is currently NOT being enforced so user discretion is advised.")
+endif()
 
 # option() always creates a BOOL variable so we have to use a normal cache
 # variable with STRING type for this option.
@@ -94,9 +132,9 @@ option(VELOX_ENABLE_TPCH_CONNECTOR "Build TPC-H connector." ON)
 option(VELOX_ENABLE_PRESTO_FUNCTIONS "Build Presto SQL functions." ON)
 option(VELOX_ENABLE_SPARK_FUNCTIONS "Build Spark SQL functions." ON)
 option(VELOX_ENABLE_EXPRESSION "Build expression." ON)
-option(VELOX_ENABLE_EXAMPLES
-       "Build examples. This will enable VELOX_ENABLE_EXPRESSION automatically."
-       OFF)
+option(
+  VELOX_ENABLE_EXAMPLES
+  "Build examples. This will enable VELOX_ENABLE_EXPRESSION automatically." OFF)
 option(VELOX_ENABLE_SUBSTRAIT "Build Substrait-to-Velox converter." OFF)
 option(VELOX_ENABLE_BENCHMARKS "Enable Velox top level benchmarks." OFF)
 option(VELOX_ENABLE_BENCHMARKS_BASIC "Enable Velox basic benchmarks." OFF)
@@ -104,18 +142,24 @@ option(VELOX_ENABLE_S3 "Build S3 Connector" OFF)
 option(VELOX_ENABLE_GCS "Build GCS Connector" OFF)
 option(VELOX_ENABLE_ABFS "Build Abfs Connector" OFF)
 option(VELOX_ENABLE_HDFS "Build Hdfs Connector" OFF)
-option(VELOX_ENABLE_PARQUET "Enable Parquet support" OFF)
+option(VELOX_ENABLE_PARQUET "Enable Parquet support" ON)
 option(VELOX_ENABLE_ARROW "Enable Arrow support" OFF)
+option(VELOX_ENABLE_GEO "Enable Geospatial support" ON)
 option(VELOX_ENABLE_REMOTE_FUNCTIONS "Enable remote function support" OFF)
 option(VELOX_ENABLE_CCACHE "Use ccache if installed." ON)
+option(VELOX_ENABLE_COMPRESSION_LZ4 "Enable Lz4 compression support." OFF)
 
 option(VELOX_BUILD_TEST_UTILS "Builds Velox test utilities" OFF)
 option(VELOX_BUILD_VECTOR_TEST_UTILS "Builds Velox vector test utilities" OFF)
 option(VELOX_BUILD_PYTHON_PACKAGE "Builds Velox Python bindings" OFF)
+option(VELOX_PYTHON_LEGACY_ONLY "Build only the pyvelox module" OFF)
+option(VELOX_BUILD_RUNNER "Builds velox runner" ON)
 option(
   VELOX_ENABLE_INT64_BUILD_PARTITION_BOUND
   "make buildPartitionBounds_ a vector int64 instead of int32 to avoid integer overflow when the hashtable has billions of records"
   OFF)
+option(VELOX_SIMDJSON_SKIPUTF8VALIDATION
+       "Skip simdjson utf8 validation in JSON parsing" OFF)
 
 # Explicitly force compilers to generate colored output. Compilers usually do
 # this by default if they detect the output is a terminal, but this assumption
@@ -140,18 +184,6 @@ if(${VELOX_BUILD_MINIMAL} OR ${VELOX_BUILD_MINIMAL_WITH_DWIO})
   set(VELOX_ENABLE_SUBSTRAIT OFF)
 endif()
 
-if(${VELOX_BUILD_TESTING})
-  # Enable all components to build testing binaries
-  set(VELOX_ENABLE_PRESTO_FUNCTIONS ON)
-  set(VELOX_ENABLE_EXPRESSION ON)
-  set(VELOX_ENABLE_EXEC ON)
-  set(VELOX_ENABLE_AGGREGATES ON)
-  set(VELOX_ENABLE_HIVE_CONNECTOR ON)
-  set(VELOX_ENABLE_TPCH_CONNECTOR ON)
-  set(VELOX_ENABLE_SPARK_FUNCTIONS ON)
-  set(VELOX_ENABLE_EXAMPLES ON)
-endif()
-
 if(${VELOX_ENABLE_BENCHMARKS})
   set(VELOX_ENABLE_BENCHMARKS_BASIC ON)
 endif()
@@ -162,9 +194,15 @@ endif()
 
 if(VELOX_BUILD_TESTING OR VELOX_BUILD_TEST_UTILS)
   set(cpr_SOURCE BUNDLED)
-  resolve_dependency(cpr)
+  velox_resolve_dependency(cpr)
   set(VELOX_ENABLE_DUCKDB ON)
   set(VELOX_ENABLE_PARSE ON)
+endif()
+
+if(${VELOX_BUILD_TESTING}
+   OR ${VELOX_BUILD_MINIMAL_WITH_DWIO}
+   OR ${VELOX_ENABLE_HIVE_CONNECTOR})
+  set(VELOX_ENABLE_COMPRESSION_LZ4 ON)
 endif()
 
 if(${VELOX_ENABLE_EXAMPLES})
@@ -179,6 +217,23 @@ if(${VELOX_BUILD_PYTHON_PACKAGE})
   set(VELOX_ENABLE_EXEC ON)
   set(VELOX_ENABLE_AGGREGATES ON)
   set(VELOX_ENABLE_SPARK_FUNCTIONS ON)
+
+  if(NOT VELOX_PYTHON_LEGACY_ONLY)
+    set(VELOX_BUILD_RUNNER OFF)
+    set(VELOX_BUILD_TEST_UTILS ON) # required for velox_exec_test_lib
+  endif()
+endif()
+
+if(${VELOX_ENABLE_DUCKDB})
+  velox_set_source(DuckDB)
+  velox_resolve_dependency(DuckDB)
+endif()
+
+if(DEFINED ENV{INSTALL_PREFIX})
+  # Allow installed package headers to be picked up before brew/system package
+  # headers. We set this after DuckDB bundling since DuckDB uses its own
+  # dependencies.
+  include_directories(BEFORE "$ENV{INSTALL_PREFIX}/include")
 endif()
 
 # We look for OpenSSL here to cache the result enforce the version across our
@@ -187,7 +242,8 @@ find_package(OpenSSL REQUIRED)
 
 if(VELOX_ENABLE_CCACHE
    AND NOT CMAKE_C_COMPILER_LAUNCHER
-   AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+   AND NOT CMAKE_CXX_COMPILER_LAUNCHER
+   AND NOT CMAKE_CUDA_COMPILER_LAUNCHER)
 
   find_program(CCACHE_FOUND ccache)
 
@@ -195,6 +251,7 @@ if(VELOX_ENABLE_CCACHE
     message(STATUS "Using ccache: ${CCACHE_FOUND}")
     set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE_FOUND})
     set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_FOUND})
+    set(CMAKE_CUDA_COMPILER_LAUNCHER ${CCACHE_FOUND})
     # keep comments as they might matter to the compiler
     set(ENV{CCACHE_COMMENTS} "1")
   endif()
@@ -209,14 +266,10 @@ if(${VELOX_FORCE_COLORED_OUTPUT})
   endif()
 endif()
 
-# At the moment we prefer static linking but by default cmake looks for shared
-# libs first. This will still fallback to shared libs when static ones are not
-# found
-list(INSERT CMAKE_FIND_LIBRARY_SUFFIXES 0 a)
 if(VELOX_ENABLE_S3)
   # Set AWS_ROOT_DIR if you have a custom install location of AWS SDK CPP.
   if(AWSSDK_ROOT_DIR)
-    set(CMAKE_PREFIX_PATH ${AWSSDK_ROOT_DIR})
+    list(APPEND CMAKE_PREFIX_PATH ${AWSSDK_ROOT_DIR})
   endif()
   find_package(AWSSDK REQUIRED COMPONENTS s3;identity-management)
   add_definitions(-DVELOX_ENABLE_S3)
@@ -230,15 +283,14 @@ if(VELOX_ENABLE_ABFS)
   endif()
   # files-datalake is built on blobs
   find_package(azure-storage-files-datalake-cpp CONFIG REQUIRED)
+  find_package(azure-identity-cpp CONFIG REQUIRED)
   add_definitions(-DVELOX_ENABLE_ABFS)
 endif()
 
 if(VELOX_ENABLE_HDFS)
-  find_library(
-    LIBHDFS3
-    NAMES libhdfs3.so libhdfs3.dylib
-    HINTS "${CMAKE_SOURCE_DIR}/hawq/depends/libhdfs3/_build/src/" REQUIRED)
-  add_definitions(-DVELOX_ENABLE_HDFS3)
+  add_definitions(-DVELOX_ENABLE_HDFS)
+  # JVM libhdfs requires arrow dependency.
+  set(VELOX_ENABLE_ARROW ON)
 endif()
 
 if(VELOX_ENABLE_PARQUET)
@@ -256,7 +308,7 @@ endif()
 
 # MacOSX enables two-level namespace by default:
 # http://mirror.informatimago.com/next/developer.apple.com/releasenotes/DeveloperTools/TwoLevelNamespaces.html
-# Enables -flat_namespace so type_info can be deudplicated across .so boundaries
+# Enables -flat_namespace so type_info can be deduplicated across .so boundaries
 if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
   add_link_options("-Wl,-flat_namespace")
 endif()
@@ -266,16 +318,8 @@ if(UNIX AND NOT APPLE)
   add_link_options("-Wl,-export-dynamic")
 endif()
 
-if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm64" AND ${CMAKE_SYSTEM_NAME} MATCHES
-                                                 "Darwin")
-  set(ON_APPLE_M1 True)
-endif()
-
 # Required so velox code can be used in a dynamic library
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 execute_process(
   COMMAND
@@ -297,6 +341,13 @@ if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsigned-char")
 endif()
 
+# Ensure that we don't bring in headers that might have coroutines enabled. The
+# dependencies turn off coroutines in folly and the other FBOS dependencies. If
+# not explicitly turned off differences in the build using GCC cause libray
+# incompatibilities of the thrift server and the remote functions library
+# causing SEGVs in the tests.
+string(APPEND CMAKE_CXX_FLAGS " -DFOLLY_CFG_NO_COROUTINES")
+
 # Under Ninja, we are able to designate certain targets large enough to require
 # restricted parallelism.
 if("${MAX_HIGH_MEM_JOBS}")
@@ -312,7 +363,7 @@ if("${MAX_LINK_JOBS}")
   set(CMAKE_JOB_POOL_LINK link_job_pool)
 endif()
 
-if("${ENABLE_ALL_WARNINGS}")
+if(ENABLE_ALL_WARNINGS)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     set(KNOWN_COMPILER_SPECIFIC_WARNINGS
         "-Wno-range-loop-analysis \
@@ -337,15 +388,12 @@ if("${ENABLE_ALL_WARNINGS}")
        -Wno-unused-parameter \
        -Wno-sign-compare \
        -Wno-ignored-qualifiers \
-       -Wnon-virtual-dtor \
        ${KNOWN_COMPILER_SPECIFIC_WARNINGS}")
 
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra ${KNOWN_WARNINGS}")
 endif()
 
-message("FINAL CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}")
-
-if(${VELOX_ENABLE_GPU})
+if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
   enable_language(CUDA)
   # Determine CUDA_ARCHITECTURES automatically.
   cmake_policy(SET CMP0104 NEW)
@@ -356,10 +404,54 @@ if(${VELOX_ENABLE_GPU})
   if(CMAKE_BUILD_TYPE MATCHES Debug)
     add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-G>")
   endif()
-  include_directories("${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
+  find_package(CUDAToolkit REQUIRED)
+  if(VELOX_ENABLE_CUDF)
+    foreach(arch ${CMAKE_CUDA_ARCHITECTURES})
+      if(arch LESS 70)
+        message(
+          FATAL_ERROR
+            "CUDA architecture ${arch} is below 70. CUDF requires Volta (SM 70) or newer GPUs."
+        )
+      endif()
+    endforeach()
+    set(VELOX_ENABLE_ARROW ON)
+    velox_set_source(cudf)
+    velox_resolve_dependency(cudf)
+  endif()
+endif()
+
+# Set after the test of the CUDA compiler. Otherwise, the test fails with
+# -latomic not found because it is added right after the compiler exe.
+if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang"
+   AND "${CMAKE_CXX_COMPILER_VERSION}" VERSION_GREATER_EQUAL 15)
+  set(CMAKE_EXE_LINKER_FLAGS "-latomic")
 endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
+  execute_process(
+    COMMAND brew --prefix icu4c
+    RESULT_VARIABLE BREW_ICU4C
+    OUTPUT_VARIABLE BREW_ICU4C_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(BREW_ICU4C EQUAL 0 AND EXISTS "${BREW_ICU4C_PREFIX}")
+    message(STATUS "Found icu4c installed by Homebrew at ${BREW_ICU4C_PREFIX}")
+    list(APPEND CMAKE_PREFIX_PATH "${BREW_ICU4C_PREFIX}")
+  else()
+    list(APPEND CMAKE_PREFIX_PATH "/usr/local/opt/icu4c")
+  endif()
+endif()
+
+velox_set_source(ICU)
+velox_resolve_dependency(
+  ICU
+  COMPONENTS
+  data
+  i18n
+  io
+  uc
+  tu)
 
 set(BOOST_INCLUDE_LIBRARIES
     atomic
@@ -371,14 +463,13 @@ set(BOOST_INCLUDE_LIBRARIES
     system
     thread)
 
-set_source(Boost)
-resolve_dependency(Boost 1.77.0 COMPONENTS ${BOOST_INCLUDE_LIBRARIES})
+velox_set_source(Boost)
+velox_resolve_dependency(Boost 1.77.0 COMPONENTS ${BOOST_INCLUDE_LIBRARIES})
 
-# Range-v3 will be enable when the codegen code actually lands keeping it here
-# for reference. find_package(range-v3)
+velox_set_source(gflags)
 
-set_source(gflags)
-resolve_dependency(gflags COMPONENTS ${VELOX_GFLAGS_TYPE})
+velox_resolve_dependency(gflags COMPONENTS ${VELOX_GFLAGS_TYPE})
+
 if(NOT TARGET gflags::gflags)
   # This is a bit convoluted, but we want to be able to use gflags::gflags as a
   # target even when velox is built as a subproject which uses
@@ -396,22 +487,20 @@ if(${gflags_SOURCE} STREQUAL "BUNDLED")
 else()
   set(glog_SOURCE SYSTEM)
 endif()
-resolve_dependency(glog)
+velox_resolve_dependency(glog)
 
-if(${VELOX_ENABLE_DUCKDB})
-  set_source(DuckDB)
-  resolve_dependency(DuckDB)
+velox_set_source(fmt)
+velox_resolve_dependency(fmt 9.0.0)
+
+if(VELOX_ENABLE_COMPRESSION_LZ4)
+  find_package(lz4 REQUIRED)
 endif()
-
-set_source(fmt)
-resolve_dependency(fmt 9.0.0)
 
 if(${VELOX_BUILD_MINIMAL_WITH_DWIO} OR ${VELOX_ENABLE_HIVE_CONNECTOR})
   # DWIO needs all sorts of stream compression libraries.
   #
   # TODO: make these optional and pluggable.
   find_package(ZLIB REQUIRED)
-  find_package(lz4 REQUIRED)
   find_package(lzo2 REQUIRED)
   find_package(zstd REQUIRED)
   find_package(Snappy REQUIRED)
@@ -425,13 +514,16 @@ if(${VELOX_BUILD_MINIMAL_WITH_DWIO} OR ${VELOX_ENABLE_HIVE_CONNECTOR})
   endif()
 endif()
 
-set_source(re2)
-resolve_dependency(re2)
+velox_set_source(re2)
+velox_resolve_dependency(re2)
 
 if(${VELOX_BUILD_PYTHON_PACKAGE})
-  set_source(pybind11)
-  resolve_dependency(pybind11 2.10.0)
-  add_subdirectory(pyvelox)
+  find_package(
+    Python 3.9
+    COMPONENTS Interpreter Development.Module
+    REQUIRED)
+  velox_set_source(pybind11)
+  velox_resolve_dependency(pybind11 2.10.0)
 endif()
 
 # DWIO (ORC/DWRF) and Substrait depend on protobuf.
@@ -441,18 +533,30 @@ if(${VELOX_BUILD_MINIMAL_WITH_DWIO}
    OR VELOX_ENABLE_GCS)
 
   # Locate or build protobuf.
-  set_source(Protobuf)
-  resolve_dependency(Protobuf CONFIG 3.21.7 REQUIRED)
+  velox_set_source(Protobuf)
+  velox_resolve_dependency(Protobuf 3.21.7 REQUIRED)
   include_directories(${Protobuf_INCLUDE_DIRS})
 endif()
 
-set_source(simdjson)
-resolve_dependency(simdjson 3.9.3)
+velox_set_source(simdjson)
+velox_resolve_dependency(simdjson 3.9.3)
 
-# Locate or build folly.
-add_compile_definitions(FOLLY_HAVE_INT128_T=1)
-set_source(folly)
-resolve_dependency(folly)
+velox_set_source(folly)
+velox_resolve_dependency(folly)
+
+if(${VELOX_BUILD_TESTING})
+  # Spark query runner depends on absl, gRPC.
+  velox_set_source(absl)
+  velox_resolve_dependency(absl)
+
+  # 'gRPC_CARES_PROVIDER' is set as 'package', which means c-ares library needs
+  # to be installed on the system, instead of being built by gRPC.
+  velox_set_source(c-ares)
+  velox_resolve_dependency(c-ares)
+
+  velox_set_source(gRPC)
+  velox_resolve_dependency(gRPC)
+endif()
 
 if(VELOX_ENABLE_REMOTE_FUNCTIONS)
   # TODO: Move this to use resolve_dependency(). For some reason, FBThrift
@@ -462,21 +566,14 @@ if(VELOX_ENABLE_REMOTE_FUNCTIONS)
   find_package(FBThrift CONFIG REQUIRED)
 endif()
 
-if(DEFINED FOLLY_BENCHMARK_STATIC_LIB)
-  set(FOLLY_BENCHMARK ${FOLLY_BENCHMARK_STATIC_LIB})
-else()
-  set(FOLLY_BENCHMARK Folly::follybenchmark)
-endif()
-
 if(VELOX_ENABLE_GCS)
-  set_source(google_cloud_cpp_storage)
-  resolve_dependency(google_cloud_cpp_storage CONFIG 2.22.0 REQUIRED)
+  velox_set_source(google_cloud_cpp_storage)
+  velox_resolve_dependency(google_cloud_cpp_storage CONFIG 2.22.0 REQUIRED)
   add_definitions(-DVELOX_ENABLE_GCS)
 endif()
 
 # GCC needs to link a library to enable std::filesystem.
 if("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU")
-  set(FILESYSTEM "stdc++fs")
 
   # Ensure we have gcc at least 9+.
   if(CMAKE_CXX_COMPILER_VERSION LESS 9.0)
@@ -486,8 +583,6 @@ if("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU")
 
   # Find Threads library
   find_package(Threads REQUIRED)
-else()
-  set(FILESYSTEM "")
 endif()
 
 if(VELOX_BUILD_TESTING AND NOT VELOX_ENABLE_DUCKDB)
@@ -536,20 +631,19 @@ find_package(double-conversion 3.1.5 REQUIRED)
 include_directories(SYSTEM velox)
 include_directories(SYSTEM velox/external)
 
-# these were previously vendored in third-party/
 if(NOT VELOX_DISABLE_GOOGLETEST)
-  set(gtest_SOURCE AUTO)
-  resolve_dependency(gtest)
+  velox_set_source(GTest)
+  velox_resolve_dependency(GTest)
   set(VELOX_GTEST_INCUDE_DIR
-      "${gtest_SOURCE_DIR}/googletest/include"
+      "${gtest_SOURCE_DIR}/include"
       PARENT_SCOPE)
 endif()
 
-set_source(xsimd)
-resolve_dependency(xsimd 10.0.0)
+velox_set_source(xsimd)
+velox_resolve_dependency(xsimd 10.0.0)
 
-set(stemmer_SOURCE BUNDLED)
-resolve_dependency(stemmer)
+velox_set_source(stemmer)
+velox_resolve_dependency(stemmer)
 
 if(VELOX_BUILD_TESTING)
   set(BUILD_TESTING ON)
@@ -568,9 +662,16 @@ if("${TREAT_WARNINGS_AS_ERRORS}")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
 endif()
 
+message("FINAL CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}")
+
 if(VELOX_ENABLE_ARROW)
-  set_source(Arrow)
-  resolve_dependency(Arrow)
+  velox_set_source(Arrow)
+  velox_resolve_dependency(Arrow)
+endif()
+
+if(VELOX_ENABLE_GEO)
+  velox_set_source(geos)
+  velox_resolve_dependency(geos)
 endif()
 
 add_subdirectory(velox)

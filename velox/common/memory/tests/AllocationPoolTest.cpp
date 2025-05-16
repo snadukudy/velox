@@ -28,8 +28,9 @@ using namespace facebook::velox::common::testutil;
 class AllocationPoolTest : public testing::Test {
  protected:
   void SetUp() override {
-    manager_ = std::make_shared<memory::MemoryManager>(
-        memory::MemoryManagerOptions{.allocatorCapacity = 8L << 30});
+    memory::MemoryManager::Options options;
+    options.allocatorCapacity = 8L << 30;
+    manager_ = std::make_shared<memory::MemoryManager>(options);
 
     root_ = manager_->addRootPool("allocationPoolTestRoot");
     pool_ = root_->addLeafChild("leaf");
@@ -53,7 +54,6 @@ TEST_F(AllocationPoolTest, hugePages) {
   allocationPool->setHugePageThreshold(128 << 10);
   int32_t counter = 0;
   for (;;) {
-    int32_t usedKB = 0;
     allocationPool->newRun(32 << 10);
     // Initial allocations round up to 64K
     EXPECT_EQ(1, allocationPool->numRanges());

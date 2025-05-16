@@ -2,6 +2,29 @@
 Miscellaneous Functions
 ====================================
 
+.. spark:function:: at_least_n_non_nulls(n, value1, value2, ..., valueN) -> bool
+
+    Returns true if there are at least ``n`` non-null and non-NaN values, 
+    or false otherwise. ``value1, value2, ..., valueN`` are evaluated lazily.
+    If ``n`` non-null and non-NaN values are found, the function will stop
+    evaluating the remaining arguments. If ``n <= 0``, the result is true. null
+    ``n`` is not allowed.
+    Nested nulls in complex type values are handled as non-nulls. ::
+
+        SELECT at_least_n_non_nulls(2, 0, NAN, NULL);  -- false
+        SELECT at_least_n_non_nulls(2, 0, 1.0, NULL);  -- true
+        SELECT at_least_n_non_nulls(2, 0, array(NULL), NULL);  -- true
+
+.. spark:function:: get_struct_field(struct, ordinal) -> T
+
+    Returns the value of nested subfield at position ``ordinal`` in the input ``struct``.
+    The input must be of row type and nested complex type is allowed.
+    The ``ordinal`` is 0-based, and if ``ordinal`` is negative or greater than or equal to
+    the children size of ``struct``, exception is thrown. ::
+
+        SELECT from_json('{"a": 1, "b": [1, 2, 3]}', 'a INT, b ARRAY<INT>').a; -- 1
+        SELECT from_json('{"a": 1, "b": [1, 2, 3]}', 'a INT, b ARRAY<INT>').b; -- array(1,2,3)
+
 .. spark:function:: monotonically_increasing_id() -> bigint
 
     Returns monotonically increasing 64-bit integers. The generated ID is

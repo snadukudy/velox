@@ -29,7 +29,7 @@ class TestIntegerDictionaryEncoder : public ::testing::Test {
  protected:
   static void SetUpTestCase() {
     FLAGS_velox_enable_memory_usage_track_in_default_memory_pool = true;
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 };
 
@@ -347,7 +347,8 @@ TEST_F(TestIntegerDictionaryEncoder, ShortIntegerDictionary) {
     intDictEncoder.addKey(key);
   }
 
-  int32_t dictSize = (int32_t)2 + std::numeric_limits<int16_t>::max();
+  int32_t dictSize =
+      static_cast<int32_t>(2) + std::numeric_limits<int16_t>::max();
   std::vector<int16_t> dictValues;
 
   auto actualSize =

@@ -30,7 +30,7 @@ using namespace facebook::velox::tpch;
 class TpchGenTestNationTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
@@ -137,7 +137,7 @@ TEST_F(TpchGenTestNationTest, reproducible) {
 class TpchGenTestRegionTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
@@ -203,7 +203,7 @@ TEST_F(TpchGenTestRegionTest, reproducible) {
 class TpchGenTestOrdersTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
@@ -313,7 +313,7 @@ TEST_F(TpchGenTestOrdersTest, reproducible) {
 class TpchGenTestLineItemTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
@@ -334,14 +334,17 @@ TEST_F(TpchGenTestLineItemTest, batches) {
   EXPECT_LE(rowVector1->size(), ordersMaxSize * 7);
 
   auto orderKey = rowVector1->childAt(0)->asFlatVector<int64_t>();
+  auto quantity = rowVector1->childAt(4)->asFlatVector<double>();
   auto shipDate = rowVector1->childAt(10)->asFlatVector<int32_t>();
 
   EXPECT_EQ(1, orderKey->valueAt(0));
+  EXPECT_EQ(17, quantity->valueAt(0));
   EXPECT_EQ("1996-03-13", DATE()->toString(shipDate->valueAt(0)));
   LOG(INFO) << rowVector1->toString(0);
 
   vector_size_t lastRow = rowVector1->size() - 1;
   EXPECT_EQ(388, orderKey->valueAt(lastRow));
+  EXPECT_EQ(40, quantity->valueAt(lastRow));
   EXPECT_EQ("1992-12-24", DATE()->toString(shipDate->valueAt(lastRow)));
   LOG(INFO) << rowVector1->toString(lastRow);
 
@@ -428,7 +431,7 @@ TEST_F(TpchGenTestLineItemTest, reproducible) {
 class TpchGenTestSupplierTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
@@ -524,7 +527,7 @@ TEST_F(TpchGenTestSupplierTest, reproducible) {
 class TpchGenTestPartTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
@@ -613,7 +616,7 @@ TEST_F(TpchGenTestPartTest, reproducible) {
 class TpchGenTestPartSuppTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
@@ -761,7 +764,7 @@ TEST_F(TpchGenTestPartSuppTest, reproducible) {
 class TpchGenTestCustomerTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {

@@ -73,7 +73,16 @@ class JsonExtractor {
 
     while (kTokenizer.hasNext()) {
       if (auto token = kTokenizer.getNext()) {
-        tokens_.emplace_back(token.value());
+        auto& tk = token.value();
+        if (tk.selector == JsonPathTokenizer::Selector::WILDCARD) {
+          tokens_.emplace_back("*");
+        } else if (tk.selector == JsonPathTokenizer::Selector::RECURSIVE) {
+          // Not supported in this implementation of json_extract
+          tokens_.clear();
+          return false;
+        } else {
+          tokens_.emplace_back(tk.value);
+        }
       } else {
         tokens_.clear();
         return false;
@@ -113,15 +122,16 @@ void extractArray(
     const folly::dynamic* jsonArray,
     const std::string& key,
     JsonVector& ret) {
-  auto arrayLen = jsonArray->size();
+  int64_t arrayLen = jsonArray->size();
   if (key == "*") {
     for (size_t i = 0; i < arrayLen; ++i) {
       ret.push_back(jsonArray->get_ptr(i));
     }
   } else {
-    auto rv = folly::tryTo<int32_t>(key);
+    auto rv = folly::tryTo<int64_t>(key);
     if (rv.hasValue()) {
       auto idx = rv.value();
+      idx = idx >= 0 ? idx : arrayLen + idx;
       if (idx >= 0 && idx < arrayLen) {
         ret.push_back(jsonArray->get_ptr(idx));
       }

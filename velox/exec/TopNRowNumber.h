@@ -17,8 +17,10 @@
 
 #include "velox/exec/HashTable.h"
 #include "velox/exec/Operator.h"
+#include "velox/exec/Spiller.h"
 
 namespace facebook::velox::exec {
+class TopNRowNumberSpiller;
 
 /// Partitions the input using specified partitioning keys, sorts rows within
 /// partitions using specified sorting keys, assigns row numbers and returns up
@@ -92,6 +94,9 @@ class TopNRowNumber : public Operator {
     return *reinterpret_cast<TopRows*>(group + partitionOffset_);
   }
 
+  // Decodes and potentially loads input if lazy vector.
+  void prepareInput(RowVectorPtr& input);
+
   // Adds input row to a partition or discards the row.
   void processInputRow(vector_size_t index, TopRows& partition);
 
@@ -99,15 +104,13 @@ class TopNRowNumber : public Operator {
   // partitions left.
   TopRows* nextPartition();
 
-  // Returns partition that was partially added to the previous output batch.
-  TopRows& currentPartition();
-
-  // Appends partition rows to outputRows_ and optionally populates row
-  // numbers.
+  // Appends numRows of the output partition the output. Note: The rows are
+  // popped in reverse order of the row_number.
+  // NOTE: This function erases the yielded output rows from the partition
+  // and the next call starts with the remaining rows.
   void appendPartitionRows(
       TopRows& partition,
-      vector_size_t start,
-      vector_size_t size,
+      vector_size_t numRows,
       vector_size_t outputOffset,
       FlatVector<int64_t>* rowNumbers);
 
@@ -151,7 +154,9 @@ class TopNRowNumber : public Operator {
   bool abandonPartialEarly() const;
 
   const int32_t limit_;
+
   const bool generateRowNumber_;
+
   const size_t numPartitionKeys_;
 
   // Input columns in the order of: partition keys, sorting keys, the rest.
@@ -168,6 +173,7 @@ class TopNRowNumber : public Operator {
   const std::vector<CompareFlags> spillCompareFlags_;
 
   const vector_size_t abandonPartialMinRows_;
+
   const int32_t abandonPartialMinPct_;
 
   // True if this operator runs a 'partial' stage without sufficient reduction
@@ -178,12 +184,15 @@ class TopNRowNumber : public Operator {
   // partitioning keys. For each partition, stores an instance of TopRows
   // struct.
   std::unique_ptr<BaseHashTable> table_;
+
   std::unique_ptr<HashLookup> lookup_;
+
   int32_t partitionOffset_;
 
   // TopRows struct to keep track of top rows for a single partition, when
   // there are no partitioning keys.
   std::unique_ptr<HashStringAllocator> allocator_;
+
   std::unique_ptr<TopRows> singlePartition_;
 
   // Stores input data. For each partition, only up to 'limit_' rows are stored.
@@ -208,8 +217,11 @@ class TopNRowNumber : public Operator {
 
   // Maximum number of rows in the output batch.
   vector_size_t outputBatchSize_;
-  std::vector<char*> outputRows_;
 
+  // The below variables are used when outputting from memory.
+  // Vector of pointers to individual rows in the RowContainer for the current
+  // output block.
+  std::vector<char*> outputRows_;
   // Number of partitions to fetch from a HashTable in a single listAllRows
   // call.
   static const size_t kPartitionBatchSize = 100;
@@ -217,16 +229,22 @@ class TopNRowNumber : public Operator {
   BaseHashTable::RowsIterator partitionIt_;
   std::vector<char*> partitions_{kPartitionBatchSize};
   size_t numPartitions_{0};
-  std::optional<int32_t> currentPartition_;
-  vector_size_t remainingRowsInPartition_{0};
 
+  // This is the index of the current partition within partitions_ which is
+  // obtained from the HashTable iterator.
+  std::optional<int32_t> outputPartitionNumber_;
+  // This is the currentPartition being output. It is possible that the
+  // partition is output across multiple output blocks.
+  TopNRowNumber::TopRows* outputPartition_{nullptr};
+
+  // The below variables are used when outputting from the spiller.
   // Spiller for contents of the 'data_'.
-  std::unique_ptr<Spiller> spiller_;
+  std::unique_ptr<SortInputSpiller> spiller_;
 
   // Used to sort-merge spilled data.
   std::unique_ptr<TreeOfLosers<SpillMergeStream>> merge_;
 
-  // Row number for the first row in the next output batch.
+  // Row number for the first row in the next output batch from the spiller.
   int32_t nextRowNumber_{0};
 };
 } // namespace facebook::velox::exec

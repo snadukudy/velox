@@ -19,7 +19,9 @@
 #include "velox/common/testutil/TestValue.h"
 #include "velox/dwio/common/BufferUtil.h"
 #include "velox/dwio/common/ColumnVisitors.h"
+#include "velox/dwio/parquet/common/LevelConversion.h"
 #include "velox/dwio/parquet/thrift/ThriftTransport.h"
+
 #include "velox/vector/FlatVector.h"
 
 #include <thrift/protocol/TCompactProtocol.h> // @manual
@@ -31,13 +33,17 @@ namespace facebook::velox::parquet {
 using thrift::Encoding;
 using thrift::PageHeader;
 
+struct __attribute__((__packed__)) Int96Timestamp {
+  int32_t days;
+  uint64_t nanos;
+};
+
 void PageReader::seekToPage(int64_t row) {
   defineDecoder_.reset();
   repeatDecoder_.reset();
   // 'rowOfPage_' is the row number of the first row of the next page.
   rowOfPage_ += numRowsInPage_;
   for (;;) {
-    auto dataStart = pageStart_;
     if (chunkSize_ <= pageStart_) {
       // This may happen if seeking to exactly end of row group.
       numRepDefsInPage_ = 0;
@@ -218,7 +224,7 @@ void PageReader::prepareDataPageV1(const PageHeader& pageHeader, int64_t row) {
   auto pageEnd = pageData_ + pageHeader.uncompressed_page_size;
   if (maxRepeat_ > 0) {
     uint32_t repeatLength = readField<int32_t>(pageData_);
-    repeatDecoder_ = std::make_unique<::arrow::util::RleDecoder>(
+    repeatDecoder_ = std::make_unique<RleDecoder>(
         reinterpret_cast<const uint8_t*>(pageData_),
         repeatLength,
         ::arrow::bit_util::NumRequiredBits(maxRepeat_));
@@ -234,7 +240,7 @@ void PageReader::prepareDataPageV1(const PageHeader& pageHeader, int64_t row) {
           pageData_ + defineLength,
           ::arrow::bit_util::NumRequiredBits(maxDefine_));
     }
-    wideDefineDecoder_ = std::make_unique<::arrow::util::RleDecoder>(
+    wideDefineDecoder_ = std::make_unique<RleDecoder>(
         reinterpret_cast<const uint8_t*>(pageData_),
         defineLength,
         ::arrow::bit_util::NumRequiredBits(maxDefine_));
@@ -275,7 +281,7 @@ void PageReader::prepareDataPageV2(const PageHeader& pageHeader, int64_t row) {
   pageData_ = readBytes(bytes, pageBuffer_);
 
   if (repeatLength) {
-    repeatDecoder_ = std::make_unique<::arrow::util::RleDecoder>(
+    repeatDecoder_ = std::make_unique<RleDecoder>(
         reinterpret_cast<const uint8_t*>(pageData_),
         repeatLength,
         ::arrow::bit_util::NumRequiredBits(maxRepeat_));
@@ -346,6 +352,10 @@ void PageReader::prepareDictionary(const PageHeader& pageHeader) {
         auto numVeloxBytes = dictionary_.numValues * veloxTypeLength;
         dictionary_.values =
             AlignedBuffer::allocate<char>(numVeloxBytes, &pool_);
+      } else if (type_->type()->isTimestamp()) {
+        const auto numVeloxBytes = dictionary_.numValues * sizeof(int128_t);
+        dictionary_.values =
+            AlignedBuffer::allocate<char>(numVeloxBytes, &pool_);
       } else {
         dictionary_.values = AlignedBuffer::allocate<char>(numBytes, &pool_);
       }
@@ -368,6 +378,44 @@ void PageReader::prepareDictionary(const PageHeader& pageHeader) {
           // We start from the end to allow in-place expansion.
           values[i] = parquetValues[i];
         }
+      } else if (type_->type()->isTimestamp()) {
+        VELOX_DCHECK_EQ(parquetType, thrift::Type::INT64);
+        auto values = dictionary_.values->asMutable<int128_t>();
+        auto parquetValues = dictionary_.values->asMutable<int64_t>();
+        for (auto i = dictionary_.numValues - 1; i >= 0; --i) {
+          // Expand the Parquet type length values to Velox type length.
+          // We start from the end to allow in-place expansion.
+          values[i] = parquetValues[i];
+        }
+      }
+      break;
+    }
+    case thrift::Type::INT96: {
+      auto numVeloxBytes = dictionary_.numValues * sizeof(int128_t);
+      dictionary_.values = AlignedBuffer::allocate<char>(numVeloxBytes, &pool_);
+      auto numBytes = dictionary_.numValues * sizeof(Int96Timestamp);
+      if (pageData_) {
+        memcpy(dictionary_.values->asMutable<char>(), pageData_, numBytes);
+      } else {
+        dwio::common::readBytes(
+            numBytes,
+            inputStream_.get(),
+            dictionary_.values->asMutable<char>(),
+            bufferStart_,
+            bufferEnd_);
+      }
+      // Expand the Parquet type length values to Velox type length.
+      // We start from the end to allow in-place expansion.
+      auto values = dictionary_.values->asMutable<int128_t>();
+      auto parquetValues = dictionary_.values->asMutable<char>();
+
+      for (auto i = dictionary_.numValues - 1; i >= 0; --i) {
+        int128_t result = 0;
+        memcpy(
+            &result,
+            parquetValues + i * sizeof(Int96Timestamp),
+            sizeof(Int96Timestamp));
+        values[i] = result;
       }
       break;
     }
@@ -461,7 +509,6 @@ void PageReader::prepareDictionary(const PageHeader& pageHeader) {
       VELOX_UNSUPPORTED(
           "Parquet type {} not supported for dictionary", parquetType);
     }
-    case thrift::Type::INT96:
     default:
       VELOX_UNSUPPORTED(
           "Parquet type {} not supported for dictionary", parquetType);
@@ -488,6 +535,8 @@ int32_t parquetTypeBytes(thrift::Type::type type) {
     case thrift::Type::INT64:
     case thrift::Type::DOUBLE:
       return 8;
+    case thrift::Type::INT96:
+      return 12;
     default:
       VELOX_FAIL("Type does not have a byte width {}", type);
   }
@@ -559,19 +608,19 @@ void PageReader::decodeRepDefs(int32_t numTopLevelRows) {
 
 int32_t PageReader::getLengthsAndNulls(
     LevelMode mode,
-    const arrow::LevelInfo& info,
+    const LevelInfo& info,
     int32_t begin,
     int32_t end,
     int32_t maxItems,
     int32_t* lengths,
     uint64_t* nulls,
     int32_t nullsStartIndex) const {
-  arrow::ValidityBitmapInputOutput bits;
-  bits.values_read_upper_bound = maxItems;
-  bits.values_read = 0;
-  bits.null_count = 0;
-  bits.valid_bits = reinterpret_cast<uint8_t*>(nulls);
-  bits.valid_bits_offset = nullsStartIndex;
+  ValidityBitmapInputOutput bits;
+  bits.valuesReadUpperBound = maxItems;
+  bits.valuesRead = 0;
+  bits.nullCount = 0;
+  bits.validBits = reinterpret_cast<uint8_t*>(nulls);
+  bits.validBitsOffset = nullsStartIndex;
 
   switch (mode) {
     case LevelMode::kNulls:
@@ -579,7 +628,7 @@ int32_t PageReader::getLengthsAndNulls(
           definitionLevels_.data() + begin, end - begin, info, &bits);
       break;
     case LevelMode::kList: {
-      arrow::DefRepLevelsToList(
+      DefRepLevelsToList(
           definitionLevels_.data() + begin,
           repetitionLevels_.data() + begin,
           end - begin,
@@ -587,7 +636,7 @@ int32_t PageReader::getLengthsAndNulls(
           &bits,
           lengths);
       // Convert offsets to lengths.
-      for (auto i = 0; i < bits.values_read; ++i) {
+      for (auto i = 0; i < bits.valuesRead; ++i) {
         lengths[i] = lengths[i + 1] - lengths[i];
       }
       break;
@@ -602,11 +651,22 @@ int32_t PageReader::getLengthsAndNulls(
       break;
     }
   }
-  return bits.values_read;
+  return bits.valuesRead;
+}
+
+template <typename T>
+inline std::enable_if_t<std::is_trivially_copyable_v<T>, T> SafeLoadAs(
+    const uint8_t* unaligned) {
+  std::remove_const_t<T> ret;
+  std::memcpy(&ret, unaligned, sizeof(T));
+  return ret;
 }
 
 void PageReader::makeDecoder() {
   auto parquetType = type_->parquetType_.value();
+  auto pageDataSize = folly::Endian::little(
+      SafeLoadAs<uint32_t>(reinterpret_cast<const uint8_t*>(pageData_)));
+  const uint8_t parquetMagicNumberSize = 4;
   switch (encoding_) {
     case Encoding::RLE_DICTIONARY:
     case Encoding::PLAIN_DICTIONARY:
@@ -624,7 +684,7 @@ void PageReader::makeDecoder() {
               pageData_, pageData_ + encodedDataSize_);
           break;
         case thrift::Type::FIXED_LEN_BYTE_ARRAY:
-          if (type_->type()->isVarbinary()) {
+          if (type_->type()->isVarbinary() || type_->type()->isVarchar()) {
             stringDecoder_ = std::make_unique<StringDecoder>(
                 pageData_, pageData_ + encodedDataSize_, type_->typeLength_);
           } else {
@@ -657,6 +717,35 @@ void PageReader::makeDecoder() {
               "DELTA_BINARY_PACKED decoder only supports INT32 and INT64");
       }
       break;
+    case Encoding::RLE:
+      switch (parquetType) {
+        case thrift::Type::BOOLEAN:
+          VELOX_CHECK_GE(
+              encodedDataSize_,
+              parquetMagicNumberSize,
+              "Received invalid length : {} (corrupt data page?)",
+              encodedDataSize_);
+          VELOX_CHECK_LE(
+              pageDataSize,
+              static_cast<uint32_t>(encodedDataSize_ - parquetMagicNumberSize),
+              "Received invalid number of bytes: {} (corrupt data page?)",
+              pageDataSize);
+          rleBooleanDecoder_ = std::make_unique<RleBpDataDecoder>(
+              pageData_ + parquetMagicNumberSize,
+              pageData_ + encodedDataSize_,
+              1);
+          break;
+        default:
+          VELOX_UNSUPPORTED("RLE decoder only supports BOOLEAN");
+      }
+      break;
+    case Encoding::DELTA_BYTE_ARRAY:
+      if (parquetType == thrift::Type::BYTE_ARRAY) {
+        deltaByteArrDecoder_ =
+            std::make_unique<DeltaByteArrayDecoder>(pageData_);
+        break;
+      }
+      FMT_FALLTHROUGH;
     default:
       VELOX_UNSUPPORTED("Encoding not supported yet: {}", encoding_);
   }
@@ -677,8 +766,14 @@ void PageReader::skip(int64_t numRows) {
   }
   firstUnvisited_ += numRows;
 
+  if (toSkip == 0) {
+    return;
+  }
   // Skip nulls
   toSkip = skipNulls(toSkip);
+  if (toSkip == 0) {
+    return;
+  }
 
   // Skip the decoder
   if (isDictionary()) {
@@ -691,6 +786,10 @@ void PageReader::skip(int64_t numRows) {
     booleanDecoder_->skip(toSkip);
   } else if (deltaBpDecoder_) {
     deltaBpDecoder_->skip(toSkip);
+  } else if (deltaByteArrDecoder_) {
+    deltaByteArrDecoder_->skip(toSkip);
+  } else if (rleBooleanDecoder_) {
+    rleBooleanDecoder_->skip(toSkip);
   } else {
     VELOX_FAIL("No decoder to skip");
   }

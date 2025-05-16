@@ -82,17 +82,28 @@ class OpaqueCustomTypeRegister {
     return VeloxType::get();
   }
 
+  static const TypePtr& get() {
+    return VeloxType::get();
+  }
+
  private:
   class TypeFactory : public CustomTypeFactories {
    public:
     TypeFactory() = default;
 
-    TypePtr getType() const override {
+    TypePtr getType(
+        const std::vector<TypeParameter>& parameters) const override {
+      VELOX_CHECK(parameters.empty());
       return singletonTypePtr();
     }
 
     exec::CastOperatorPtr getCastOperator() const override {
       VELOX_UNSUPPORTED();
+    }
+
+    AbstractInputGeneratorPtr getInputGenerator(
+        const InputGeneratorConfig& /*config*/) const override {
+      return nullptr;
     }
   };
 };

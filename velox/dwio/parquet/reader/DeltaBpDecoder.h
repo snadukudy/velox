@@ -78,6 +78,22 @@ class DeltaBpDecoder {
     }
   }
 
+  const char* bufferStart() {
+    return bufferStart_;
+  }
+
+  int64_t validValuesCount() {
+    return static_cast<int64_t>(totalValuesRemaining_);
+  }
+
+  template <typename T>
+  void readValues(T* values, int32_t numValues) {
+    VELOX_DCHECK_LE(numValues, totalValuesRemaining_);
+    for (auto i = 0; i < numValues; i++) {
+      values[i] = T(readLong());
+    }
+  }
+
  private:
   bool getVlqInt(uint64_t& v) {
     uint64_t tmp = 0;
@@ -134,7 +150,7 @@ class DeltaBpDecoder {
     VELOX_DCHECK_GT(totalValuesRemaining_, 0, "initBlock called at EOF");
 
     if (!getZigZagVlqInt(minDelta_)) {
-      VELOX_FAIL("initBlock EOF")
+      VELOX_FAIL("initBlock EOF");
     }
 
     // read the bitwidth of each miniblock
@@ -173,6 +189,7 @@ class DeltaBpDecoder {
         if (totalValueCount_ != 1) {
           initBlock();
         }
+        totalValuesRemaining_--;
         return value;
       } else {
         ++miniBlockIdx_;
@@ -201,7 +218,7 @@ class DeltaBpDecoder {
     valuesRemainingCurrentMiniBlock_--;
     totalValuesRemaining_--;
 
-    if (valuesRemainingCurrentMiniBlock_ == 0) {
+    if (valuesRemainingCurrentMiniBlock_ == 0 || totalValuesRemaining_ == 0) {
       bufferStart_ += bits::nbytes(deltaBitWidth_ * valuesPerMiniBlock_);
     }
     return value;

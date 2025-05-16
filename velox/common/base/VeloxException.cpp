@@ -34,7 +34,7 @@ std::exception_ptr toVeloxException(const std::exception_ptr& exceptionPtr) {
 }
 
 int64_t& threadNumVeloxThrow() {
-  thread_local int64_t numThrow;
+  thread_local int64_t numThrow = 0;
   return numThrow;
 }
 
@@ -54,7 +54,7 @@ std::string getAdditionalExceptionContextString(
     VeloxException::Type exceptionType,
     const std::string& currentMessage) {
   auto* context = &getExceptionContext();
-  std::string additionalMessage = "";
+  std::string additionalMessage;
   if (!context->parent || !context->parent->parent) {
     return additionalMessage;
   }

@@ -13,324 +13,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/exec/Aggregate.h"
-#include "velox/exec/SetAccumulator.h"
-#include "velox/functions/lib/CheckNestedNulls.h"
+#include "velox/functions/prestosql/aggregates/SetAggregates.h"
+#include "velox/functions/lib/aggregates/SetBaseAggregate.h"
 #include "velox/functions/prestosql/aggregates/AggregateNames.h"
+
+using namespace facebook::velox::functions::aggregate;
 
 namespace facebook::velox::aggregate::prestosql {
 
 namespace {
 
-template <typename T, bool ignoreNulls = false>
-class SetBaseAggregate : public exec::Aggregate {
+template <typename T, typename AccumulatorType = SetAccumulator<T>>
+class SetUnionAggregate
+    : public SetBaseAggregate<T, false, true, AccumulatorType> {
  public:
-  explicit SetBaseAggregate(const TypePtr& resultType)
-      : exec::Aggregate(resultType) {}
+  using Base = SetBaseAggregate<T, false, true, AccumulatorType>;
 
-  using AccumulatorType = SetAccumulator<T>;
-
-  int32_t accumulatorFixedWidthSize() const override {
-    return sizeof(AccumulatorType);
-  }
-
-  bool isFixedSize() const override {
-    return false;
-  }
-
-  void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
-      override {
-    auto arrayVector = (*result)->as<ArrayVector>();
-    arrayVector->resize(numGroups);
-
-    auto* rawOffsets = arrayVector->offsets()->asMutable<vector_size_t>();
-    auto* rawSizes = arrayVector->sizes()->asMutable<vector_size_t>();
-
-    vector_size_t numValues = 0;
-    uint64_t* rawNulls = getRawNulls(arrayVector);
-    for (auto i = 0; i < numGroups; ++i) {
-      auto* group = groups[i];
-      if (isNull(group)) {
-        arrayVector->setNull(i, true);
-      } else {
-        clearNull(rawNulls, i);
-
-        const auto size = value(group)->size();
-
-        rawOffsets[i] = numValues;
-        rawSizes[i] = size;
-
-        numValues += size;
-      }
-    }
-
-    if constexpr (std::is_same_v<T, ComplexType>) {
-      auto values = arrayVector->elements();
-      values->resize(numValues);
-
-      vector_size_t offset = 0;
-      for (auto i = 0; i < numGroups; ++i) {
-        auto* group = groups[i];
-        if (!isNull(group)) {
-          offset += value(group)->extractValues(*values, offset);
-        }
-      }
-    } else {
-      auto values = arrayVector->elements()->as<FlatVector<T>>();
-      values->resize(numValues);
-
-      vector_size_t offset = 0;
-      for (auto i = 0; i < numGroups; ++i) {
-        auto* group = groups[i];
-        if (!isNull(group)) {
-          offset += value(group)->extractValues(*values, offset);
-        }
-      }
-    }
-  }
-
-  void extractAccumulators(char** groups, int32_t numGroups, VectorPtr* result)
-      override {
-    return extractValues(groups, numGroups, result);
-  }
-
-  void addIntermediateResults(
-      char** groups,
-      const SelectivityVector& rows,
-      const std::vector<VectorPtr>& args,
-      bool /*mayPushdown*/) override {
-    addIntermediateResultsInt(groups, rows, args, false);
-  }
-
-  void addSingleGroupIntermediateResults(
-      char* group,
-      const SelectivityVector& rows,
-      const std::vector<VectorPtr>& args,
-      bool /*mayPushdown*/) override {
-    addSingleGroupIntermediateResultsInt(group, rows, args, false);
-  }
-
- protected:
-  inline AccumulatorType* value(char* group) {
-    return reinterpret_cast<AccumulatorType*>(group + Aggregate::offset_);
-  }
-
-  void addIntermediateResultsInt(
-      char** groups,
-      const SelectivityVector& rows,
-      const std::vector<VectorPtr>& args,
-      bool clearNullForAllInputs) {
-    decoded_.decode(*args[0], rows);
-
-    auto baseArray = decoded_.base()->template as<ArrayVector>();
-    decodedElements_.decode(*baseArray->elements());
-
-    rows.applyToSelected([&](vector_size_t i) {
-      if (decoded_.isNullAt(i)) {
-        if (clearNullForAllInputs) {
-          clearNull(groups[i]);
-        }
-        return;
-      }
-
-      auto* group = groups[i];
-      clearNull(group);
-
-      auto tracker = trackRowSize(group);
-
-      auto decodedIndex = decoded_.index(i);
-      if constexpr (ignoreNulls) {
-        value(group)->addNonNullValues(
-            *baseArray, decodedIndex, decodedElements_, allocator_);
-      } else {
-        value(group)->addValues(
-            *baseArray, decodedIndex, decodedElements_, allocator_);
-      }
-    });
-  }
-
-  void addSingleGroupIntermediateResultsInt(
-      char* group,
-      const SelectivityVector& rows,
-      const std::vector<VectorPtr>& args,
-      bool clearNullForAllInputs) {
-    decoded_.decode(*args[0], rows);
-
-    auto baseArray = decoded_.base()->template as<ArrayVector>();
-
-    decodedElements_.decode(*baseArray->elements());
-
-    auto* accumulator = value(group);
-
-    auto tracker = trackRowSize(group);
-    rows.applyToSelected([&](vector_size_t i) {
-      if (decoded_.isNullAt(i)) {
-        if (clearNullForAllInputs) {
-          clearNull(group);
-        }
-        return;
-      }
-
-      clearNull(group);
-
-      auto decodedIndex = decoded_.index(i);
-      if constexpr (ignoreNulls) {
-        accumulator->addNonNullValues(
-            *baseArray, decodedIndex, decodedElements_, allocator_);
-      } else {
-        accumulator->addValues(
-            *baseArray, decodedIndex, decodedElements_, allocator_);
-      }
-    });
-  }
-
-  void initializeNewGroupsInternal(
-      char** groups,
-      folly::Range<const vector_size_t*> indices) override {
-    const auto& type = resultType()->childAt(0);
-    exec::Aggregate::setAllNulls(groups, indices);
-    for (auto i : indices) {
-      new (groups[i] + offset_) AccumulatorType(type, allocator_);
-    }
-  }
-
-  void destroyInternal(folly::Range<char**> groups) override {
-    for (auto* group : groups) {
-      if (isInitialized(group) && !isNull(group)) {
-        value(group)->free(*allocator_);
-      }
-    }
-  }
-
-  DecodedVector decoded_;
-  DecodedVector decodedElements_;
-};
-
-template <typename T, bool ignoreNulls = false>
-class SetAggAggregate : public SetBaseAggregate<T, ignoreNulls> {
- public:
-  explicit SetAggAggregate(
-      const TypePtr& resultType,
-      const bool throwOnNestedNulls = false)
-      : SetBaseAggregate<T, ignoreNulls>(resultType),
-        throwOnNestedNulls_(throwOnNestedNulls) {}
-
-  using Base = SetBaseAggregate<T, ignoreNulls>;
-
-  bool supportsToIntermediate() const override {
-    return true;
-  }
-
-  void toIntermediate(
-      const SelectivityVector& rows,
-      std::vector<VectorPtr>& args,
-      VectorPtr& result) const override {
-    const auto& elements = args[0];
-
-    if (throwOnNestedNulls_) {
-      DecodedVector decodedElements(*elements, rows);
-      auto indices = decodedElements.indices();
-      rows.applyToSelected([&](vector_size_t i) {
-        velox::functions::checkNestedNulls(
-            decodedElements, indices, i, throwOnNestedNulls_);
-      });
-    }
-
-    const auto numRows = rows.size();
-
-    // Convert input to a single-entry array.
-
-    // Set nulls for rows not present in 'rows'.
-    auto* pool = Base::allocator_->pool();
-    BufferPtr nulls = allocateNulls(numRows, pool);
-    memcpy(
-        nulls->asMutable<uint64_t>(),
-        rows.asRange().bits(),
-        bits::nbytes(numRows));
-
-    // Set offsets to 0, 1, 2, 3...
-    BufferPtr offsets = allocateOffsets(numRows, pool);
-    auto* rawOffsets = offsets->asMutable<vector_size_t>();
-    std::iota(rawOffsets, rawOffsets + numRows, 0);
-
-    // Set sizes to 1.
-    BufferPtr sizes = allocateSizes(numRows, pool);
-    auto* rawSizes = sizes->asMutable<vector_size_t>();
-    std::fill(rawSizes, rawSizes + numRows, 1);
-
-    result = std::make_shared<ArrayVector>(
-        pool,
-        ARRAY(elements->type()),
-        nulls,
-        numRows,
-        offsets,
-        sizes,
-        BaseVector::loadedVectorShared(elements));
-  }
-
-  void addRawInput(
-      char** groups,
-      const SelectivityVector& rows,
-      const std::vector<VectorPtr>& args,
-      bool /*mayPushdown*/) override {
-    Base::decoded_.decode(*args[0], rows);
-    auto indices = Base::decoded_.indices();
-    rows.applyToSelected([&](vector_size_t i) {
-      auto* group = groups[i];
-      Base::clearNull(group);
-
-      if (throwOnNestedNulls_) {
-        velox::functions::checkNestedNulls(
-            Base::decoded_, indices, i, throwOnNestedNulls_);
-      }
-
-      auto tracker = Base::trackRowSize(group);
-      if constexpr (ignoreNulls) {
-        Base::value(group)->addNonNullValue(
-            Base::decoded_, i, Base::allocator_);
-      } else {
-        Base::value(group)->addValue(Base::decoded_, i, Base::allocator_);
-      }
-    });
-  }
-
-  void addSingleGroupRawInput(
-      char* group,
-      const SelectivityVector& rows,
-      const std::vector<VectorPtr>& args,
-      bool /*mayPushdown*/) override {
-    Base::decoded_.decode(*args[0], rows);
-
-    Base::clearNull(group);
-    auto* accumulator = Base::value(group);
-
-    auto tracker = Base::trackRowSize(group);
-    auto indices = Base::decoded_.indices();
-    rows.applyToSelected([&](vector_size_t i) {
-      if (throwOnNestedNulls_) {
-        velox::functions::checkNestedNulls(
-            Base::decoded_, indices, i, throwOnNestedNulls_);
-      }
-
-      if constexpr (ignoreNulls) {
-        accumulator->addNonNullValue(Base::decoded_, i, Base::allocator_);
-      } else {
-        accumulator->addValue(Base::decoded_, i, Base::allocator_);
-      }
-    });
-  }
-
- private:
-  const bool throwOnNestedNulls_;
-};
-
-template <typename T>
-class SetUnionAggregate : public SetBaseAggregate<T> {
- public:
-  explicit SetUnionAggregate(const TypePtr& resultType)
-      : SetBaseAggregate<T>(resultType) {}
-
-  using Base = SetBaseAggregate<T>;
+  explicit SetUnionAggregate(const TypePtr& resultType) : Base(resultType) {}
 
   bool supportsToIntermediate() const override {
     return true;
@@ -363,7 +62,7 @@ class SetUnionAggregate : public SetBaseAggregate<T> {
     if (rows.isAllSelected()) {
       result = arrayInput;
     } else {
-      auto* pool = SetBaseAggregate<T>::allocator_->pool();
+      auto* pool = Base::allocator_->pool();
       const auto numRows = rows.size();
 
       // Set nulls for rows not present in 'rows'.
@@ -404,15 +103,16 @@ class SetUnionAggregate : public SetBaseAggregate<T> {
 
 /// Returns the number of distinct non-null values in a group. This is an
 /// internal function only used for testing.
-template <typename T>
-class CountDistinctAggregate : public SetAggAggregate<T, true> {
+template <typename T, typename AccumulatorType = SetAccumulator<T>>
+class CountDistinctAggregate
+    : public SetAggAggregate<T, true, false, AccumulatorType> {
  public:
+  using Base = SetAggAggregate<T, true, false, AccumulatorType>;
+
   explicit CountDistinctAggregate(
       const TypePtr& resultType,
       const TypePtr& inputType)
-      : SetAggAggregate<T, true>(resultType, false), inputType_{inputType} {}
-
-  using Base = SetAggAggregate<T, true>;
+      : Base(resultType), inputType_{inputType} {}
 
   bool supportsToIntermediate() const override {
     return false;
@@ -424,7 +124,7 @@ class CountDistinctAggregate : public SetAggAggregate<T, true> {
     exec::Aggregate::setAllNulls(groups, indices);
     for (auto i : indices) {
       new (groups[i] + Base::offset_)
-          SetAccumulator<T>(inputType_, Base::allocator_);
+          AccumulatorType(inputType_, Base::allocator_);
     }
   }
 
@@ -457,10 +157,26 @@ class CountDistinctAggregate : public SetAggAggregate<T, true> {
   TypePtr inputType_;
 };
 
-template <template <typename T> class Aggregate>
+template <
+    template <typename T, typename AccumulatorType>
+    class Aggregate,
+    TypeKind Kind>
+std::unique_ptr<exec::Aggregate> create(const TypePtr& resultType) {
+  return std::make_unique<Aggregate<
+      typename TypeTraits<Kind>::NativeType,
+      aggregate::prestosql::CustomComparisonSetAccumulator<Kind>>>(resultType);
+}
+
+template <template <typename T, typename AcumulatorType = SetAccumulator<T>>
+          class Aggregate>
 std::unique_ptr<exec::Aggregate> create(
     const TypePtr& inputType,
     const TypePtr& resultType) {
+  if (inputType->providesCustomComparison()) {
+    return VELOX_DYNAMIC_SCALAR_TEMPLATE_TYPE_DISPATCH(
+        create, Aggregate, inputType->kind(), resultType);
+  }
+
   switch (inputType->kind()) {
     case TypeKind::BOOLEAN:
       return std::make_unique<Aggregate<bool>>(resultType);
@@ -493,10 +209,32 @@ std::unique_ptr<exec::Aggregate> create(
       [[fallthrough]];
     case TypeKind::ROW:
       return std::make_unique<Aggregate<ComplexType>>(resultType);
+    case TypeKind::UNKNOWN:
+      return std::make_unique<Aggregate<UnknownValue>>(resultType);
     default:
       VELOX_UNREACHABLE(
           "Unexpected type {}", mapTypeKindToName(inputType->kind()));
   }
+}
+
+template <TypeKind Kind>
+std::unique_ptr<exec::Aggregate> creatSetAggAggregate(
+    const TypePtr& resultType) {
+  return std::make_unique<SetAggAggregate<
+      typename TypeTraits<Kind>::NativeType,
+      false,
+      true,
+      aggregate::prestosql::CustomComparisonSetAccumulator<Kind>>>(resultType);
+}
+
+template <TypeKind Kind>
+std::unique_ptr<exec::Aggregate> createCountDistinctAggregate(
+    const TypePtr& resultType,
+    const TypePtr& inputType) {
+  return std::make_unique<CountDistinctAggregate<
+      typename TypeTraits<Kind>::NativeType,
+      aggregate::prestosql::CustomComparisonSetAccumulator<Kind>>>(
+      resultType, inputType);
 }
 
 } // namespace
@@ -529,7 +267,11 @@ void registerSetAggAggregate(
         const TypePtr& inputType =
             isRawInput ? argTypes[0] : argTypes[0]->childAt(0);
         const TypeKind typeKind = inputType->kind();
-        const bool throwOnNestedNulls = isRawInput;
+
+        if (inputType->providesCustomComparison()) {
+          return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
+              creatSetAggAggregate, inputType->kind(), resultType);
+        }
 
         switch (typeKind) {
           case TypeKind::BOOLEAN:
@@ -562,8 +304,9 @@ void registerSetAggAggregate(
           case TypeKind::MAP:
             [[fallthrough]];
           case TypeKind::ROW:
-            return std::make_unique<SetAggAggregate<ComplexType>>(
-                resultType, throwOnNestedNulls);
+            return std::make_unique<SetAggAggregate<ComplexType>>(resultType);
+          case TypeKind::UNKNOWN:
+            return std::make_unique<SetAggAggregate<UnknownValue>>(resultType);
           default:
             VELOX_UNREACHABLE(
                 "Unexpected type {}", mapTypeKindToName(typeKind));
@@ -627,8 +370,17 @@ void registerCountDistinctAggregate(
         VELOX_CHECK_EQ(argTypes.size(), 1);
 
         const bool isRawInput = exec::isRawInput(step);
-        const TypeKind typeKind =
-            isRawInput ? argTypes[0]->kind() : argTypes[0]->childAt(0)->kind();
+        const TypePtr& inputType =
+            isRawInput ? argTypes[0] : argTypes[0]->childAt(0);
+        const TypeKind typeKind = inputType->kind();
+
+        if (inputType->providesCustomComparison()) {
+          return VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
+              createCountDistinctAggregate,
+              inputType->kind(),
+              resultType,
+              inputType);
+        }
 
         switch (typeKind) {
           case TypeKind::BOOLEAN:
@@ -669,6 +421,9 @@ void registerCountDistinctAggregate(
             [[fallthrough]];
           case TypeKind::ROW:
             return std::make_unique<CountDistinctAggregate<ComplexType>>(
+                resultType, argTypes[0]);
+          case TypeKind::UNKNOWN:
+            return std::make_unique<CountDistinctAggregate<UnknownValue>>(
                 resultType, argTypes[0]);
           default:
             VELOX_UNREACHABLE(

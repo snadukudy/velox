@@ -17,13 +17,78 @@
 #include "velox/functions/sparksql/specialforms/SparkCastHooks.h"
 #include "velox/functions/lib/string/StringImpl.h"
 #include "velox/type/TimestampConversion.h"
+#include "velox/type/tz/TimeZoneMap.h"
 
 namespace facebook::velox::functions::sparksql {
 
+SparkCastHooks::SparkCastHooks(const velox::core::QueryConfig& config)
+    : config_(config) {
+  const auto sessionTzName = config.sessionTimezone();
+  if (!sessionTzName.empty()) {
+    timestampToStringOptions_.timeZone = tz::locateZone(sessionTzName);
+  }
+}
+
 Expected<Timestamp> SparkCastHooks::castStringToTimestamp(
     const StringView& view) const {
-  return util::fromTimestampString(
+  auto conversionResult = util::fromTimestampWithTimezoneString(
       view.data(), view.size(), util::TimestampParseMode::kSparkCast);
+  if (conversionResult.hasError()) {
+    return folly::makeUnexpected(conversionResult.error());
+  }
+
+  auto sessionTimezone = config_.sessionTimezone().empty()
+      ? nullptr
+      : tz::locateZone(config_.sessionTimezone());
+  return util::fromParsedTimestampWithTimeZone(
+      conversionResult.value(), sessionTimezone);
+}
+
+template <typename T>
+Expected<Timestamp> SparkCastHooks::castNumberToTimestamp(T seconds) const {
+  // Spark internally use microsecond precision for timestamp.
+  // To avoid overflow, we need to check the range of seconds.
+  static constexpr int64_t maxSeconds =
+      std::numeric_limits<int64_t>::max() / Timestamp::kMicrosecondsInSecond;
+  if (seconds > maxSeconds) {
+    return Timestamp::fromMicrosNoError(std::numeric_limits<int64_t>::max());
+  }
+  if (seconds < -maxSeconds) {
+    return Timestamp::fromMicrosNoError(std::numeric_limits<int64_t>::min());
+  }
+
+  if constexpr (std::is_floating_point_v<T>) {
+    return Timestamp::fromMicrosNoError(
+        static_cast<int64_t>(seconds * Timestamp::kMicrosecondsInSecond));
+  }
+
+  return Timestamp(seconds, 0);
+}
+
+Expected<Timestamp> SparkCastHooks::castIntToTimestamp(int64_t seconds) const {
+  return castNumberToTimestamp(seconds);
+}
+
+Expected<int64_t> SparkCastHooks::castTimestampToInt(
+    Timestamp timestamp) const {
+  auto micros = timestamp.toMicros();
+  if (micros < 0) {
+    return std::floor(
+        static_cast<double>(micros) / Timestamp::kMicrosecondsInSecond);
+  }
+  return micros / Timestamp::kMicrosecondsInSecond;
+}
+
+Expected<std::optional<Timestamp>> SparkCastHooks::castDoubleToTimestamp(
+    double value) const {
+  if (FOLLY_UNLIKELY(std::isnan(value) || std::isinf(value))) {
+    return std::nullopt;
+  }
+  return castNumberToTimestamp(value);
+}
+
+Expected<Timestamp> SparkCastHooks::castBooleanToTimestamp(bool val) const {
+  return Timestamp::fromMicrosNoError(val ? 1 : 0);
 }
 
 Expected<int32_t> SparkCastHooks::castStringToDate(
@@ -57,18 +122,6 @@ StringView SparkCastHooks::removeWhiteSpaces(const StringView& view) const {
   stringImpl::trimUnicodeWhiteSpace<true, true, StringView, StringView>(
       output, view);
   return output;
-}
-
-const TimestampToStringOptions& SparkCastHooks::timestampToStringOptions()
-    const {
-  static constexpr TimestampToStringOptions options = {
-      .precision = TimestampToStringOptions::Precision::kMicroseconds,
-      .leadingPositiveSign = true,
-      .skipTrailingZeros = true,
-      .zeroPaddingYear = true,
-      .dateTimeSeparator = ' ',
-  };
-  return options;
 }
 
 exec::PolicyType SparkCastHooks::getPolicy() const {

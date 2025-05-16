@@ -16,6 +16,7 @@
 #pragma once
 
 #include <folly/CPortability.h>
+#include <folly/Random.h>
 #include <folly/Range.h>
 #include <folly/dynamic.h>
 
@@ -32,6 +33,7 @@
 #include <vector>
 
 #include "velox/common/base/ClassName.h"
+#include "velox/common/base/Exceptions.h"
 #include "velox/common/serialization/Serializable.h"
 #include "velox/type/HugeInt.h"
 #include "velox/type/StringView.h"
@@ -41,6 +43,11 @@
 namespace facebook::velox {
 
 using int128_t = __int128_t;
+
+using column_index_t = uint32_t;
+
+constexpr column_index_t kConstantChannel =
+    std::numeric_limits<column_index_t>::max();
 
 /// Velox type system supports a small set of SQL-compatible composeable types:
 /// BOOLEAN, TINYINT, SMALLINT, INTEGER, BIGINT, HUGEINT, REAL, DOUBLE, VARCHAR,
@@ -434,7 +441,8 @@ struct TypeParameter {
 ///                   BigintType
 class Type : public Tree<const TypePtr>, public velox::ISerializable {
  public:
-  explicit Type(TypeKind kind) : kind_{kind} {}
+  explicit Type(TypeKind kind, bool providesCustomComparison = false)
+      : kind_{kind}, providesCustomComparison_(providesCustomComparison) {}
 
   TypeKind kind() const {
     return kind_;
@@ -464,6 +472,13 @@ class Type : public Tree<const TypePtr>, public velox::ISerializable {
   /// are, while map types are not orderable.
   virtual bool isOrderable() const = 0;
 
+  /// Returns true if values of this type implements custom comparison and hash
+  /// functions. If this returns true the compare and hash functions in TypeBase
+  /// should be used instead of native implementations, e.g. ==, <, >, etc.
+  bool providesCustomComparison() const {
+    return providesCustomComparison_;
+  }
+
   /// Returns unique logical type name. It can be
   /// different from the physical type name returned by 'kindName()'.
   virtual const char* name() const = 0;
@@ -478,18 +493,27 @@ class Type : public Tree<const TypePtr>, public velox::ISerializable {
 
   virtual std::string toString() const = 0;
 
+  /// Options to control the output of toSummaryString().
+  struct TypeSummaryOptions {
+    /// Maximum number of child types to include in the summary.
+    size_type maxChildren{0};
+  };
+
+  /// Returns human-readable summary of the type. Useful when full output of
+  /// toString() is too large.
+  std::string toSummaryString(
+      TypeSummaryOptions options = {.maxChildren = 0}) const;
+
   /// Types are weakly matched.
   /// Examples: Two RowTypes are equivalent if the children types are
   /// equivalent, but the children names could be different. Two OpaqueTypes are
   /// equivalent if the typeKind matches, but the typeIndex could be different.
   virtual bool equivalent(const Type& other) const = 0;
 
-  /// Types are strongly matched.
-  /// Examples: Two RowTypes are == if the children types and the children names
-  /// are same. Two OpaqueTypes are == if the typeKind and the typeIndex are
-  /// same. Same as equivalent for most types except for Row, Opaque types.
+  /// For Complex types (Row, Array, Map, Opaque): types are strongly matched.
+  /// For primitive types: same as equivalent.
   virtual bool operator==(const Type& other) const {
-    return this->equivalent(other);
+    return this->equals(other);
   }
 
   inline bool operator!=(const Type& other) const {
@@ -511,7 +535,7 @@ class Type : public Tree<const TypePtr>, public velox::ISerializable {
   static void registerSerDe();
 
   /// Recursive kind hashing (uses only TypeKind).
-  size_t hashKind() const;
+  virtual size_t hashKind() const;
 
   /// Recursive kind match (uses only TypeKind).
   bool kindEquals(const std::shared_ptr<const Type>& other) const;
@@ -553,25 +577,54 @@ class Type : public Tree<const TypePtr>, public velox::ISerializable {
 
   bool containsUnknown() const;
 
+  VELOX_DEFINE_CLASS_NAME(Type)
+
  protected:
   FOLLY_ALWAYS_INLINE bool hasSameTypeId(const Type& other) const {
     return typeid(*this) == typeid(other);
   }
 
+  /// For Complex types (Row, Array, Map, Opaque): types are strongly matched.
+  /// Examples: Two RowTypes are == if the children types and the children names
+  /// are same. Two OpaqueTypes are == if the typeKind and the typeIndex are
+  /// same.
+  /// For primitive types: same as equivalent.
+  virtual bool equals(const Type& other) const {
+    VELOX_CHECK(this->isPrimitiveType());
+    return this->equivalent(other);
+  }
+
  private:
   const TypeKind kind_;
-
-  VELOX_DEFINE_CLASS_NAME(Type)
+  const bool providesCustomComparison_;
 };
 
 #undef VELOX_FLUENT_CAST
 
+template <TypeKind KIND, typename = void>
+struct kindCanProvideCustomComparison : std::false_type {};
+
+template <TypeKind KIND>
+struct kindCanProvideCustomComparison<
+    KIND,
+    std::enable_if_t<
+        TypeTraits<KIND>::isPrimitiveType && TypeTraits<KIND>::isFixedWidth>> {
+  static constexpr bool value = true;
+};
+
 template <TypeKind KIND>
 class TypeBase : public Type {
  public:
-  using NativeType = TypeTraits<KIND>;
+  using NativeType = typename TypeTraits<KIND>::NativeType;
 
-  TypeBase() : Type{KIND} {}
+  explicit TypeBase(bool providesCustomComparison = false)
+      : Type{KIND, providesCustomComparison} {
+    if (providesCustomComparison) {
+      VELOX_CHECK(
+          kindCanProvideCustomComparison<KIND>::value,
+          "Custom comparisons are only supported for primitive types that are fixed width.");
+    }
+  }
 
   bool isPrimitiveType() const override {
     return TypeTraits<KIND>::isPrimitiveType;
@@ -604,14 +657,41 @@ class TypeBase : public Type {
 };
 
 template <TypeKind KIND>
-class ScalarType : public TypeBase<KIND> {
+class CanProvideCustomComparisonType : public TypeBase<KIND> {
  public:
+  explicit CanProvideCustomComparisonType(bool providesCustomComparison = false)
+      : TypeBase<KIND>{providesCustomComparison} {}
+
+  virtual int32_t compare(
+      const typename TypeBase<KIND>::NativeType& /*left*/,
+      const typename TypeBase<KIND>::NativeType& /*right*/) const {
+    VELOX_CHECK(
+        !this->providesCustomComparison(),
+        "Type {} is marked as providesCustomComparison but did not implement compare.");
+    VELOX_FAIL("Type {} does not provide custom comparison", this->name());
+  }
+
+  virtual uint64_t hash(
+      const typename TypeBase<KIND>::NativeType& /*value*/) const {
+    VELOX_CHECK(
+        !this->providesCustomComparison(),
+        "Type {} is marked as providesCustomComparison but did not implement hash.");
+    VELOX_FAIL("Type {} does not provide custom hash", this->name());
+  }
+};
+
+template <TypeKind KIND>
+class ScalarType : public CanProvideCustomComparisonType<KIND> {
+ public:
+  explicit ScalarType(bool providesCustomComparison = false)
+      : CanProvideCustomComparisonType<KIND>{providesCustomComparison} {}
+
   uint32_t size() const override {
     return 0;
   }
 
   const std::shared_ptr<const Type>& childAt(uint32_t) const override {
-    throw std::invalid_argument{"scalar type has no children"};
+    VELOX_FAIL("scalar type has no children");
   }
 
   std::string toString() const override {
@@ -657,8 +737,8 @@ const std::shared_ptr<const ScalarType<KIND>> ScalarType<KIND>::create() {
 
 /// This class represents the fixed-point numbers.
 /// The parameter "precision" represents the number of digits the
-/// Decimal Type can support and "scale" represents the number of digits to the
-/// right of the decimal point.
+/// Decimal Type can support and "scale" represents the number of digits to
+/// the right of the decimal point.
 template <TypeKind KIND>
 class DecimalType : public ScalarType<KIND> {
  public:
@@ -765,11 +845,13 @@ FOLLY_ALWAYS_INLINE bool isDecimalName(const std::string& name) {
   return (name == "DECIMAL");
 }
 
-std::pair<int, int> getDecimalPrecisionScale(const Type& type);
+std::pair<uint8_t, uint8_t> getDecimalPrecisionScale(const Type& type);
 
-class UnknownType : public TypeBase<TypeKind::UNKNOWN> {
+class UnknownType : public CanProvideCustomComparisonType<TypeKind::UNKNOWN> {
  public:
-  UnknownType() = default;
+  explicit UnknownType(bool proivdesCustomComparison = false)
+      : CanProvideCustomComparisonType<TypeKind::UNKNOWN>(
+            proivdesCustomComparison) {}
 
   uint32_t size() const override {
     return 0;
@@ -858,6 +940,8 @@ class ArrayType : public TypeBase<TypeKind::ARRAY> {
   }
 
  protected:
+  bool equals(const Type& other) const override;
+
   TypePtr child_;
   const std::vector<TypeParameter> parameters_;
 };
@@ -909,6 +993,9 @@ class MapType : public TypeBase<TypeKind::MAP> {
     return parameters_;
   }
 
+ protected:
+  bool equals(const Type& other) const override;
+
  private:
   TypePtr keyType_;
   TypePtr valueType_;
@@ -923,9 +1010,14 @@ class RowType : public TypeBase<TypeKind::ROW> {
 
   ~RowType() override;
 
-  uint32_t size() const override;
+  uint32_t size() const final {
+    return children_.size();
+  }
 
-  const std::shared_ptr<const Type>& childAt(uint32_t idx) const override;
+  const TypePtr& childAt(uint32_t idx) const final {
+    VELOX_CHECK_LT(idx, children_.size());
+    return children_[idx];
+  }
 
   const std::vector<std::shared_ptr<const Type>>& children() const {
     return children_;
@@ -939,19 +1031,16 @@ class RowType : public TypeBase<TypeKind::ROW> {
 
   bool containsChild(std::string_view name) const;
 
-  uint32_t getChildIdx(const std::string& name) const;
+  uint32_t getChildIdx(std::string_view name) const;
 
-  std::optional<uint32_t> getChildIdxIfExists(const std::string& name) const;
+  std::optional<uint32_t> getChildIdxIfExists(std::string_view name) const;
 
   const std::string& nameOf(uint32_t idx) const {
-    return names_.at(idx);
+    VELOX_CHECK_LT(idx, names_.size());
+    return names_[idx];
   }
 
   bool equivalent(const Type& other) const override;
-
-  bool equals(const Type& other) const;
-  bool operator==(const Type& other) const override;
-  bool operator==(const RowType& other) const;
 
   std::string toString() const override;
 
@@ -981,12 +1070,19 @@ class RowType : public TypeBase<TypeKind::ROW> {
     return *parameters;
   }
 
+  size_t hashKind() const override;
+
+ protected:
+  bool equals(const Type& other) const override;
+
  private:
   std::unique_ptr<std::vector<TypeParameter>> makeParameters() const;
 
   const std::vector<std::string> names_;
   const std::vector<std::shared_ptr<const Type>> children_;
   mutable std::atomic<std::vector<TypeParameter>*> parameters_{nullptr};
+  mutable std::atomic_bool hashKindComputed_{false};
+  mutable std::atomic_size_t hashKind_;
 };
 
 using RowTypePtr = std::shared_ptr<const RowType>;
@@ -1034,6 +1130,9 @@ class FunctionType : public TypeBase<TypeKind::FUNCTION> {
     return parameters_;
   }
 
+ protected:
+  bool equals(const Type& other) const override;
+
  private:
   static std::vector<std::shared_ptr<const Type>> allChildren(
       std::vector<std::shared_ptr<const Type>>&& argumentTypes,
@@ -1061,14 +1160,12 @@ class OpaqueType : public TypeBase<TypeKind::OPAQUE> {
   }
 
   const std::shared_ptr<const Type>& childAt(uint32_t) const override {
-    throw std::invalid_argument{"OpaqueType type has no children"};
+    VELOX_FAIL("OpaqueType type has no children");
   }
 
   std::string toString() const override;
 
   bool equivalent(const Type& other) const override;
-
-  bool operator==(const Type& other) const override;
 
   const std::type_index& typeIndex() const {
     return typeIndex_;
@@ -1077,11 +1174,12 @@ class OpaqueType : public TypeBase<TypeKind::OPAQUE> {
   folly::dynamic serialize() const override;
   /// In special cases specific OpaqueTypes might want to serialize additional
   /// metadata. In those cases we need to deserialize it back. Since
-  /// OpaqueType::create<T>() returns canonical type for T without metadata, we
-  /// allow to create new instance here or return nullptr if the same one can be
-  /// used. Note that it's about deserialization of type itself, DeserializeFunc
-  /// above is about deserializing instances of the type. It's implemented as a
-  /// virtual member instead of a standalone registry just for convenience.
+  /// OpaqueType::create<T>() returns canonical type for T without metadata,
+  /// we allow to create new instance here or return nullptr if the same one
+  /// can be used. Note that it's about deserialization of type itself,
+  /// DeserializeFunc above is about deserializing instances of the type. It's
+  /// implemented as a virtual member instead of a standalone registry just
+  /// for convenience.
   virtual std::shared_ptr<const OpaqueType> deserializeExtra(
       const folly::dynamic& json) const;
 
@@ -1128,6 +1226,11 @@ class OpaqueType : public TypeBase<TypeKind::OPAQUE> {
         serializeTypeErased,
         deserializeTypeErased);
   }
+
+  static void clearSerializationRegistry();
+
+ protected:
+  bool equals(const Type& other) const override;
 
  private:
   const std::type_index typeIndex_;
@@ -1236,8 +1339,8 @@ class IntervalYearMonthType : public IntegerType {
   }
 
   /// Returns the interval 'value' (months) formatted as YEARS MONTHS.
-  /// For example, 14 months (INTERVAL '1-2' YEAR TO MONTH) would be represented
-  /// as 1-2; -14 months would be represents as -1-2.
+  /// For example, 14 months (INTERVAL '1-2' YEAR TO MONTH) would be
+  /// represented as 1-2; -14 months would be represents as -1-2.
   std::string valueToString(int32_t value) const;
 
   folly::dynamic serialize() const override {
@@ -1500,6 +1603,85 @@ std::shared_ptr<const OpaqueType> OPAQUE() {
         VELOX_FAIL(                                                      \
             "not a scalar type! kind: {}", mapTypeKindToName(typeKind)); \
     }                                                                    \
+  }()
+
+#define VELOX_DYNAMIC_TEMPLATE_TYPE_DISPATCH(TEMPLATE_FUNC, T, typeKind, ...) \
+  [&]() {                                                                     \
+    switch (typeKind) {                                                       \
+      case ::facebook::velox::TypeKind::BOOLEAN: {                            \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::BOOLEAN>(        \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::INTEGER: {                            \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::INTEGER>(        \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::TINYINT: {                            \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::TINYINT>(        \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::SMALLINT: {                           \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::SMALLINT>(       \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::BIGINT: {                             \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::BIGINT>(         \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::HUGEINT: {                            \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::HUGEINT>(        \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::REAL: {                               \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::REAL>(           \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::DOUBLE: {                             \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::DOUBLE>(         \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::VARCHAR: {                            \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::VARCHAR>(        \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::VARBINARY: {                          \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::VARBINARY>(      \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::TIMESTAMP: {                          \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::TIMESTAMP>(      \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::MAP: {                                \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::MAP>(            \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::ARRAY: {                              \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::ARRAY>(          \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::ROW: {                                \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::ROW>(            \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      default:                                                                \
+        VELOX_FAIL("not a known type kind: {}", mapTypeKindToName(typeKind)); \
+    }                                                                         \
+  }()
+
+#define VELOX_DYNAMIC_TEMPLATE_TYPE_DISPATCH_ALL(                    \
+    TEMPLATE_FUNC, T, typeKind, ...)                                 \
+  [&]() {                                                            \
+    if ((typeKind) == ::facebook::velox::TypeKind::UNKNOWN) {        \
+      return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::UNKNOWN>( \
+          __VA_ARGS__);                                              \
+    } else if ((typeKind) == ::facebook::velox::TypeKind::OPAQUE) {  \
+      return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::OPAQUE>(  \
+          __VA_ARGS__);                                              \
+    } else {                                                         \
+      return VELOX_DYNAMIC_TEMPLATE_TYPE_DISPATCH(                   \
+          TEMPLATE_FUNC, T, typeKind, __VA_ARGS__);                  \
+    }                                                                \
   }()
 
 #define VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH_ALL(TEMPLATE_FUNC, typeKind, ...)   \
@@ -1829,31 +2011,114 @@ namespace exec {
 class CastOperator;
 
 using CastOperatorPtr = std::shared_ptr<const CastOperator>;
-
 } // namespace exec
 
-/// Associates custom types with their custom operators to be the payload in the
-/// custom type registry.
+/// Forward declaration.
+class variant;
+class AbstractInputGenerator;
+
+using AbstractInputGeneratorPtr = std::shared_ptr<AbstractInputGenerator>;
+using FuzzerGenerator = folly::detail::DefaultGenerator;
+
+struct InputGeneratorConfig {
+  // TODO: hook up the rest options in VectorFuzzer::Options.
+  size_t seed_;
+  double nullRatio_;
+};
+
+/// Associates custom types with their custom operators to be the payload in
+/// the custom type registry.
 class CustomTypeFactories {
  public:
-  virtual ~CustomTypeFactories() = default;
+  virtual ~CustomTypeFactories();
 
   /// Returns a shared pointer to the custom type.
-  virtual TypePtr getType() const = 0;
+  virtual TypePtr getType(
+      const std::vector<TypeParameter>& parameters) const = 0;
 
   /// Returns a shared pointer to the custom cast operator. If a custom type
   /// should be treated as its underlying native type during type castings,
   /// return a nullptr. If a custom type does not support castings, throw an
   /// exception.
   virtual exec::CastOperatorPtr getCastOperator() const = 0;
+
+  virtual AbstractInputGeneratorPtr getInputGenerator(
+      const InputGeneratorConfig& config) const = 0;
 };
 
-/// Adds custom type to the registry if it doesn't exist already. No-op if type
-/// with specified name already exists. Returns true if type was added, false if
-/// type with the specified name already exists.
+class AbstractInputGenerator {
+ public:
+  AbstractInputGenerator(
+      size_t seed,
+      const TypePtr& type,
+      std::unique_ptr<AbstractInputGenerator>&& next,
+      double nullRatio)
+      : type_{type}, next_{std::move(next)}, nullRatio_{nullRatio} {
+    rng_.seed(seed);
+  }
+
+  virtual ~AbstractInputGenerator();
+
+  virtual variant generate() = 0;
+
+  TypePtr type() const {
+    return type_;
+  }
+
+ protected:
+  FuzzerGenerator rng_;
+
+  TypePtr type_;
+
+  std::unique_ptr<AbstractInputGenerator> next_;
+
+  double nullRatio_;
+};
+
+/// Adds custom type to the registry if it doesn't exist already. No-op if
+/// type with specified name already exists. Returns true if type was added,
+/// false if type with the specified name already exists.
 bool registerCustomType(
     const std::string& name,
     std::unique_ptr<const CustomTypeFactories> factories);
+
+// See registerOpaqueType() for documentation on type index and opaque type
+// alias.
+std::unordered_map<std::string, std::type_index>& getTypeIndexByOpaqueAlias();
+
+// Reverse of getTypeIndexByOpaqueAlias() when we need to look up the opaque
+// alias by its type index.
+std::unordered_map<std::type_index, std::string>& getOpaqueAliasByTypeIndex();
+
+std::type_index getTypeIdForOpaqueTypeAlias(const std::string& name);
+
+std::string getOpaqueAliasForTypeId(std::type_index typeIndex);
+
+/// OpaqueType represents a type that is not part of the Velox type system.
+/// To identify the underlying type we use std::type_index which is stable
+/// within the same process. However, it is not necessarily stable across
+/// processes.
+///
+/// So if we were to serialize an opaque type using its std::type_index, we
+/// might not be able to deserialize it in another process. To solve this
+/// problem, we require that both the serializing and deserializing processes
+/// register the opaque type using registerOpaqueType() with the same alias.
+template <typename Class>
+bool registerOpaqueType(const std::string& alias) {
+  auto typeIndex = std::type_index(typeid(Class));
+  return getTypeIndexByOpaqueAlias().emplace(alias, typeIndex).second &&
+      getOpaqueAliasByTypeIndex().emplace(typeIndex, alias).second;
+}
+
+/// Unregisters an opaque type. Returns true if the type was unregistered.
+/// Currently, it is only used for testing to provide isolation between tests
+/// when using the same alias.
+template <typename Class>
+bool unregisterOpaqueType(const std::string& alias) {
+  auto typeIndex = std::type_index(typeid(Class));
+  return getTypeIndexByOpaqueAlias().erase(alias) == 1 &&
+      getOpaqueAliasByTypeIndex().erase(typeIndex) == 1;
+}
 
 /// Return true if a custom type with the specified name exists.
 bool customTypeExists(const std::string& name);
@@ -1863,7 +2128,9 @@ std::unordered_set<std::string> getCustomTypeNames();
 
 /// Returns an instance of a custom type with the specified name and specified
 /// child types.
-TypePtr getCustomType(const std::string& name);
+TypePtr getCustomType(
+    const std::string& name,
+    const std::vector<TypeParameter>& parameters);
 
 /// Removes custom type from the registry if exists. Returns true if type was
 /// removed, false if type didn't exist.
@@ -1873,6 +2140,11 @@ bool unregisterCustomType(const std::string& name);
 /// name. Returns nullptr if a type with the specified name does not exist or
 /// does not have a dedicated custom cast operator.
 exec::CastOperatorPtr getCustomTypeCastOperator(const std::string& name);
+
+/// Returns the input generator for the custom type with the specified name.
+AbstractInputGeneratorPtr getCustomTypeInputGenerator(
+    const std::string& name,
+    const InputGeneratorConfig& config);
 
 // Allows us to transparently use folly::toAppend(), folly::join(), etc.
 template <class TString>
@@ -1884,6 +2156,95 @@ void toAppend(
 
 /// Appends type's SQL string to 'out'. Uses DuckDB SQL.
 void toTypeSql(const TypePtr& type, std::ostream& out);
+
+/// Cache of serialized RowType instances. Useful to reduce the size of
+/// serialized expressions and plans. Disabled by default. Not thread safe.
+///
+/// To enable, call 'serializedTypeCache().enable()'. This enables the cache for
+/// the current thread. To disable, call 'serializedTypeCache().disable()'.
+/// While enables, type serialization will use the cache and serialize the types
+/// using IDs stored in the cache. The caller is responsible for saving
+/// serialized types from the cache and using these to hidrate
+/// 'deserializedTypeCache()' before deserializing the types.
+class SerializedTypeCache {
+ public:
+  struct Options {
+    // Caching applies to RowType's with at least this many fields.
+    size_t minRowTypeSize = 10;
+  };
+
+  bool isEnabled() const {
+    return enabled_;
+  }
+
+  const Options& options() const {
+    return options_;
+  }
+
+  void enable(const Options& options = {.minRowTypeSize = 10}) {
+    enabled_ = true;
+    options_ = options;
+  }
+
+  void disable() {
+    enabled_ = false;
+  }
+
+  size_t size() const {
+    return cache_.size();
+  }
+
+  void clear() {
+    cache_.clear();
+  }
+
+  /// Returns the ID of the type if it is in the cache. Returns std::nullopt if
+  /// type is not found in the cache. Cache key is type instance pointer. Hence,
+  /// equal but different instances are stored separately.
+  std::optional<int32_t> get(const Type& type) const;
+
+  /// Stores the type in the cache. Returns the ID of the type. Reports an error
+  /// if type is already present in the cache. IDs are monotonically increasing.
+  /// Serialized type may refer to types stored previously in the cache. When
+  /// deserializing type cache, make sure to deserialize types in the order of
+  /// cache IDs.
+  int32_t put(const Type& type, folly::dynamic serialized);
+
+  /// Serialized the types stored in the cache. Use
+  /// DeserializedTypeCache::deserialize to deserialize.
+  folly::dynamic serialize();
+
+ private:
+  bool enabled_{false};
+  Options options_;
+  folly::F14FastMap<const Type*, std::pair<int32_t, folly::dynamic>> cache_;
+};
+
+/// Thread local cache of serialized RowType instances. Used by
+/// RowType::serialize.
+SerializedTypeCache& serializedTypeCache();
+
+/// Thread local cache of deserialized RowType instances. Used when
+/// deserializing Type objects.
+class DeserializedTypeCache {
+ public:
+  void deserialize(const folly::dynamic& obj);
+
+  size_t size() const {
+    return cache_.size();
+  }
+
+  const TypePtr& get(int32_t id) const;
+
+  void clear() {
+    cache_.clear();
+  }
+
+ private:
+  folly::F14FastMap<int32_t, TypePtr> cache_;
+};
+
+DeserializedTypeCache& deserializedTypeCache();
 
 } // namespace facebook::velox
 

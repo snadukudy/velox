@@ -17,30 +17,31 @@
 // Adapted from Apache Arrow.
 
 #include <gmock/gmock.h>
-#include <gtest/gtest.h>
 
-#include <cstdint>
-#include <cstring>
-#include <memory>
-#include <optional>
-
-#include "velox/dwio/parquet/writer/arrow/ColumnPage.h"
+#include "velox/common/base/tests/GTestUtils.h"
+#include "velox/dwio/parquet/reader/ParquetReader.h"
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
 #include "velox/dwio/parquet/writer/arrow/FileWriter.h"
-#include "velox/dwio/parquet/writer/arrow/Metadata.h"
-#include "velox/dwio/parquet/writer/arrow/Platform.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
-#include "velox/dwio/parquet/writer/arrow/Types.h"
-#include "velox/dwio/parquet/writer/arrow/tests/ColumnReader.h"
-#include "velox/dwio/parquet/writer/arrow/tests/FileReader.h"
 #include "velox/dwio/parquet/writer/arrow/tests/TestUtil.h"
+#include "velox/exec/tests/utils/TempFilePath.h"
 
-#include "arrow/io/memory.h"
 #include "arrow/testing/gtest_util.h"
-#include "arrow/util/compression.h"
 #include "arrow/util/crc32.h"
 
 namespace facebook::velox::parquet::arrow {
+namespace {
+void writeToFile(
+    std::shared_ptr<exec::test::TempFilePath> filePath,
+    std::shared_ptr<arrow::Buffer> buffer) {
+  auto localWriteFile =
+      std::make_unique<LocalWriteFile>(filePath->getPath(), false, false);
+  auto bufferReader = std::make_shared<::arrow::io::BufferReader>(buffer);
+  auto bufferToString = bufferReader->buffer()->ToString();
+  localWriteFile->append(bufferToString);
+  localWriteFile->close();
+}
+} // namespace
 
 using ::arrow::io::BufferReader;
 
@@ -104,9 +105,12 @@ static std::vector<Compression::type> GetSupportedCodecTypes() {
 class TestPageSerde : public ::testing::Test {
  public:
   void SetUp() {
-    data_page_header_.encoding = format::Encoding::PLAIN;
-    data_page_header_.definition_level_encoding = format::Encoding::RLE;
-    data_page_header_.repetition_level_encoding = format::Encoding::RLE;
+    data_page_header_.encoding =
+        facebook::velox::parquet::thrift::Encoding::PLAIN;
+    data_page_header_.definition_level_encoding =
+        facebook::velox::parquet::thrift::Encoding::RLE;
+    data_page_header_.repetition_level_encoding =
+        facebook::velox::parquet::thrift::Encoding::RLE;
 
     ResetStream();
   }
@@ -133,7 +137,7 @@ class TestPageSerde : public ::testing::Test {
     page_header_.__set_data_page_header(data_page_header_);
     page_header_.uncompressed_page_size = uncompressed_size;
     page_header_.compressed_page_size = compressed_size;
-    page_header_.type = format::PageType::DATA_PAGE;
+    page_header_.type = facebook::velox::parquet::thrift::PageType::DATA_PAGE;
     if (checksum.has_value()) {
       page_header_.__set_crc(checksum.value());
     }
@@ -154,7 +158,8 @@ class TestPageSerde : public ::testing::Test {
     page_header_.__set_data_page_header_v2(data_page_header_v2_);
     page_header_.uncompressed_page_size = uncompressed_size;
     page_header_.compressed_page_size = compressed_size;
-    page_header_.type = format::PageType::DATA_PAGE_V2;
+    page_header_.type =
+        facebook::velox::parquet::thrift::PageType::DATA_PAGE_V2;
     if (checksum.has_value()) {
       page_header_.__set_crc(checksum.value());
     }
@@ -170,7 +175,8 @@ class TestPageSerde : public ::testing::Test {
     page_header_.__set_dictionary_page_header(dictionary_page_header_);
     page_header_.uncompressed_page_size = uncompressed_size;
     page_header_.compressed_page_size = compressed_size;
-    page_header_.type = format::PageType::DICTIONARY_PAGE;
+    page_header_.type =
+        facebook::velox::parquet::thrift::PageType::DICTIONARY_PAGE;
     if (checksum.has_value()) {
       page_header_.__set_crc(checksum.value());
     }
@@ -185,7 +191,7 @@ class TestPageSerde : public ::testing::Test {
     page_header_.__set_index_page_header(index_page_header_);
     page_header_.uncompressed_page_size = uncompressed_size;
     page_header_.compressed_page_size = compressed_size;
-    page_header_.type = format::PageType::INDEX_PAGE;
+    page_header_.type = facebook::velox::parquet::thrift::PageType::INDEX_PAGE;
 
     ThriftSerializer serializer;
     ASSERT_NO_THROW(serializer.Serialize(&page_header_, out_stream_.get()));
@@ -213,11 +219,12 @@ class TestPageSerde : public ::testing::Test {
   std::shared_ptr<Buffer> out_buffer_;
 
   std::unique_ptr<PageReader> page_reader_;
-  format::PageHeader page_header_;
-  format::DataPageHeader data_page_header_;
-  format::DataPageHeaderV2 data_page_header_v2_;
-  format::IndexPageHeader index_page_header_;
-  format::DictionaryPageHeader dictionary_page_header_;
+  facebook::velox::parquet::thrift::PageHeader page_header_;
+  facebook::velox::parquet::thrift::DataPageHeader data_page_header_;
+  facebook::velox::parquet::thrift::DataPageHeaderV2 data_page_header_v2_;
+  facebook::velox::parquet::thrift::IndexPageHeader index_page_header_;
+  facebook::velox::parquet::thrift::DictionaryPageHeader
+      dictionary_page_header_;
 };
 
 void TestPageSerde::TestPageSerdeCrc(
@@ -336,7 +343,7 @@ void TestPageSerde::TestPageSerdeCrc(
 }
 
 void CheckDataPageHeader(
-    const format::DataPageHeader& expected,
+    const facebook::velox::parquet::thrift::DataPageHeader& expected,
     const Page* page) {
   ASSERT_EQ(PageType::DATA_PAGE, page->type());
 
@@ -354,7 +361,7 @@ void CheckDataPageHeader(
 
 // Overload for DataPageV2 tests.
 void CheckDataPageHeader(
-    const format::DataPageHeaderV2& expected,
+    const facebook::velox::parquet::thrift::DataPageHeaderV2& expected,
     const Page* page) {
   ASSERT_EQ(PageType::DATA_PAGE_V2, page->type());
 
@@ -386,8 +393,9 @@ TEST_F(TestPageSerde, DataPageV1) {
       CheckDataPageHeader(data_page_header_, current_page.get()));
 }
 
-// Templated test class to test page filtering for both format::DataPageHeader
-// and format::DataPageHeaderV2.
+// Templated test class to test page filtering for both
+// facebook::velox::parquet::thrift::DataPageHeader and
+// facebook::velox::parquet::thrift::DataPageHeaderV2.
 template <typename T>
 class PageFilterTest : public TestPageSerde {
  public:
@@ -402,7 +410,8 @@ class PageFilterTest : public TestPageSerde {
 };
 
 template <>
-void PageFilterTest<format::DataPageHeader>::WriteStream() {
+void PageFilterTest<
+    facebook::velox::parquet::thrift::DataPageHeader>::WriteStream() {
   for (int i = 0; i < kNumPages; ++i) {
     // Vary the number of rows to produce different headers.
     int32_t num_rows = i + 100;
@@ -425,7 +434,8 @@ void PageFilterTest<format::DataPageHeader>::WriteStream() {
 }
 
 template <>
-void PageFilterTest<format::DataPageHeaderV2>::WriteStream() {
+void PageFilterTest<
+    facebook::velox::parquet::thrift::DataPageHeaderV2>::WriteStream() {
   for (int i = 0; i < kNumPages; ++i) {
     // Vary the number of rows to produce different headers.
     int32_t num_rows = i + 100;
@@ -451,7 +461,8 @@ void PageFilterTest<format::DataPageHeaderV2>::WriteStream() {
 }
 
 template <>
-void PageFilterTest<format::DataPageHeader>::WritePageWithoutStats() {
+void PageFilterTest<
+    facebook::velox::parquet::thrift::DataPageHeader>::WritePageWithoutStats() {
   int32_t num_rows = 100;
   total_rows_ += num_rows;
   int data_size = 1024;
@@ -465,7 +476,8 @@ void PageFilterTest<format::DataPageHeader>::WritePageWithoutStats() {
 }
 
 template <>
-void PageFilterTest<format::DataPageHeaderV2>::WritePageWithoutStats() {
+void PageFilterTest<facebook::velox::parquet::thrift::DataPageHeaderV2>::
+    WritePageWithoutStats() {
   int32_t num_rows = 100;
   total_rows_ += num_rows;
   int data_size = 1024;
@@ -480,21 +492,24 @@ void PageFilterTest<format::DataPageHeaderV2>::WritePageWithoutStats() {
 }
 
 template <>
-void PageFilterTest<format::DataPageHeader>::CheckNumRows(
-    std::optional<int32_t> num_rows,
-    const format::DataPageHeader& header) {
+void PageFilterTest<facebook::velox::parquet::thrift::DataPageHeader>::
+    CheckNumRows(
+        std::optional<int32_t> num_rows,
+        const facebook::velox::parquet::thrift::DataPageHeader& header) {
   ASSERT_EQ(num_rows, std::nullopt);
 }
 
 template <>
-void PageFilterTest<format::DataPageHeaderV2>::CheckNumRows(
-    std::optional<int32_t> num_rows,
-    const format::DataPageHeaderV2& header) {
+void PageFilterTest<facebook::velox::parquet::thrift::DataPageHeaderV2>::
+    CheckNumRows(
+        std::optional<int32_t> num_rows,
+        const facebook::velox::parquet::thrift::DataPageHeaderV2& header) {
   ASSERT_EQ(*num_rows, header.num_rows);
 }
 
-using DataPageHeaderTypes =
-    ::testing::Types<format::DataPageHeader, format::DataPageHeaderV2>;
+using DataPageHeaderTypes = ::testing::Types<
+    facebook::velox::parquet::thrift::DataPageHeader,
+    facebook::velox::parquet::thrift::DataPageHeaderV2>;
 TYPED_TEST_SUITE(PageFilterTest, DataPageHeaderTypes);
 
 // Test that the returned encoded_statistics is nullptr when there are no
@@ -538,7 +553,7 @@ TYPED_TEST(PageFilterTest, TestPageFilterCallback) {
     std::vector<int64_t> read_num_values;
     std::vector<std::optional<int32_t>> read_num_rows;
     auto read_all_pages = [&](const DataPageStats& stats) -> bool {
-      DCHECK_NE(stats.encoded_statistics, nullptr);
+      VELOX_DCHECK_NOT_NULL(stats.encoded_statistics);
       read_stats.push_back(*stats.encoded_statistics);
       read_num_values.push_back(stats.num_values);
       read_num_rows.push_back(stats.num_rows);
@@ -978,17 +993,24 @@ TEST_F(TestPageSerde, DataPageV2CrcCheckNonExistent) {
 class TestParquetFileReader : public ::testing::Test {
  public:
   void AssertInvalidFileThrows(const std::shared_ptr<Buffer>& buffer) {
-    reader_.reset(new ParquetFileReader());
-
     auto reader = std::make_shared<BufferReader>(buffer);
-
-    ASSERT_THROW(
-        reader_->Open(ParquetFileReader::Contents::Open(reader)),
-        ParquetException);
+    // Write the buffer to a temp file path
+    auto filePath = exec::test::TempFilePath::create();
+    writeToFile(filePath, buffer);
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
+    std::shared_ptr<facebook::velox::memory::MemoryPool> rootPool =
+        memory::memoryManager()->addRootPool("MetadataTest");
+    std::shared_ptr<facebook::velox::memory::MemoryPool> leafPool =
+        rootPool->addLeafChild("MetadataTest");
+    dwio::common::ReaderOptions readerOptions{leafPool.get()};
+    auto input = std::make_unique<dwio::common::BufferedInput>(
+        std::make_shared<LocalReadFile>(filePath->getPath()),
+        readerOptions.memoryPool());
+    uint64_t fileSize = std::move(input)->getReadFile()->size();
+    VELOX_ASSERT_THROW(
+        std::make_unique<ParquetReader>(std::move(input), readerOptions),
+        fmt::format("({} vs. 12) Parquet file is too small", fileSize));
   }
-
- protected:
-  std::unique_ptr<ParquetFileReader> reader_;
 };
 
 TEST_F(TestParquetFileReader, InvalidHeader) {
@@ -1026,7 +1048,37 @@ TEST_F(TestParquetFileReader, IncompleteMetadata) {
       stream->Write(reinterpret_cast<const uint8_t*>(magic), strlen(magic)));
 
   ASSERT_OK_AND_ASSIGN(auto buffer, stream->Finish());
-  ASSERT_NO_FATAL_FAILURE(AssertInvalidFileThrows(buffer));
+
+  auto reader = std::make_shared<BufferReader>(buffer);
+  // Write the buffer to a temp file path
+  auto filePath = exec::test::TempFilePath::create();
+  writeToFile(filePath, buffer);
+  memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
+  std::shared_ptr<facebook::velox::memory::MemoryPool> rootPool =
+      memory::memoryManager()->addRootPool("MetadataTest");
+  std::shared_ptr<facebook::velox::memory::MemoryPool> leafPool =
+      rootPool->addLeafChild("MetadataTest");
+  dwio::common::ReaderOptions readerOptions{leafPool.get()};
+  auto input = std::make_unique<dwio::common::BufferedInput>(
+      std::make_shared<LocalReadFile>(filePath->getPath()),
+      readerOptions.memoryPool());
+
+  uint64_t fileSize = std::move(input)->getReadFile()->size();
+  std::unique_ptr<dwio::common::SeekableInputStream> inputStream;
+  inputStream = std::move(input)->loadCompleteFile();
+  std::vector<char> copy(fileSize);
+  const char* bufferStart = nullptr;
+  const char* bufferEnd = nullptr;
+  dwio::common::readBytes(
+      fileSize, inputStream.get(), copy.data(), bufferStart, bufferEnd);
+  ASSERT_EQ(0, strncmp(copy.data() + fileSize - 4, "PAR1", 4));
+
+  uint32_t footerLength;
+  std::memcpy(&footerLength, copy.data() + fileSize - 8, sizeof(uint32_t));
+
+  VELOX_ASSERT_THROW(
+      std::make_unique<ParquetReader>(std::move(input), readerOptions),
+      fmt::format("({} vs. {})", footerLength + 12, fileSize));
 }
 
 } // namespace facebook::velox::parquet::arrow

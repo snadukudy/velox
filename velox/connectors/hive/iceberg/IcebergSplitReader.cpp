@@ -33,6 +33,7 @@ IcebergSplitReader::IcebergSplitReader(
     const std::shared_ptr<const HiveConfig>& hiveConfig,
     const RowTypePtr& readerOutputType,
     const std::shared_ptr<io::IoStatistics>& ioStats,
+    const std::shared_ptr<filesystems::File::IoStats>& fsStats,
     FileHandleFactory* const fileHandleFactory,
     folly::Executor* executor,
     const std::shared_ptr<common::ScanSpec>& scanSpec)
@@ -44,24 +45,29 @@ IcebergSplitReader::IcebergSplitReader(
           hiveConfig,
           readerOutputType,
           ioStats,
+          fsStats,
           fileHandleFactory,
           executor,
           scanSpec),
       baseReadOffset_(0),
-      splitOffset_(0) {}
+      splitOffset_(0),
+      deleteBitmap_(nullptr) {}
 
 void IcebergSplitReader::prepareSplit(
     std::shared_ptr<common::MetadataFilter> metadataFilter,
-    dwio::common::RuntimeStatistics& runtimeStats,
-    const std::shared_ptr<HiveColumnHandle>& rowIndexColumn) {
-  createReader(std::move(metadataFilter), rowIndexColumn);
+    dwio::common::RuntimeStatistics& runtimeStats) {
+  createReader();
+  if (emptySplit_) {
+    return;
+  }
+  auto rowType = getAdaptedRowType();
 
   if (checkIfSplitIsEmpty(runtimeStats)) {
     VELOX_CHECK(emptySplit_);
     return;
   }
 
-  createRowReader();
+  createRowReader(std::move(metadataFilter), std::move(rowType));
 
   std::shared_ptr<const HiveIcebergSplit> icebergSplit =
       std::dynamic_pointer_cast<const HiveIcebergSplit>(hiveSplit_);
@@ -82,6 +88,7 @@ void IcebergSplitReader::prepareSplit(
                 executor_,
                 hiveConfig_,
                 ioStats_,
+                fsStats_,
                 runtimeStats,
                 splitOffset_,
                 hiveSplit_->connectorId));
@@ -97,28 +104,39 @@ uint64_t IcebergSplitReader::next(uint64_t size, VectorPtr& output) {
   mutation.randomSkip = baseReaderOpts_.randomSkip().get();
   mutation.deletedRows = nullptr;
 
+  if (deleteBitmap_) {
+    std::memset(
+        (void*)(deleteBitmap_->asMutable<int8_t>()), 0L, deleteBitmap_->size());
+  }
+
+  const auto actualSize = baseRowReader_->nextReadSize(size);
+
+  if (actualSize == dwio::common::RowReader::kAtEnd) {
+    return 0;
+  }
+
   if (!positionalDeleteFileReaders_.empty()) {
-    auto numBytes = bits::nbytes(size);
+    auto numBytes = bits::nbytes(actualSize);
     dwio::common::ensureCapacity<int8_t>(
-        deleteBitmap_, numBytes, connectorQueryCtx_->memoryPool());
-    std::memset((void*)deleteBitmap_->as<int8_t>(), 0L, numBytes);
+        deleteBitmap_, numBytes, connectorQueryCtx_->memoryPool(), false, true);
 
     for (auto iter = positionalDeleteFileReaders_.begin();
          iter != positionalDeleteFileReaders_.end();) {
-      (*iter)->readDeletePositions(
-          baseReadOffset_, size, deleteBitmap_->asMutable<int8_t>());
-      if ((*iter)->endOfFile()) {
+      (*iter)->readDeletePositions(baseReadOffset_, actualSize, deleteBitmap_);
+
+      if ((*iter)->noMoreData()) {
         iter = positionalDeleteFileReaders_.erase(iter);
       } else {
         ++iter;
       }
     }
-
-    deleteBitmap_->setSize(numBytes);
-    mutation.deletedRows = deleteBitmap_->as<uint64_t>();
   }
 
-  auto rowsScanned = baseRowReader_->next(size, output, &mutation);
+  mutation.deletedRows = deleteBitmap_ && deleteBitmap_->size() > 0
+      ? deleteBitmap_->as<uint64_t>()
+      : nullptr;
+
+  auto rowsScanned = baseRowReader_->next(actualSize, output, &mutation);
   baseReadOffset_ += rowsScanned;
 
   return rowsScanned;

@@ -178,6 +178,18 @@ TEST_F(InTest, Timestamp) {
       std::nullopt);
   EXPECT_EQ(
       in<Timestamp>(Timestamp(0, 0), {Timestamp(0, 0), Timestamp()}), true);
+
+  // The precision of Spark 'in' is microseconds.
+  EXPECT_EQ(
+      in<Timestamp>(
+          Timestamp(0, 123'456'000),
+          {Timestamp(0, 123'000'000), Timestamp(0, 123'123'000)}),
+      false);
+  EXPECT_EQ(
+      in<Timestamp>(
+          Timestamp(0, 123'456'789),
+          {Timestamp(0, 123'456'000), Timestamp(0, 123'456'123)}),
+      true);
 }
 
 TEST_F(InTest, Date) {
@@ -192,6 +204,42 @@ TEST_F(InTest, Bool) {
   EXPECT_EQ(in<bool>(false, {true, false, std::nullopt}), true);
   EXPECT_EQ(in<bool>(false, {false, std::nullopt}), true);
   EXPECT_EQ(in<bool>(false, {false}), true);
+}
+
+TEST_F(InTest, shortDecimal) {
+  EXPECT_EQ(in<int64_t>(1, {1, 2}, DECIMAL(2, 1)), true);
+  EXPECT_EQ(in<int64_t>(2, {1, 2}, DECIMAL(10, 5)), true);
+  EXPECT_EQ(in<int64_t>(3, {1, 2}, DECIMAL(17, 11)), false);
+  EXPECT_EQ(
+      in<int64_t>(
+          DecimalUtil::kShortDecimalMin,
+          {DecimalUtil::kShortDecimalMin, DecimalUtil::kShortDecimalMax},
+          DECIMAL(18, 9)),
+      true);
+  EXPECT_EQ(
+      in<int64_t>(
+          DecimalUtil::kShortDecimalMax,
+          {DecimalUtil::kShortDecimalMin, DecimalUtil::kShortDecimalMax},
+          DECIMAL(18, 9)),
+      true);
+}
+
+TEST_F(InTest, longDecimal) {
+  EXPECT_EQ(in<int128_t>(1, {1, 2}, DECIMAL(21, 2)), true);
+  EXPECT_EQ(in<int128_t>(2, {1, 2}, DECIMAL(29, 10)), true);
+  EXPECT_EQ(in<int128_t>(3, {1, 2}, DECIMAL(35, 20)), false);
+  EXPECT_EQ(
+      in<int128_t>(
+          DecimalUtil::kLongDecimalMin,
+          {DecimalUtil::kLongDecimalMin, DecimalUtil::kLongDecimalMax},
+          DECIMAL(38, 19)),
+      true);
+  EXPECT_EQ(
+      in<int128_t>(
+          DecimalUtil::kLongDecimalMax,
+          {DecimalUtil::kLongDecimalMin, DecimalUtil::kLongDecimalMax},
+          DECIMAL(38, 19)),
+      true);
 }
 
 TEST_F(InTest, Const) {

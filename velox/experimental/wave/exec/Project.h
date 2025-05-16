@@ -23,13 +23,8 @@ class Project : public WaveOperator {
   Project(
       CompileState& state,
       RowTypePtr outputType,
-      std::vector<std::vector<ProgramPtr>> levels,
-      AbstractWrap* filterWrap = nullptr)
-      : WaveOperator(state, outputType, ""),
-        levels_(std::move(levels)),
-        filterWrap_(filterWrap) {}
-
-  AbstractWrap* findWrap() const override;
+      std::vector<std::vector<ProgramPtr>> levels)
+      : WaveOperator(state, outputType, ""), levels_(std::move(levels)) {}
 
   bool isStreaming() const override {
     if (!levels_.empty() && levels_[0].size() == 1 &&
@@ -56,11 +51,14 @@ class Project : public WaveOperator {
     return last.size() == 1 && last[0]->isSink();
   }
 
-  AdvanceResult canAdvance(WaveStream& Stream) override;
+  exec::BlockingReason isBlocked(WaveStream& stream, ContinueFuture* future)
+      override;
+
+  std::vector<AdvanceResult> canAdvance(WaveStream& Stream) override;
 
   void schedule(WaveStream& stream, int32_t maxRows = 0) override;
 
-  vector_size_t outputSize(WaveStream& stream) const override;
+  void pipelineFinished(WaveStream& stream) override;
 
   void finalize(CompileState& state) override;
 
@@ -72,6 +70,11 @@ class Project : public WaveOperator {
     return computedSet_;
   }
 
+  void callUpdateStatus(
+      WaveStream& stream,
+      const std::vector<WaveStream*>& otherStreams,
+      AdvanceResult& advance) override;
+
  private:
   struct ContinueLocation {
     int32_t programIdx;
@@ -80,7 +83,6 @@ class Project : public WaveOperator {
 
   std::vector<std::vector<ProgramPtr>> levels_;
   OperandSet computedSet_;
-  AbstractWrap* filterWrap_{nullptr};
 };
 
 } // namespace facebook::velox::wave

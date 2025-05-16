@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/functions/prestosql/aggregates/SumDataSizeForStatsAggregate.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/functions/lib/aggregates/SimpleNumericAggregate.h"
@@ -85,7 +86,7 @@ class SumDataSizeForStatsAggregate
           result = checkedPlus(result, value);
         },
         mayPushdown,
-        (int64_t)0);
+        static_cast<int64_t>(0));
   }
 
   void addSingleGroupRawInput(

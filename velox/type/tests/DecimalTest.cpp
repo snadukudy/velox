@@ -99,11 +99,33 @@ void assertRescaleRealFail(
 }
 
 void testToByteArray(int128_t value, int8_t* expected, int32_t size) {
-  char out[size];
-  int32_t length = DecimalUtil::toByteArray(value, out);
+  std::vector<char> out(size);
+  int32_t length = DecimalUtil::toByteArray(value, out.data());
   EXPECT_EQ(length, size);
   EXPECT_EQ(DecimalUtil::getByteArrayLength(value), size);
-  EXPECT_EQ(std::memcmp(expected, out, length), 0);
+  EXPECT_EQ(std::memcmp(expected, out.data(), length), 0);
+}
+
+template <typename T>
+void testcastToString(
+    T unscaleValue,
+    int precision,
+    int scale,
+    int maxStringSize,
+    const std::string& expected) {
+  std::vector<char> out(maxStringSize);
+  auto actualSize = DecimalUtil::castToString<T>(
+      unscaleValue, scale, maxStringSize, out.data());
+  EXPECT_EQ(expected.size(), actualSize);
+  EXPECT_EQ(std::memcmp(expected.data(), out.data(), expected.size()), 0);
+}
+
+void testMaxStringViewSize(
+    int precision,
+    int scale,
+    int expectedMaxStringSize) {
+  EXPECT_EQ(
+      DecimalUtil::maxStringViewSize(precision, scale), expectedMaxStringSize);
 }
 
 std::string zeros(uint32_t numZeros) {
@@ -375,12 +397,21 @@ TEST(DecimalTest, rescaleDouble) {
       10.03, DECIMAL(38, 18), HugeInt::parse("1003" + zeros(16)));
   assertRescaleDouble(0.034567890, DECIMAL(38, 18), 34'567'890'000'000'000);
   assertRescaleDouble(
+      0.03456789, DECIMAL(38, 33), HugeInt::parse("3456789" + zeros(25)));
+  assertRescaleDouble(
       0.999999999999999, DECIMAL(38, 18), 999'999'999'999'999'000);
   assertRescaleDouble(
       0.123456789123123, DECIMAL(38, 18), 123'456'789'123'123'000);
   assertRescaleDouble(21.54551, DECIMAL(12, 3), 21546);
 
   assertRescaleDouble(std::numeric_limits<double>::min(), DECIMAL(38, 2), 0);
+
+  assertRescaleDouble(0.9999999999999999, DECIMAL(17, 2), 100);
+
+  assertRescaleDouble(-0.9999999999999999, DECIMAL(17, 2), -100);
+
+  assertRescaleDouble(
+      kMaxDoubleBelowInt64Max, DECIMAL(19, 0), 9'223'372'036'854'774'784);
 
   // Test for overflows.
   std::vector<double> invalidInputs = {
@@ -455,6 +486,10 @@ TEST(DecimalTest, rescaleReal) {
 
   assertRescaleReal(std::numeric_limits<float>::min(), DECIMAL(38, 2), 0);
 
+  assertRescaleReal(27867.64, DECIMAL(18, 2), 2786764);
+  assertRescaleReal(27867.644, DECIMAL(18, 2), 2786764);
+  assertRescaleReal(27867.645, DECIMAL(18, 2), 2786764);
+
   // Test for overflows.
   std::vector<float> invalidInputs = {
       std::numeric_limits<float>::max(),
@@ -489,6 +524,51 @@ TEST(DecimalTest, rescaleReal) {
       NAN, DECIMAL(10, 2), "The input value should be finite.");
   assertRescaleRealFail(
       INFINITY, DECIMAL(10, 2), "The input value should be finite.");
+}
+
+TEST(DecimalTest, maxStringViewSize) {
+  testMaxStringViewSize(10, 0, 11);
+  testMaxStringViewSize(10, 1, 12);
+  testMaxStringViewSize(10, 10, 13);
+}
+
+TEST(DecimalTest, castToString) {
+  testcastToString<int64_t>(12, 10, 0, 11, "12");
+  testcastToString<int64_t>(12, 10, 1, 12, "1.2");
+  testcastToString<int64_t>(12, 10, 3, 12, "0.012");
+  testcastToString<int64_t>(-12, 10, 3, 12, "-0.012");
+  testcastToString<int64_t>(12, 5, 5, 8, "0.00012");
+  testcastToString<int64_t>(-12, 5, 5, 8, "-0.00012");
+  testcastToString<int64_t>(-12, 5, 5, 8, "-0.00012");
+  testcastToString<int64_t>(
+      DecimalUtil::kShortDecimalMax, 18, 0, 19, std::string(18, '9'));
+  testcastToString<int64_t>(
+      DecimalUtil::kShortDecimalMin, 18, 0, 19, "-" + std::string(18, '9'));
+
+  testcastToString<int128_t>(
+      HugeInt::parse("-18446744073709551616"),
+      20,
+      0,
+      21,
+      "-18446744073709551616");
+
+  testcastToString<int128_t>(
+      HugeInt::parse("-18446744073709551616"),
+      20,
+      3,
+      22,
+      "-18446744073709551.616");
+
+  testcastToString<int128_t>(
+      HugeInt::parse("-12345678901234567890"),
+      20,
+      20,
+      23,
+      "-0.12345678901234567890");
+  testcastToString<int128_t>(
+      DecimalUtil::kLongDecimalMax, 38, 0, 39, std::string(38, '9'));
+  testcastToString<int128_t>(
+      DecimalUtil::kLongDecimalMin, 38, 0, 39, "-" + std::string(38, '9'));
 }
 } // namespace
 } // namespace facebook::velox

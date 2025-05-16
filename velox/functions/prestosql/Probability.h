@@ -291,7 +291,6 @@ struct InverseCauchyCDFFunction {
   FOLLY_ALWAYS_INLINE void
   call(double& result, double median, double scale, double p) {
     static constexpr double kInf = std::numeric_limits<double>::infinity();
-    static constexpr double kDoubleMax = std::numeric_limits<double>::max();
     static constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
 
     VELOX_USER_CHECK(p >= 0 && p <= 1, "p must be in the interval [0, 1]");
@@ -318,13 +317,92 @@ struct InverseLaplaceCDFFunction {
   FOLLY_ALWAYS_INLINE void
   call(double& result, double location, double scale, double p) {
     VELOX_USER_CHECK_GT(scale, 0, "scale must be greater than 0");
-    VELOX_USER_CHECK(p >= 0 && p <= 1, "p must be in the interval [0, 1]")
+    VELOX_USER_CHECK(p >= 0 && p <= 1, "p must be in the interval [0, 1]");
 
     if (std::isnan(location) || std::isinf(location)) {
       result = std::numeric_limits<double>::quiet_NaN();
     } else {
       boost::math::laplace_distribution<> laplaceDist(location, scale);
       result = boost::math::quantile(laplaceDist, p);
+    }
+  }
+};
+
+template <typename T>
+struct InverseGammaCDFFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void
+  call(double& result, double shape, double scale, double p) {
+    static constexpr double kInf = std::numeric_limits<double>::infinity();
+
+    VELOX_USER_CHECK(
+        (p >= 0) && (p <= 1) && (p != kInf),
+        "inverseGammaCdf Function: p must be in the interval [0, 1]");
+    VELOX_USER_CHECK(
+        (shape > 0) && (shape != kInf),
+        "inverseGammaCdf Function: shape must be greater than 0");
+    VELOX_USER_CHECK(
+        (scale > 0) && (scale != kInf),
+        "inverseGammaCdf Function: scale must be greater than 0");
+
+    if (p == 1) {
+      result = std::numeric_limits<double>::infinity();
+    } else {
+      boost::math::gamma_distribution<> dist(shape, scale);
+      result = boost::math::quantile(dist, p);
+    }
+  }
+};
+
+template <typename T>
+struct InverseBinomialCDFFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void call(
+      int32_t& result,
+      int32_t numberOfTrials,
+      double successProbability,
+      double p) {
+    static constexpr double kInf = std::numeric_limits<double>::infinity();
+
+    VELOX_USER_CHECK(
+        (p >= 0) && (p <= 1) && (p != kInf),
+        "inverseBinomialCdf Function: p must be in the interval [0, 1]");
+    VELOX_USER_CHECK(
+        (successProbability >= 0) && (successProbability <= 1) &&
+            (successProbability != kInf),
+        "inverseBinomialCdf Function: successProbability must be in the interval [0, 1]");
+    VELOX_USER_CHECK(
+        numberOfTrials > 0,
+        "inverseBinomialCdf Function: numberOfTrials must be greater than 0");
+
+    boost::math::binomial_distribution<> dist(
+        numberOfTrials, successProbability);
+    result = static_cast<int32_t>(boost::math::quantile(dist, p));
+  }
+};
+
+template <typename T>
+struct InversePoissonCDFFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void call(int32_t& result, double lambda, double p) {
+    static constexpr double kInf = std::numeric_limits<double>::infinity();
+
+    VELOX_USER_CHECK(
+        (p >= 0) && (p < 1) && (p != kInf),
+        "inversePoissonCdf Function: p must be in the interval [0, 1)");
+    VELOX_USER_CHECK(
+        (lambda > 0) && (lambda != kInf),
+        "inversePoissonCdf Function: lambda must be greater than 0");
+
+    boost::math::poisson_distribution<> dist(lambda);
+    double quantile = boost::math::quantile(dist, p);
+    if (quantile > std::numeric_limits<int32_t>::max()) {
+      result = std::numeric_limits<int32_t>::max();
+    } else {
+      result = static_cast<int32_t>(quantile);
     }
   }
 };

@@ -26,15 +26,19 @@
 #include "velox/exec/HashAggregation.h"
 #include "velox/exec/HashBuild.h"
 #include "velox/exec/HashProbe.h"
+#include "velox/exec/IndexLookupJoin.h"
 #include "velox/exec/Limit.h"
 #include "velox/exec/MarkDistinct.h"
 #include "velox/exec/Merge.h"
 #include "velox/exec/MergeJoin.h"
 #include "velox/exec/NestedLoopJoinBuild.h"
 #include "velox/exec/NestedLoopJoinProbe.h"
+#include "velox/exec/OperatorTraceScan.h"
 #include "velox/exec/OrderBy.h"
 #include "velox/exec/PartitionedOutput.h"
+#include "velox/exec/RoundRobinPartitionFunction.h"
 #include "velox/exec/RowNumber.h"
+#include "velox/exec/ScaleWriterLocalPartition.h"
 #include "velox/exec/StreamingAggregation.h"
 #include "velox/exec/TableScan.h"
 #include "velox/exec/TableWriteMerge.h"
@@ -47,6 +51,23 @@
 #include "velox/exec/Window.h"
 
 namespace facebook::velox::exec {
+
+namespace {
+
+// If the upstream is partial limit, downstream is final limit and we want to
+// flush as soon as we can to reach the limit and do as little work as possible.
+bool eagerFlush(const core::PlanNode& node) {
+  if (auto* limit = dynamic_cast<const core::LimitNode*>(&node)) {
+    return limit->isPartial() && limit->offset() + limit->count() < 10'000;
+  }
+  if (node.sources().empty()) {
+    return false;
+  }
+  // Follow the first source, which is driving the output.
+  return eagerFlush(*node.sources()[0]);
+}
+
+} // namespace
 
 namespace detail {
 
@@ -68,6 +89,21 @@ bool mustStartNewPipeline(
   return sourceId != 0;
 }
 
+// Creates the customized local partition operator for table writer scaling.
+std::unique_ptr<Operator> createScaleWriterLocalPartition(
+    const std::shared_ptr<const core::LocalPartitionNode>& localPartitionNode,
+    int32_t operatorId,
+    DriverCtx* ctx) {
+  if (dynamic_cast<const RoundRobinPartitionFunctionSpec*>(
+          &localPartitionNode->partitionFunctionSpec())) {
+    return std::make_unique<ScaleWriterLocalPartition>(
+        operatorId, ctx, localPartitionNode);
+  }
+
+  return std::make_unique<ScaleWriterPartitioningLocalPartition>(
+      operatorId, ctx, localPartitionNode);
+}
+
 OperatorSupplier makeConsumerSupplier(ConsumerSupplier consumerSupplier) {
   if (consumerSupplier) {
     return [consumerSupplier = std::move(consumerSupplier)](
@@ -86,26 +122,46 @@ OperatorSupplier makeConsumerSupplier(
     return [localMerge](int32_t operatorId, DriverCtx* ctx) {
       auto mergeSource = ctx->task->addLocalMergeSource(
           ctx->splitGroupId, localMerge->id(), localMerge->outputType());
-
-      auto consumer = [mergeSource](
-                          RowVectorPtr input, ContinueFuture* future) {
-        return mergeSource->enqueue(std::move(input), future);
+      auto consumerCb =
+          [mergeSource](
+              RowVectorPtr input, bool drained, ContinueFuture* future) {
+            VELOX_CHECK(!drained);
+            return mergeSource->enqueue(std::move(input), future);
+          };
+      auto startCb = [mergeSource](ContinueFuture* future) {
+        return mergeSource->started(future);
       };
-      return std::make_unique<CallbackSink>(operatorId, ctx, consumer);
+      return std::make_unique<CallbackSink>(
+          operatorId, ctx, std::move(consumerCb), std::move(startCb));
     };
   }
 
   if (auto localPartitionNode =
           std::dynamic_pointer_cast<const core::LocalPartitionNode>(planNode)) {
-    return [localPartitionNode](int32_t operatorId, DriverCtx* ctx) {
+    if (localPartitionNode->scaleWriter()) {
+      return [localPartitionNode](int32_t operatorId, DriverCtx* ctx) {
+        return createScaleWriterLocalPartition(
+            localPartitionNode, operatorId, ctx);
+      };
+    }
+    bool useEagerFlush = eagerFlush(*planNode);
+    return [localPartitionNode, useEagerFlush](
+               int32_t operatorId, DriverCtx* ctx) {
       return std::make_unique<LocalPartition>(
-          operatorId, ctx, localPartitionNode);
+          operatorId, ctx, localPartitionNode, useEagerFlush);
     };
   }
 
   if (auto join =
           std::dynamic_pointer_cast<const core::HashJoinNode>(planNode)) {
     return [join](int32_t operatorId, DriverCtx* ctx) {
+      if (ctx->task->hasMixedExecutionGroup() &&
+          needRightSideJoin(join->joinType())) {
+        VELOX_UNSUPPORTED(
+            "Hash join currently does not support mixed grouped execution for join "
+            "type {}",
+            core::joinTypeName(join->joinType()));
+      }
       return std::make_unique<HashBuild>(operatorId, ctx, join);
     };
   }
@@ -123,9 +179,17 @@ OperatorSupplier makeConsumerSupplier(
     return [planNodeId](int32_t operatorId, DriverCtx* ctx) {
       auto source =
           ctx->task->getMergeJoinSource(ctx->splitGroupId, planNodeId);
-      auto consumer = [source](RowVectorPtr input, ContinueFuture* future) {
-        return source->enqueue(std::move(input), future);
-      };
+      auto consumer =
+          [source](RowVectorPtr input, bool drained, ContinueFuture* future) {
+            if (drained) {
+              VELOX_CHECK_NULL(input);
+              source->drain();
+              return BlockingReason::kNotBlocked;
+            } else {
+              VELOX_CHECK(!drained);
+              return source->enqueue(std::move(input), future);
+            }
+          };
       return std::make_unique<CallbackSink>(operatorId, ctx, consumer);
     };
   }
@@ -150,7 +214,9 @@ void plan(
   if (sources.empty()) {
     driverFactories->back()->inputDriver = true;
   } else {
-    for (int32_t i = 0; i < sources.size(); ++i) {
+    const auto numSourcesToPlan =
+        isIndexLookupJoin(planNode.get()) ? 1 : sources.size();
+    for (int32_t i = 0; i < numSourcesToPlan; ++i) {
       plan(
           sources[i],
           mustStartNewPipeline(planNode, i) ? nullptr : currentPlanNodes,
@@ -212,8 +278,14 @@ uint32_t maxDrivers(
         auto localExchange =
             std::dynamic_pointer_cast<const core::LocalPartitionNode>(node)) {
       // Local gather must run single-threaded.
-      if (localExchange->type() == core::LocalPartitionNode::Type::kGather) {
-        return 1;
+      switch (localExchange->type()) {
+        case core::LocalPartitionNode::Type::kGather:
+          return 1;
+        case core::LocalPartitionNode::Type::kRepartition:
+          count = std::min(queryConfig.maxLocalExchangePartitionCount(), count);
+          break;
+        default:
+          VELOX_UNREACHABLE("Unexpected local exchange type");
       }
     } else if (std::dynamic_pointer_cast<const core::LocalMergeNode>(node)) {
       // Local merge must run single-threaded.
@@ -251,7 +323,7 @@ uint32_t maxDrivers(
             *result,
             0,
             "maxDrivers must be greater than 0. Plan node: {}",
-            node->toString())
+            node->toString());
         if (*result == 1) {
           return 1;
         }
@@ -389,23 +461,6 @@ void LocalPlanner::markMixedJoinBridges(
   }
 }
 
-namespace {
-
-// If the upstream is partial limit, downstream is final limit and we want to
-// flush as soon as we can to reach the limit and do as little work as possible.
-bool eagerFlush(const core::PlanNode& node) {
-  if (auto* limit = dynamic_cast<const core::LimitNode*>(&node)) {
-    return limit->isPartial() && limit->offset() + limit->count() < 10'000;
-  }
-  if (node.sources().empty()) {
-    return false;
-  }
-  // Follow the first source, which is driving the output.
-  return eagerFlush(*node.sources()[0]);
-}
-
-} // namespace
-
 std::shared_ptr<Driver> DriverFactory::createDriver(
     std::unique_ptr<DriverCtx> ctx,
     std::shared_ptr<ExchangeClient> exchangeClient,
@@ -493,6 +548,12 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
                 planNode)) {
       operators.push_back(
           std::make_unique<NestedLoopJoinProbe>(id, ctx.get(), joinNode));
+    } else if (
+        auto joinNode =
+            std::dynamic_pointer_cast<const core::IndexLookupJoinNode>(
+                planNode)) {
+      operators.push_back(
+          std::make_unique<IndexLookupJoin>(id, ctx.get(), joinNode));
     } else if (
         auto aggregationNode =
             std::dynamic_pointer_cast<const core::AggregationNode>(planNode)) {
@@ -587,6 +648,11 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
           assignUniqueIdNode,
           assignUniqueIdNode->taskUniqueId(),
           assignUniqueIdNode->uniqueIdCounter()));
+    } else if (
+        const auto traceScanNode =
+            std::dynamic_pointer_cast<const core::TraceScanNode>(planNode)) {
+      operators.push_back(std::make_unique<trace::OperatorTraceScan>(
+          id, ctx.get(), traceScanNode));
     } else {
       std::unique_ptr<Operator> extended;
       if (planNode->requiresExchangeClient()) {

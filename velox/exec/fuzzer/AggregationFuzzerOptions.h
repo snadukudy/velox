@@ -29,6 +29,9 @@ struct AggregationFuzzerOptions {
   /// Set of functions to not test.
   std::unordered_set<std::string> skipFunctions;
 
+  /// Set of functions that should only be tested with sorted input.
+  std::unordered_set<std::string> functionsRequireSortedInput;
+
   /// Set of functions whose results are non-deterministic. These can be
   /// order-dependent functions whose results depend on the order of input
   /// rows, or functions that return complex-typed results containing
@@ -58,6 +61,14 @@ struct AggregationFuzzerOptions {
   /// Could be used to specify timezone or enable/disable settings that
   /// affect semantics of individual aggregate functions.
   std::unordered_map<std::string, std::string> queryConfigs;
+
+  /// A set of hive configuration properties to use when running query plans.
+  /// Could be used to specify different timestamp units for Presto and Spark
+  /// fuzzer test.
+  std::unordered_map<std::string, std::string> hiveConfigs;
+
+  // Whether group keys must be orderable or be just comparable.
+  bool orderableGroupKeys = false;
 };
 
 } // namespace facebook::velox::exec::test

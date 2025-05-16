@@ -43,7 +43,8 @@ TableWriter::TableWriter(
           tableWriteNode->insertTableHandle()->connectorId())),
       insertTableHandle_(
           tableWriteNode->insertTableHandle()->connectorInsertTableHandle()),
-      commitStrategy_(tableWriteNode->commitStrategy()) {
+      commitStrategy_(tableWriteNode->commitStrategy()),
+      createTimeUs_(getCurrentTimeNano()) {
   setConnectorMemoryReclaimer();
   if (tableWriteNode->outputType()->size() == 1) {
     VELOX_USER_CHECK_NULL(tableWriteNode->aggregationNode());
@@ -63,18 +64,31 @@ TableWriter::TableWriter(
       planNodeId(),
       connectorPool_,
       spillConfig_.has_value() ? &(spillConfig_.value()) : nullptr);
+  setTypeMappings(tableWriteNode);
+}
 
-  auto names = tableWriteNode->columnNames();
-  auto types = tableWriteNode->columns()->children();
+void TableWriter::setTypeMappings(
+    const std::shared_ptr<const core::TableWriteNode>& tableWriteNode) {
+  auto outputNames = tableWriteNode->columnNames();
+  auto outputTypes = tableWriteNode->columns()->children();
 
   const auto& inputType = tableWriteNode->sources()[0]->outputType();
 
-  inputMapping_.reserve(types.size());
+  // Ids that map input to output columns.
+  inputMapping_.reserve(outputTypes.size());
+  std::vector<TypePtr> inputTypes;
+
+  // Generate mappings between input and output types. Note that column names
+  // must match, but in some case the types won't, for example, when writing a
+  // struct (ROW) as a flat map (MAP).
   for (const auto& name : tableWriteNode->columns()->names()) {
-    inputMapping_.emplace_back(inputType->getChildIdx(name));
+    auto idx = inputType->getChildIdx(name);
+    inputMapping_.emplace_back(idx);
+    inputTypes.emplace_back(inputType->childAt(idx));
   }
 
-  mappedType_ = ROW(std::move(names), std::move(types));
+  mappedOutputType_ = ROW(folly::copy(outputNames), std::move(outputTypes));
+  mappedInputType_ = ROW(std::move(outputNames), std::move(inputTypes));
 }
 
 void TableWriter::initialize() {
@@ -88,7 +102,7 @@ void TableWriter::initialize() {
 
 void TableWriter::createDataSink() {
   dataSink_ = connector_->createDataSink(
-      mappedType_,
+      mappedOutputType_,
       insertTableHandle_,
       connectorQueryCtx_.get(),
       commitStrategy_);
@@ -115,6 +129,13 @@ std::vector<std::string> TableWriter::closeDataSink() {
   return dataSink_->close();
 }
 
+bool TableWriter::finishDataSink() {
+  // We only expect finish on a non-closed data sink.
+  VELOX_CHECK(!closed_);
+  VELOX_CHECK_NOT_NULL(dataSink_);
+  return dataSink_->finish();
+}
+
 void TableWriter::addInput(RowVectorPtr input) {
   if (input->size() == 0) {
     return;
@@ -122,13 +143,13 @@ void TableWriter::addInput(RowVectorPtr input) {
 
   std::vector<VectorPtr> mappedChildren;
   mappedChildren.reserve(inputMapping_.size());
-  for (auto i : inputMapping_) {
+  for (const auto i : inputMapping_) {
     mappedChildren.emplace_back(input->childAt(i));
   }
 
-  auto mappedInput = std::make_shared<RowVector>(
+  const auto mappedInput = std::make_shared<RowVector>(
       input->pool(),
-      mappedType_,
+      mappedInputType_,
       input->nulls(),
       input->size(),
       mappedChildren,
@@ -150,6 +171,14 @@ void TableWriter::noMoreInput() {
   }
 }
 
+BlockingReason TableWriter::isBlocked(ContinueFuture* future) {
+  if (blockingFuture_.valid()) {
+    *future = std::move(blockingFuture_);
+    return blockingReason_;
+  }
+  return BlockingReason::kNotBlocked;
+}
+
 RowVectorPtr TableWriter::getOutput() {
   // Making sure the output is read only once after the write is fully done.
   if (!noMoreInput_ || finished_) {
@@ -163,6 +192,12 @@ RowVectorPtr TableWriter::getOutput() {
         aggregation_->getOutput(),
         StringView(commitContext),
         pool());
+  }
+
+  if (!finishDataSink()) {
+    blockingReason_ = BlockingReason::kYield;
+    blockingFuture_ = ContinueFuture{folly::Unit{}};
+    return nullptr;
   }
 
   finished_ = true;
@@ -191,7 +226,7 @@ RowVectorPtr TableWriter::getOutput() {
   // 1. Set rows column.
   FlatVectorPtr<int64_t> writtenRowsVector =
       BaseVector::create<FlatVector<int64_t>>(BIGINT(), numOutputRows, pool());
-  writtenRowsVector->set(0, (int64_t)numWrittenRows_);
+  writtenRowsVector->set(0, static_cast<int64_t>(numWrittenRows_));
   for (int idx = 1; idx < numOutputRows; ++idx) {
     writtenRowsVector->setNull(idx, true);
   }
@@ -242,6 +277,8 @@ std::string TableWriter::createTableCommitContext(bool lastOutput) {
 }
 
 void TableWriter::updateStats(const connector::DataSink::Stats& stats) {
+  const auto currentTimeNs = getCurrentTimeNano();
+  VELOX_CHECK_GE(currentTimeNs, createTimeUs_);
   {
     auto lockedStats = stats_.wlock();
     lockedStats->physicalWrittenBytes = stats.numWrittenBytes;
@@ -251,8 +288,31 @@ void TableWriter::updateStats(const connector::DataSink::Stats& stats) {
       VELOX_CHECK(stats.spillStats.empty());
       return;
     }
+    if (stats.numWrittenFiles != 0) {
+      lockedStats->addRuntimeStat(
+          kNumWrittenFiles, RuntimeCounter(stats.numWrittenFiles));
+    }
+    if (stats.writeIOTimeUs != 0) {
+      lockedStats->addRuntimeStat(
+          kWriteIOTime,
+          RuntimeCounter(
+              stats.writeIOTimeUs * 1000, RuntimeCounter::Unit::kNanos));
+    }
+    if (stats.recodeTimeNs != 0) {
+      lockedStats->addRuntimeStat(
+          kWriteRecodeTime,
+          RuntimeCounter(stats.recodeTimeNs, RuntimeCounter::Unit::kNanos));
+    }
+    if (stats.compressionTimeNs != 0) {
+      lockedStats->addRuntimeStat(
+          kWriteCompressionTime,
+          RuntimeCounter(
+              stats.compressionTimeNs, RuntimeCounter::Unit::kNanos));
+    }
     lockedStats->addRuntimeStat(
-        "numWrittenFiles", RuntimeCounter(stats.numWrittenFiles));
+        kRunningWallNanos,
+        RuntimeCounter(
+            currentTimeNs - createTimeUs_, RuntimeCounter::Unit::kNanos));
   }
   if (!stats.spillStats.empty()) {
     *spillStats_.wlock() += stats.spillStats;
@@ -260,7 +320,6 @@ void TableWriter::updateStats(const connector::DataSink::Stats& stats) {
 }
 
 void TableWriter::close() {
-  Operator::close();
   if (!closed_) {
     // Abort the data sink if the query has already failed and no need for
     // regular close.
@@ -269,6 +328,7 @@ void TableWriter::close() {
   if (aggregation_ != nullptr) {
     aggregation_->close();
   }
+  Operator::close();
 }
 
 void TableWriter::setConnectorMemoryReclaimer() {

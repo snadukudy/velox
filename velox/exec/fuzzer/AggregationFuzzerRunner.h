@@ -27,7 +27,9 @@
 #include "velox/exec/fuzzer/AggregationFuzzer.h"
 #include "velox/exec/fuzzer/AggregationFuzzerOptions.h"
 #include "velox/parse/TypeResolver.h"
+#include "velox/serializers/CompactRowSerializer.h"
 #include "velox/serializers/PrestoSerializer.h"
+#include "velox/serializers/UnsafeRowSerializer.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 
 namespace facebook::velox::exec::test {
@@ -105,15 +107,31 @@ class AggregationFuzzerRunner {
     facebook::velox::parse::registerTypeResolver();
     facebook::velox::serializer::presto::PrestoVectorSerde::
         registerVectorSerde();
+    if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kPresto)) {
+      serializer::presto::PrestoVectorSerde::registerNamedVectorSerde();
+    }
+    if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kCompactRow)) {
+      serializer::CompactRowVectorSerde::registerNamedVectorSerde();
+    }
+    if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kUnsafeRow)) {
+      serializer::spark::UnsafeRowVectorSerde::registerNamedVectorSerde();
+    }
     facebook::velox::filesystems::registerLocalFileSystem();
+
+    auto& aggregationFunctionDataSpecs =
+        referenceQueryRunner->aggregationFunctionDataSpecs();
 
     facebook::velox::exec::test::aggregateFuzzer(
         filteredSignatures,
         seed,
+        options.functionsRequireSortedInput,
         options.customVerificationFunctions,
         options.customInputGenerators,
+        aggregationFunctionDataSpecs,
         options.timestampPrecision,
         options.queryConfigs,
+        options.hiveConfigs,
+        options.orderableGroupKeys,
         planPath,
         std::move(referenceQueryRunner));
     // Calling gtest here so that it can be recognized as tests in CI systems.

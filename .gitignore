@@ -48,7 +48,9 @@ autoconf/autom4te.cache
 projects/*
 !projects/*.*
 !projects/Makefile
-
+.venv
+deps-install
+deps-download
 
 #==============================================================================#
 # Autotools artifacts
@@ -80,6 +82,7 @@ m4/lt~obsolete.m4
 build/
 _build/
 .ccache/
+ccache/
 #*.m4
 *.o
 *.lo
@@ -88,7 +91,7 @@ _build/
 *.pdf
 *.swp
 a.out
-CMake/resolve_dependency_module/boost/FindBoost.cmake
+CMake/resolve_dependency_modules/boost/FindBoost.cmake
 __cmake_systeminformation/
 
 #==============================================================================#
@@ -322,3 +325,5 @@ src/amalgamation/
 velox/docs/sphinx/source/README_generated_*
 velox/docs/bindings/python/_generate/*
 scripts/bm-report/report.html
+dist/
+wheelhouse/

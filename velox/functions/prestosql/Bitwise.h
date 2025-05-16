@@ -34,7 +34,7 @@ struct BitCountFunction {
     VELOX_USER_CHECK(
         bits >= 2 && bits <= kMaxBits,
         "Bits specified in bit_count must be between 2 and 64, got {}",
-        bits)
+        bits);
     // Check if input "num" falls within the limits of max and min that
     // can be represented with "bits".
     const uint64_t lowBitsMask = 1L << (bits - 1);
@@ -82,7 +82,7 @@ struct BitwiseArithmeticShiftRightFunction {
   // Only support bigint inputs.
   FOLLY_ALWAYS_INLINE void
   call(int64_t& result, int64_t number, int64_t shift) {
-    VELOX_USER_CHECK_GE(shift, 0, "Shift must be non-negative")
+    VELOX_USER_CHECK_GE(shift, 0, "Shift must be non-negative");
     if (shift >= 63) {
       if (number >= 0) {
         result = 0;
@@ -167,7 +167,7 @@ struct BitwiseRightShiftArithmeticFunction {
 
 template <typename T>
 struct BitwiseLogicalShiftRightFunction {
-  FOLLY_ALWAYS_INLINE bool
+  FOLLY_ALWAYS_INLINE void
 #if defined(__clang__)
       __attribute__((no_sanitize("integer")))
 #endif
@@ -175,8 +175,17 @@ struct BitwiseLogicalShiftRightFunction {
     // Presto defines this only for bigint, thus we will define this only for
     // int64_t.
     if (bits == 64) {
+      if (number < 0) {
+        // >> operator may perform an arithmetic shift right for signed
+        // integers, depending on the compiler, which gives wrong result when
+        // the input is negative. To ensure a logical shift, we cast it to
+        // uint64_t.
+        uint64_t unsignedNumber = static_cast<uint64_t>(number) >> shift;
+        result = static_cast<int64_t>(unsignedNumber);
+        return;
+      }
       result = number >> shift;
-      return true;
+      return;
     }
 
     VELOX_USER_CHECK(
@@ -184,7 +193,7 @@ struct BitwiseLogicalShiftRightFunction {
     VELOX_USER_CHECK_GE(shift, 0, "Shift must be non-negative");
 
     result = (number & ((1LL << bits) - 1)) >> shift;
-    return true;
+    return;
   }
 };
 
@@ -198,7 +207,7 @@ struct BitwiseShiftLeftFunction {
     // Presto defines this only for bigint, thus we will define this only for
     // int64_t.
     if (bits == 64) {
-      result = number >> shift;
+      result = number << shift;
       return true;
     }
 

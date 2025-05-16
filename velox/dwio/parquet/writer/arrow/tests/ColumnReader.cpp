@@ -36,20 +36,19 @@
 #include "arrow/array/builder_primitive.h"
 #include "arrow/chunked_array.h"
 #include "arrow/type.h"
-#include "arrow/util/bit_stream_utils.h"
 #include "arrow/util/bit_util.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/compression.h"
 #include "arrow/util/crc32.h"
 #include "arrow/util/int_util_overflow.h"
-#include "arrow/util/logging.h"
-#include "arrow/util/rle_encoding.h"
+
+#include "velox/common/base/Exceptions.h"
+#include "velox/dwio/parquet/common/LevelComparison.h"
+#include "velox/dwio/parquet/common/LevelConversion.h"
 #include "velox/dwio/parquet/writer/arrow/ColumnPage.h"
 #include "velox/dwio/parquet/writer/arrow/Encoding.h"
 #include "velox/dwio/parquet/writer/arrow/EncryptionInternal.h"
 #include "velox/dwio/parquet/writer/arrow/FileDecryptorInternal.h"
-#include "velox/dwio/parquet/writer/arrow/LevelComparison.h"
-#include "velox/dwio/parquet/writer/arrow/LevelConversion.h"
 #include "velox/dwio/parquet/writer/arrow/Properties.h"
 #include "velox/dwio/parquet/writer/arrow/Statistics.h"
 #include "velox/dwio/parquet/writer/arrow/ThriftInternal.h"
@@ -62,6 +61,11 @@ using arrow::internal::MultiplyWithOverflow;
 namespace bit_util = arrow::bit_util;
 
 namespace facebook::velox::parquet::arrow {
+
+fmt::underlying_t<Type::type> format_as(Type::type type) {
+  return fmt::underlying(type);
+}
+
 namespace {
 
 // The minimum number of repetition/definition levels to decode at a time, for
@@ -114,7 +118,7 @@ int LevelDecoder::SetData(
   int32_t num_bytes = 0;
   encoding_ = encoding;
   num_values_remaining_ = num_buffered_values;
-  bit_width_ = bit_util::Log2(max_level + 1);
+  bit_width_ = ::arrow::bit_util::Log2(max_level + 1);
   switch (encoding) {
     case Encoding::RLE: {
       if (data_size < 4) {
@@ -127,8 +131,8 @@ int LevelDecoder::SetData(
       }
       const uint8_t* decoder_data = data + 4;
       if (!rle_decoder_) {
-        rle_decoder_ = std::make_unique<::arrow::util::RleDecoder>(
-            decoder_data, num_bytes, bit_width_);
+        rle_decoder_ =
+            std::make_unique<RleDecoder>(decoder_data, num_bytes, bit_width_);
       } else {
         rle_decoder_->Reset(decoder_data, num_bytes, bit_width_);
       }
@@ -140,14 +144,14 @@ int LevelDecoder::SetData(
         throw ParquetException(
             "Number of buffered values too large (corrupt data page?)");
       }
-      num_bytes = static_cast<int32_t>(bit_util::BytesForBits(num_bits));
+      num_bytes =
+          static_cast<int32_t>(::arrow::bit_util::BytesForBits(num_bits));
       if (num_bytes < 0 || num_bytes > data_size - 4) {
         throw ParquetException(
             "Received invalid number of bytes (corrupt data page?)");
       }
       if (!bit_packed_decoder_) {
-        bit_packed_decoder_ =
-            std::make_unique<::arrow::bit_util::BitReader>(data, num_bytes);
+        bit_packed_decoder_ = std::make_unique<BitReader>(data, num_bytes);
       } else {
         bit_packed_decoder_->Reset(data, num_bytes);
       }
@@ -172,11 +176,10 @@ void LevelDecoder::SetDataV2(
   }
   encoding_ = Encoding::RLE;
   num_values_remaining_ = num_buffered_values;
-  bit_width_ = bit_util::Log2(max_level + 1);
+  bit_width_ = ::arrow::bit_util::Log2(max_level + 1);
 
   if (!rle_decoder_) {
-    rle_decoder_ = std::make_unique<::arrow::util::RleDecoder>(
-        data, num_bytes, bit_width_);
+    rle_decoder_ = std::make_unique<RleDecoder>(data, num_bytes, bit_width_);
   } else {
     rle_decoder_->Reset(data, num_bytes, bit_width_);
   }
@@ -192,7 +195,7 @@ int LevelDecoder::Decode(int batch_size, int16_t* levels) {
     num_decoded = bit_packed_decoder_->GetBatch(bit_width_, levels, num_values);
   }
   if (num_decoded > 0) {
-    internal::MinMax min_max = internal::FindMinMax(levels, num_decoded);
+    MinMax min_max = FindMinMax(levels, num_decoded);
     if (ARROW_PREDICT_FALSE(min_max.min < 0 || min_max.max > max_level_)) {
       std::stringstream ss;
       ss << "Malformed levels. min: " << min_max.min << " max: " << min_max.max
@@ -213,7 +216,7 @@ EncodedStatistics ExtractStatsFromHeader(const H& header) {
   if (!header.__isset.statistics) {
     return page_statistics;
   }
-  const format::Statistics& stats = header.statistics;
+  const facebook::velox::parquet::thrift::Statistics& stats = header.statistics;
   // Use the new V2 min-max statistics over the former one if it is filled
   if (stats.__isset.max_value || stats.__isset.min_value) {
     // TODO: check if the column_order is TYPE_DEFINED_ORDER.
@@ -253,8 +256,8 @@ void CheckNumValuesInHeader(int num_values) {
 // assembled in a serialized stream for storing in a Parquet files
 
 // This subclass delimits pages appearing in a serialized stream, each preceded
-// by a serialized Thrift format::PageHeader indicating the type of each page
-// and the page metadata.
+// by a serialized Thrift facebook::velox::parquet::thrift::PageHeader
+// indicating the type of each page and the page metadata.
 class SerializedPageReader : public PageReader {
  public:
   SerializedPageReader(
@@ -314,7 +317,7 @@ class SerializedPageReader : public PageReader {
   const ReaderProperties properties_;
   std::shared_ptr<ArrowInputStream> stream_;
 
-  format::PageHeader current_page_header_;
+  facebook::velox::parquet::thrift::PageHeader current_page_header_;
   std::shared_ptr<Page> current_page_;
 
   // Compression codec to use.
@@ -357,7 +360,7 @@ class SerializedPageReader : public PageReader {
 void SerializedPageReader::InitDecryption() {
   // Prepare the AAD for quick update later.
   if (crypto_ctx_.data_decryptor != nullptr) {
-    ARROW_DCHECK(!crypto_ctx_.data_decryptor->file_aad().empty());
+    VELOX_DCHECK(!crypto_ctx_.data_decryptor->file_aad().empty());
     data_page_aad_ = encryption::CreateModuleAad(
         crypto_ctx_.data_decryptor->file_aad(),
         encryption::kDataPage,
@@ -366,7 +369,7 @@ void SerializedPageReader::InitDecryption() {
         kNonPageOrdinal);
   }
   if (crypto_ctx_.meta_decryptor != nullptr) {
-    ARROW_DCHECK(!crypto_ctx_.meta_decryptor->file_aad().empty());
+    VELOX_DCHECK(!crypto_ctx_.meta_decryptor->file_aad().empty());
     data_page_header_aad_ = encryption::CreateModuleAad(
         crypto_ctx_.meta_decryptor->file_aad(),
         encryption::kDataPageHeader,
@@ -380,7 +383,7 @@ void SerializedPageReader::UpdateDecryption(
     const std::shared_ptr<Decryptor>& decryptor,
     int8_t module_type,
     std::string* page_aad) {
-  ARROW_DCHECK(decryptor != nullptr);
+  VELOX_DCHECK_NOT_NULL(decryptor);
   if (crypto_ctx_.start_decrypt_with_dictionary_page) {
     std::string aad = encryption::CreateModuleAad(
         decryptor->file_aad(),
@@ -399,7 +402,7 @@ bool SerializedPageReader::ShouldSkipPage(
     EncodedStatistics* data_page_statistics) {
   const PageType::type page_type = LoadEnumSafe(&current_page_header_.type);
   if (page_type == PageType::DATA_PAGE) {
-    const format::DataPageHeader& header =
+    const facebook::velox::parquet::thrift::DataPageHeader& header =
         current_page_header_.data_page_header;
     CheckNumValuesInHeader(header.num_values);
     *data_page_statistics = ExtractStatsFromHeader(header);
@@ -416,7 +419,7 @@ bool SerializedPageReader::ShouldSkipPage(
       }
     }
   } else if (page_type == PageType::DATA_PAGE_V2) {
-    const format::DataPageHeaderV2& header =
+    const facebook::velox::parquet::thrift::DataPageHeaderV2& header =
         current_page_header_.data_page_header_v2;
     CheckNumValuesInHeader(header.num_values);
     if (header.num_rows < 0) {
@@ -439,7 +442,7 @@ bool SerializedPageReader::ShouldSkipPage(
       }
     }
   } else if (page_type == PageType::DICTIONARY_PAGE) {
-    const format::DictionaryPageHeader& dict_header =
+    const facebook::velox::parquet::thrift::DictionaryPageHeader& dict_header =
         current_page_header_.dictionary_page_header;
     CheckNumValuesInHeader(dict_header.num_values);
   } else {
@@ -478,7 +481,7 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
               &data_page_header_aad_);
         }
         // Reset current page header to avoid unclearing the __isset flag.
-        current_page_header_ = format::PageHeader();
+        current_page_header_ = facebook::velox::parquet::thrift::PageHeader();
         deserializer.DeserializeMessage(
             reinterpret_cast<const uint8_t*>(view.data()),
             &header_size,
@@ -558,8 +561,8 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
 
     if (page_type == PageType::DICTIONARY_PAGE) {
       crypto_ctx_.start_decrypt_with_dictionary_page = false;
-      const format::DictionaryPageHeader& dict_header =
-          current_page_header_.dictionary_page_header;
+      const facebook::velox::parquet::thrift::DictionaryPageHeader&
+          dict_header = current_page_header_.dictionary_page_header;
       bool is_sorted =
           dict_header.__isset.is_sorted ? dict_header.is_sorted : false;
 
@@ -573,7 +576,7 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
           is_sorted);
     } else if (page_type == PageType::DATA_PAGE) {
       ++page_ordinal_;
-      const format::DataPageHeader& header =
+      const facebook::velox::parquet::thrift::DataPageHeader& header =
           current_page_header_.data_page_header;
       page_buffer = DecompressIfNeeded(
           std::move(page_buffer), compressed_len, uncompressed_len);
@@ -588,7 +591,7 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
           data_page_statistics);
     } else if (page_type == PageType::DATA_PAGE_V2) {
       ++page_ordinal_;
-      const format::DataPageHeaderV2& header =
+      const facebook::velox::parquet::thrift::DataPageHeaderV2& header =
           current_page_header_.data_page_header_v2;
 
       // Arrow prior to 3.0.0 set is_compressed to false but still compressed.
@@ -861,7 +864,7 @@ class ColumnReaderImplBase {
 
     new_dictionary_ = true;
     current_decoder_ = decoders_[encoding].get();
-    ARROW_DCHECK(current_decoder_);
+    VELOX_DCHECK(current_decoder_);
   }
 
   // Initialize repetition and definition level decoders on the next data page.
@@ -973,7 +976,7 @@ class ColumnReaderImplBase {
 
     auto it = decoders_.find(static_cast<int>(encoding));
     if (it != decoders_.end()) {
-      ARROW_DCHECK(it->second.get() != nullptr);
+      VELOX_DCHECK_NOT_NULL(it->second.get());
       current_decoder_ = it->second.get();
     } else {
       switch (encoding) {
@@ -1362,19 +1365,19 @@ int64_t TypedColumnReaderImpl<DType>::ReadBatchSpaced(
       *values_read = total_values;
     } else {
       LevelInfo info;
-      info.repeated_ancestor_def_level = this->max_def_level_ - 1;
-      info.def_level = this->max_def_level_;
-      info.rep_level = this->max_rep_level_;
+      info.repeatedAncestorDefLevel = this->max_def_level_ - 1;
+      info.defLevel = this->max_def_level_;
+      info.repLevel = this->max_rep_level_;
       ValidityBitmapInputOutput validity_io;
-      validity_io.values_read_upper_bound = num_def_levels;
-      validity_io.valid_bits = valid_bits;
-      validity_io.valid_bits_offset = valid_bits_offset;
-      validity_io.null_count = null_count;
-      validity_io.values_read = *values_read;
+      validity_io.valuesReadUpperBound = num_def_levels;
+      validity_io.validBits = valid_bits;
+      validity_io.validBitsOffset = valid_bits_offset;
+      validity_io.nullCount = null_count;
+      validity_io.valuesRead = *values_read;
 
       DefLevelsToBitmap(def_levels, num_def_levels, info, &validity_io);
-      null_count = validity_io.null_count;
-      *values_read = validity_io.values_read;
+      null_count = validity_io.nullCount;
+      *values_read = validity_io.valuesRead;
 
       total_values = this->ReadValuesSpaced(
           *values_read,
@@ -1429,7 +1432,7 @@ int64_t TypedColumnReaderImpl<DType>::Skip(int64_t num_values_to_skip) {
       // Jump to the right offset in the Page
       int64_t values_read = 0;
       InitScratchForSkip();
-      ARROW_DCHECK_NE(this->scratch_for_skip_, nullptr);
+      VELOX_DCHECK_NOT_NULL(this->scratch_for_skip_);
       do {
         int64_t batch_size = std::min(kSkipScratchBatchSize, values_to_skip);
         values_read = ReadBatch(
@@ -1617,10 +1620,10 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
   // accordingly and move the levels to left to fill in the gap.
   // It will resize the buffer without releasing the memory allocation.
   void ThrowAwayLevels(int64_t start_levels_position) {
-    ARROW_DCHECK_LE(levels_position_, levels_written_);
-    ARROW_DCHECK_LE(start_levels_position, levels_position_);
-    ARROW_DCHECK_GT(this->max_def_level_, 0);
-    ARROW_DCHECK_NE(def_levels_, nullptr);
+    VELOX_DCHECK_LE(levels_position_, levels_written_);
+    VELOX_DCHECK_LE(start_levels_position, levels_position_);
+    VELOX_DCHECK_GT(this->max_def_level_, 0);
+    VELOX_DCHECK_NOT_NULL(def_levels_);
 
     int64_t gap = levels_position_ - start_levels_position;
     if (gap == 0)
@@ -1642,7 +1645,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
     left_shift(def_levels_.get());
 
     if (this->max_rep_level_ > 0) {
-      ARROW_DCHECK_NE(rep_levels_, nullptr);
+      VELOX_DCHECK_NOT_NULL(rep_levels_);
       left_shift(rep_levels_.get());
     }
 
@@ -1654,7 +1657,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
   // Skip records that we have in our buffer. This function is only for
   // non-repeated fields.
   int64_t SkipRecordsInBufferNonRepeated(int64_t num_records) {
-    ARROW_DCHECK_EQ(this->max_rep_level_, 0);
+    VELOX_DCHECK_EQ(this->max_rep_level_, 0);
     if (!this->has_values_to_process() || num_records == 0)
       return 0;
 
@@ -1670,18 +1673,18 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
     std::shared_ptr<::arrow::ResizableBuffer> valid_bits;
     valid_bits = AllocateBuffer(this->pool_);
     PARQUET_THROW_NOT_OK(valid_bits->Resize(
-        bit_util::BytesForBits(skipped_records),
+        ::arrow::bit_util::BytesForBits(skipped_records),
         /*shrink_to_fit=*/true));
     ValidityBitmapInputOutput validity_io;
-    validity_io.values_read_upper_bound = skipped_records;
-    validity_io.valid_bits = valid_bits->mutable_data();
-    validity_io.valid_bits_offset = 0;
+    validity_io.valuesReadUpperBound = skipped_records;
+    validity_io.validBits = valid_bits->mutable_data();
+    validity_io.validBitsOffset = 0;
     DefLevelsToBitmap(
         def_levels() + start_levels_position,
         skipped_records,
         this->leaf_info_,
         &validity_io);
-    int64_t values_to_read = validity_io.values_read - validity_io.null_count;
+    int64_t values_to_read = validity_io.valuesRead - validity_io.nullCount;
 
     // Now that we have figured out number of values to read, we do not need
     // these levels anymore. We will remove these values from the buffer.
@@ -1729,7 +1732,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
   // reach the desired number of records or we run out of values in the column
   // chunk. Returns number of skipped records.
   int64_t SkipRecordsRepeated(int64_t num_records) {
-    ARROW_DCHECK_GT(this->max_rep_level_, 0);
+    VELOX_DCHECK_GT(this->max_rep_level_, 0);
     int64_t skipped_records = 0;
 
     // First consume what is in the buffer.
@@ -1800,7 +1803,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
     // Allocate enough scratch space to accommodate 16-bit levels or any
     // value type
     this->InitScratchForSkip();
-    ARROW_DCHECK_NE(this->scratch_for_skip_, nullptr);
+    VELOX_DCHECK_NOT_NULL(this->scratch_for_skip_);
     do {
       int64_t batch_size =
           std::min<int64_t>(kSkipScratchBatchSize, values_left);
@@ -1831,7 +1834,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
       // First consume whatever is in the buffer.
       skipped_records = SkipRecordsInBufferNonRepeated(num_records);
 
-      ARROW_DCHECK_LE(skipped_records, num_records);
+      VELOX_DCHECK_LE(skipped_records, num_records);
 
       // For records that we have not buffered, we will use the column
       // reader's Skip to do the remaining Skip. Since the field is not
@@ -1867,7 +1870,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
     if (nullable_values()) {
       auto result = valid_bits_;
       PARQUET_THROW_NOT_OK(result->Resize(
-          bit_util::BytesForBits(values_written_),
+          ::arrow::bit_util::BytesForBits(values_written_),
           /*shrink_to_fit=*/true));
       valid_bits_ = AllocateBuffer(this->pool_);
       return result;
@@ -1889,7 +1892,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
     const int16_t* def_levels = this->def_levels() + levels_position_;
     const int16_t* rep_levels = this->rep_levels() + levels_position_;
 
-    ARROW_DCHECK_GT(this->max_rep_level_, 0);
+    VELOX_DCHECK_GT(this->max_rep_level_, 0);
 
     // Count logical records and number of values to read
     while (levels_position_ < levels_written_) {
@@ -1943,7 +1946,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
     if (capacity >= target_size) {
       return capacity;
     }
-    return bit_util::NextPower2(target_size);
+    return ::arrow::bit_util::NextPower2(target_size);
   }
 
   void ReserveLevels(int64_t extra_levels) {
@@ -1982,9 +1985,11 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
       values_capacity_ = new_values_capacity;
     }
     if (nullable_values() && !read_dense_for_nullable_) {
-      int64_t valid_bytes_new = bit_util::BytesForBits(values_capacity_);
+      int64_t valid_bytes_new =
+          ::arrow::bit_util::BytesForBits(values_capacity_);
       if (valid_bits_->size() < valid_bytes_new) {
-        int64_t valid_bytes_old = bit_util::BytesForBits(values_written_);
+        int64_t valid_bytes_old =
+            ::arrow::bit_util::BytesForBits(values_written_);
         PARQUET_THROW_NOT_OK(
             valid_bits_->Resize(valid_bytes_new, /*shrink_to_fit=*/false));
 
@@ -2064,7 +2069,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
     if (!nullable_values() || read_dense_for_nullable_) {
       ReadValuesDense(*values_to_read);
       // null_count is always 0 for required.
-      ARROW_DCHECK_EQ(*null_count, 0);
+      VELOX_DCHECK_EQ(*null_count, 0);
     } else {
       ReadSpacedForOptionalOrRepeated(
           start_levels_position, values_to_read, null_count);
@@ -2091,7 +2096,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
       ReadDenseForOptional(start_levels_position, values_to_read);
       // We don't need to update null_count when reading dense. It should be
       // already set to 0.
-      ARROW_DCHECK_EQ(*null_count, 0);
+      VELOX_DCHECK_EQ(*null_count, 0);
     } else {
       ReadSpacedForOptionalOrRepeated(
           start_levels_position, values_to_read, null_count);
@@ -2114,7 +2119,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
       int64_t* values_to_read) {
     // levels_position_ must already be incremented based on number of records
     // read.
-    ARROW_DCHECK_GE(levels_position_, start_levels_position);
+    VELOX_DCHECK_GE(levels_position_, start_levels_position);
 
     // When reading dense we need to figure out number of values to read.
     const int16_t* def_levels = this->def_levels();
@@ -2133,23 +2138,22 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
       int64_t* null_count) {
     // levels_position_ must already be incremented based on number of records
     // read.
-    ARROW_DCHECK_GE(levels_position_, start_levels_position);
+    VELOX_DCHECK_GE(levels_position_, start_levels_position);
     ValidityBitmapInputOutput validity_io;
-    validity_io.values_read_upper_bound =
-        levels_position_ - start_levels_position;
-    validity_io.valid_bits = valid_bits_->mutable_data();
-    validity_io.valid_bits_offset = values_written_;
+    validity_io.valuesReadUpperBound = levels_position_ - start_levels_position;
+    validity_io.validBits = valid_bits_->mutable_data();
+    validity_io.validBitsOffset = values_written_;
 
     DefLevelsToBitmap(
         def_levels() + start_levels_position,
         levels_position_ - start_levels_position,
         leaf_info_,
         &validity_io);
-    *values_to_read = validity_io.values_read - validity_io.null_count;
-    *null_count = validity_io.null_count;
-    ARROW_DCHECK_GE(*values_to_read, 0);
-    ARROW_DCHECK_GE(*null_count, 0);
-    ReadValuesSpaced(validity_io.values_read, *null_count);
+    *values_to_read = validity_io.valuesRead - validity_io.nullCount;
+    *null_count = validity_io.nullCount;
+    VELOX_DCHECK_GE(*values_to_read, 0);
+    VELOX_DCHECK_GE(*null_count, 0);
+    ReadValuesSpaced(validity_io.valuesRead, *null_count);
   }
 
   // Return number of logical records read.
@@ -2175,22 +2179,22 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
     } else if (this->max_def_level_ > 0) {
       // Non-repeated optional values are always nullable.
       // This call updates levels_position_.
-      ARROW_DCHECK(nullable_values());
+      VELOX_DCHECK(nullable_values());
       records_read =
           ReadOptionalRecords(num_records, &values_to_read, &null_count);
     } else {
-      ARROW_DCHECK(!nullable_values());
+      VELOX_DCHECK(!nullable_values());
       records_read = ReadRequiredRecords(num_records, &values_to_read);
       // We don't need to update null_count, since it is 0.
     }
 
-    ARROW_DCHECK_GE(records_read, 0);
-    ARROW_DCHECK_GE(values_to_read, 0);
-    ARROW_DCHECK_GE(null_count, 0);
+    VELOX_DCHECK_GE(records_read, 0);
+    VELOX_DCHECK_GE(values_to_read, 0);
+    VELOX_DCHECK_GE(null_count, 0);
 
     if (read_dense_for_nullable_) {
       values_written_ += values_to_read;
-      ARROW_DCHECK_EQ(null_count, 0);
+      VELOX_DCHECK_EQ(null_count, 0);
     } else {
       values_written_ += values_to_read + null_count;
       null_count_ += null_count;
@@ -2214,7 +2218,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
 
     const T* vals = reinterpret_cast<const T*>(this->values());
 
-    if (leaf_info_.def_level > 0) {
+    if (leaf_info_.defLevel > 0) {
       std::cout << "def levels: ";
       for (int64_t i = 0; i < total_levels_read; ++i) {
         std::cout << def_levels[i] << " ";
@@ -2222,7 +2226,7 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
       std::cout << std::endl;
     }
 
-    if (leaf_info_.rep_level > 0) {
+    if (leaf_info_.repLevel > 0) {
       std::cout << "rep levels: ";
       for (int64_t i = 0; i < total_levels_read; ++i) {
         std::cout << rep_levels[i] << " ";
@@ -2272,7 +2276,7 @@ class FLBARecordReader : public TypedRecordReader<FLBAType>,
             pool,
             read_dense_for_nullable),
         builder_(nullptr) {
-    ARROW_DCHECK_EQ(descr_->physical_type(), Type::FIXED_LEN_BYTE_ARRAY);
+    VELOX_DCHECK_EQ(descr_->physical_type(), Type::FIXED_LEN_BYTE_ARRAY);
     int byte_width = descr_->type_length();
     std::shared_ptr<::arrow::DataType> type =
         ::arrow::fixed_size_binary(byte_width);
@@ -2309,7 +2313,7 @@ class FLBARecordReader : public TypedRecordReader<FLBAType>,
         static_cast<int>(null_count),
         valid_bits,
         valid_bits_offset);
-    ARROW_DCHECK_EQ(num_decoded, values_to_read);
+    VELOX_DCHECK_EQ(num_decoded, values_to_read);
 
     for (int64_t i = 0; i < num_decoded; i++) {
       if (::arrow::bit_util::GetBit(valid_bits, valid_bits_offset + i)) {
@@ -2338,7 +2342,7 @@ class ByteArrayChunkedRecordReader : public TypedRecordReader<ByteArrayType>,
             leaf_info,
             pool,
             read_dense_for_nullable) {
-    ARROW_DCHECK_EQ(descr_->physical_type(), Type::BYTE_ARRAY);
+    VELOX_DCHECK_EQ(descr_->physical_type(), Type::BYTE_ARRAY);
     accumulator_.builder = std::make_unique<::arrow::BinaryBuilder>(pool);
   }
 
@@ -2442,7 +2446,7 @@ class ByteArrayDictionaryRecordReader : public TypedRecordReader<ByteArrayType>,
   }
 
   void ReadValuesSpaced(int64_t values_to_read, int64_t null_count) override {
-    int64_t num_decoded = 0;
+    VELOX_DEBUG_ONLY int64_t num_decoded = 0;
     if (current_encoding_ == Encoding::RLE_DICTIONARY) {
       MaybeWriteNewDictionary();
       auto decoder = dynamic_cast<BinaryDictDecoder*>(this->current_decoder_);
@@ -2463,7 +2467,7 @@ class ByteArrayDictionaryRecordReader : public TypedRecordReader<ByteArrayType>,
       /// Flush values since they have been copied into the builder
       ResetValues();
     }
-    ARROW_DCHECK_EQ(num_decoded, values_to_read - null_count);
+    VELOX_DCHECK_EQ(num_decoded, values_to_read - null_count);
   }
 
  private:

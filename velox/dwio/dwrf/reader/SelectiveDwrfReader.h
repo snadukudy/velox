@@ -22,7 +22,7 @@
 
 namespace facebook::velox::dwrf {
 
-// Wrapper for static functions for making DWRF readers
+/// Wrapper for static functions for making DWRF readers
 class SelectiveDwrfReader {
  public:
   static std::unique_ptr<dwio::common::SelectiveColumnReader> build(
@@ -32,8 +32,8 @@ class SelectiveDwrfReader {
       common::ScanSpec& scanSpec,
       bool isRoot = false);
 
-  // Compatibility wrapper for tests. Takes the components of DwrfParams as
-  // separate.
+  /// Compatibility wrapper for tests. Takes the components of DwrfParams as
+  /// separate.
   static std::unique_ptr<dwio::common::SelectiveColumnReader> build(
       const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
@@ -48,28 +48,4 @@ class SelectiveDwrfReader {
   }
 };
 
-class SelectiveColumnReaderFactory : public ColumnReaderFactory {
- public:
-  explicit SelectiveColumnReaderFactory(
-      std::shared_ptr<common::ScanSpec> scanSpec)
-      : scanSpec_(scanSpec) {}
-
-  std::unique_ptr<dwio::common::SelectiveColumnReader> buildSelective(
-      const TypePtr& requestedType,
-      const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
-      StripeStreams& stripe,
-      const StreamLabels& streamLabels,
-      dwio::common::ColumnReaderStatistics& stats,
-      FlatMapContext flatMapContext = {}) {
-    auto params =
-        DwrfParams(stripe, streamLabels, stats, std::move(flatMapContext));
-    auto reader =
-        SelectiveDwrfReader::build(requestedType, fileType, params, *scanSpec_);
-    reader->setIsTopLevel();
-    return reader;
-  }
-
- private:
-  std::shared_ptr<common::ScanSpec> const scanSpec_;
-};
 } // namespace facebook::velox::dwrf

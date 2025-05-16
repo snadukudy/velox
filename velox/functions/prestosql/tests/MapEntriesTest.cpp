@@ -125,6 +125,25 @@ TEST_F(MapEntriesTest, constant) {
   test::assertEqualVectors(expected, result);
 }
 
+TEST_F(MapEntriesTest, unknownType) {
+  auto mapVector = makeMapVector<UnknownValue, UnknownValue>({
+      {},
+  });
+  auto result = evaluate("map_entries(c0)", makeRowVector({mapVector}));
+  auto keyVector = makeNullableFlatVector<UnknownValue>({});
+  auto valueVector = makeNullableFlatVector<UnknownValue>({});
+  auto elementVector = makeRowVector({keyVector, valueVector});
+  auto arrayVector = makeSingleRowArrayVector(elementVector);
+  test::assertEqualVectors(arrayVector, result);
+}
+
+TEST_F(MapEntriesTest, unknownTypeNonNullValue) {
+  auto mapVector = makeAllNullMapVector(1, UNKNOWN(), BIGINT());
+  auto result = evaluate("map_entries(c0)", makeRowVector({mapVector}));
+  auto expected = makeAllNullArrayVector(1, ROW({UNKNOWN(), BIGINT()}));
+  test::assertEqualVectors(expected, result);
+}
+
 TEST_F(MapEntriesTest, outputSizeIsBoundBySelectedRows) {
   // This test makes sure that map_entries output vector size is `rows.end()`
   // and not `rows.size()`. This is important for this function because it
@@ -168,14 +187,14 @@ TEST_F(MapEntriesTest, differentSizedValueKeyVectors) {
       makeNullableFlatVector<int64_t>({1, 2, 3, 4, std::nullopt, std::nullopt});
   auto valueVector = makeFlatVector<int64_t>({1, 2, 3, 4});
 
-  auto offsetBuffer = makeIndices({3, 2, 1, 0, 0, 0});
-  auto sizeBuffer = makeIndices({1, 1, 1, 1, 1, 1});
+  auto offsetBuffer = makeIndices({3, 2, 1, 0});
+  auto sizeBuffer = makeIndices({1, 1, 1, 1});
 
   auto mapVector = std::make_shared<MapVector>(
       pool(),
       MAP(BIGINT(), BIGINT()),
       nullptr,
-      6,
+      4,
       offsetBuffer,
       sizeBuffer,
       keyVector,
@@ -188,9 +207,9 @@ TEST_F(MapEntriesTest, differentSizedValueKeyVectors) {
 
   EXPECT_NE(result, nullptr);
   auto elementVector = makeRowVector(
-      {makeFlatVector<int64_t>({4, 3, 2, 1, 1, 1}),
-       makeFlatVector<int64_t>({4, 3, 2, 1, 1, 1})});
-  auto arrayVector = makeArrayVector({0, 1, 2, 3, 4, 5}, elementVector);
+      {makeFlatVector<int64_t>({4, 3, 2, 1}),
+       makeFlatVector<int64_t>({4, 3, 2, 1})});
+  auto arrayVector = makeArrayVector({0, 1, 2, 3}, elementVector);
 
   test::assertEqualVectors(arrayVector, result);
 }

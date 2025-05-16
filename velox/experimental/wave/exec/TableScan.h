@@ -30,7 +30,8 @@ class TableScan : public WaveSourceOperator {
   TableScan(
       CompileState& state,
       int32_t operatorId,
-      const core::TableScanNode& tableScanNode)
+      const core::TableScanNode& tableScanNode,
+      DefinesMap defines)
       : WaveSourceOperator(
             state,
             tableScanNode.outputType(),
@@ -47,22 +48,20 @@ class TableScan : public WaveSourceOperator {
         readBatchSize_(driverCtx_->task->queryCtx()
                            ->queryConfig()
                            .preferredOutputBatchRows()) {
+    defines_ = std::move(defines);
     connector_ = connector::getConnector(tableHandle_->connectorId());
   }
 
-  AdvanceResult canAdvance(WaveStream& stream) override;
+  std::vector<AdvanceResult> canAdvance(WaveStream& stream) override;
 
   void schedule(WaveStream& stream, int32_t maxRows = 0) override;
-
-  vector_size_t outputSize(WaveStream& stream) const {
-    return waveDataSource_->outputSize(stream);
-  }
 
   bool isStreaming() const override {
     return true;
   }
 
-  exec::BlockingReason isBlocked(ContinueFuture* future) override;
+  exec::BlockingReason isBlocked(WaveStream& /*stream*/, ContinueFuture* future)
+      override;
 
   bool isFinished() const override;
 
@@ -98,6 +97,15 @@ class TableScan : public WaveSourceOperator {
   // needed before prepare is done, it will be made when needed.
   void preload(std::shared_ptr<connector::ConnectorSplit> split);
 
+  // Adds 'stats' to operator stats of the containing WaveDriver. Some
+  // stats come from DataSource, others from SplitReader. If
+  // 'splitReader' is given, the completed rows/bytes from
+  // 'splitReader' are added. These do not come in the runtimeStats()
+  // map.
+  void updateStats(
+      std::unordered_map<std::string, RuntimeCounter> stats,
+      WaveSplitReader* splitReader = nullptr);
+
   // Process-wide IO wait time.
   static std::atomic<uint64_t> ioWaitNanos_;
 
@@ -109,7 +117,6 @@ class TableScan : public WaveSourceOperator {
   memory::MemoryPool* const connectorPool_;
   ContinueFuture blockingFuture_{ContinueFuture::makeEmpty()};
   exec::BlockingReason blockingReason_;
-  int64_t currentSplitWeight_{0};
   bool needNewSplit_ = true;
   std::shared_ptr<connector::Connector> connector_;
   std::shared_ptr<connector::ConnectorQueryCtx> connectorQueryCtx_;
@@ -140,14 +147,7 @@ class TableScan : public WaveSourceOperator {
   // Count of splits that finished preloading before being read.
   int32_t numReadyPreloadedSplits_{0};
 
-  int32_t readBatchSize_;
-  int32_t maxReadBatchSize_;
-
-  // Exits getOutput() method after this many milliseconds.
-  // Zero means 'no limit'.
-  size_t getOutputTimeLimitMs_{0};
-
-  double maxFilteringRatio_{0};
+  vector_size_t readBatchSize_;
 
   // String shown in ExceptionContext inside DataSource and LazyVector loading.
   std::string debugString_;

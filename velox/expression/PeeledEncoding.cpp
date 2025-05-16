@@ -104,7 +104,7 @@ void PeeledEncoding::setDictionaryWrapping(
     wrapNulls_ = firstWrapper.nulls();
     return;
   }
-  auto wrapping = decoded.dictionaryWrapping(firstWrapper, rows.end());
+  auto wrapping = decoded.dictionaryWrapping(*firstWrapper.pool(), rows.end());
   wrap_ = std::move(wrapping.indices);
   wrapNulls_ = std::move(wrapping.nulls);
 }
@@ -214,11 +214,8 @@ bool PeeledEncoding::peelInternal(
     }
     decodedVector.makeIndices(*firstWrapper, rows, numLevels);
     if (decodedVector.isConstantMapping()) {
-      // This can only happen if the attempt to peel a constant encoding layer
-      // exposed a null complex constant as the base.
       VELOX_CHECK(peeledVectors.size() == 1);
       auto innerIdx = decodedVector.index(rows.begin());
-      VELOX_CHECK(peeledVectors.back()->isNullAt(innerIdx));
       wrapEncoding_ = VectorEncoding::Simple::CONSTANT;
       constantWrapIndex_ = innerIdx;
     } else {

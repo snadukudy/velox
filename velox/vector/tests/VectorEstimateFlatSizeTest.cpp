@@ -16,15 +16,16 @@
 #include <gtest/gtest.h>
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
+using namespace facebook;
 using namespace facebook::velox;
 
 class VectorEstimateFlatSizeTest : public testing::Test,
-                                   public test::VectorTestBase {
+                                   public velox::test::VectorTestBase {
  protected:
-  using test::VectorTestBase::makeArrayVector;
+  using velox::test::VectorTestBase::makeArrayVector;
 
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   ArrayVectorPtr makeArrayVector(

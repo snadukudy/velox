@@ -23,121 +23,28 @@ diff --git a/fbcode/velox/external/date/date.h b/fbcode/velox/external/date/date
  
  #ifdef _MSC_VER
  #   pragma warning(pop)
-diff --git a/fbcode/velox/external/date/ios.h b/fbcode/velox/external/date/ios.h
---- a/fbcode/velox/external/date/ios.h
-+++ b/fbcode/velox/external/date/ios.h
-@@ -32,16 +32,22 @@
- # if TARGET_OS_IPHONE
- #   include <string>
+diff --git a/fbcode/velox/external/date/iso_week.h b/fbcode/velox/external/date/iso_week.h
+--- a/fbcode/velox/external/date/iso_week.h
++++ b/fbcode/velox/external/date/iso_week.h
+@@ -27,12 +27,6 @@
  
-+    namespace facebook
-+    {
-+    namespace velox
-+    {
-     namespace date
-     {
-     namespace iOSUtils
-     {
--    
-+
-     std::string get_tzdata_path();
-     std::string get_current_timezone();
--    
-+
-     }  // namespace iOSUtils
-     }  // namespace date
-+    }  // namespace velox
-+    }  // namespace facebook
+ #include <climits>
  
- # endif  // TARGET_OS_IPHONE
- #else   // !__APPLE__
-diff --git a/fbcode/velox/external/date/tz.cpp b/fbcode/velox/external/date/tz.cpp
---- a/fbcode/velox/external/date/tz.cpp
-+++ b/fbcode/velox/external/date/tz.cpp
-@@ -268,6 +268,10 @@
- 
- #endif  // !USE_OS_TZDB
- 
-+namespace facebook
-+{
-+namespace velox
-+{
- namespace date
+-namespace facebook
+-{
+-namespace velox
+-{
+-namespace date
+-{
+ namespace iso_week
  {
- // +---------------------+
-@@ -3860,6 +3864,8 @@
+ 
+@@ -1763,8 +1757,5 @@
  }
  
- }  // namespace date
-+}  // namespace velox
-+}  // namespace facebook
+ } // namespace iso_week
+-} // namespace date
+-} // namespace velox
+-} // namespace facebook
  
- #if defined(__GNUC__) && __GNUC__ < 5
- # pragma GCC diagnostic pop
-diff --git a/fbcode/velox/external/date/tz.h b/fbcode/velox/external/date/tz.h
---- a/fbcode/velox/external/date/tz.h
-+++ b/fbcode/velox/external/date/tz.h
-@@ -143,6 +143,10 @@
- #  endif
- #endif
- 
-+namespace facebook
-+{
-+namespace velox
-+{
- namespace date
- {
- 
-@@ -2790,5 +2794,7 @@
- #endif  // !MISSING_LEAP_SECONDS
- 
- }  // namespace date
-+}  // namespace velox
-+}  // namespace facebook
- 
- #endif  // TZ_H
-diff --git a/fbcode/velox/external/date/tz_private.h b/fbcode/velox/external/date/tz_private.h
---- a/fbcode/velox/external/date/tz_private.h
-+++ b/fbcode/velox/external/date/tz_private.h
-@@ -34,6 +34,12 @@
- #include <vector>
- #endif
- 
-+namespace facebook
-+{
-+
-+namespace velox
-+{
-+
- namespace date
- {
- 
-@@ -309,6 +315,10 @@
- 
- }  // namespace date
- 
-+}  // namespace velox
-+
-+}  // namespace facebook
-+
- #if defined(_MSC_VER) && (_MSC_VER < 1900)
- #include "tz.h"
- #endif
-diff --git a/fbcode/velox/type/Timestamp.h b/fbcode/velox/type/Timestamp.h
---- a/fbcode/velox/type/Timestamp.h
-+++ b/fbcode/velox/type/Timestamp.h
-@@ -24,12 +24,12 @@
- #include "velox/common/base/CheckedArithmetic.h"
- #include "velox/type/StringView.h"
- 
-+namespace facebook::velox {
-+
- namespace date {
- class time_zone;
- }
- 
--namespace facebook::velox {
--
- struct TimestampToStringOptions {
-   enum class Precision : int8_t {
-     kMilliseconds = 3, // 10^3 milliseconds are equal to one second.
+ #endif  // ISO_WEEK_H

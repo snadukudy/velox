@@ -17,30 +17,47 @@
 #pragma once
 
 #include "velox/common/file/FileSystems.h"
-#include "velox/connectors/hive/HiveConfig.h"
+
+namespace Aws::Auth {
+// Forward-declare the AWSCredentialsProvider class from the AWS SDK.
+class AWSCredentialsProvider;
+} // namespace Aws::Auth
 
 namespace facebook::velox::filesystems {
-using namespace facebook::velox::connector::hive;
 
-bool initializeS3(const Config* config);
+bool initializeS3(
+    std::string_view logLevel = "FATAL",
+    std::optional<std::string_view> logLocation = std::nullopt);
 
 void finalizeS3();
+
+class S3Config;
+
+using AWSCredentialsProviderFactory =
+    std::function<std::shared_ptr<Aws::Auth::AWSCredentialsProvider>(
+        const S3Config& config)>;
+
+void registerCredentialsProvider(
+    const std::string& providerName,
+    const AWSCredentialsProviderFactory& factory);
 
 /// Implementation of S3 filesystem and file interface.
 /// We provide a registration method for read and write files so the appropriate
 /// type of file can be constructed based on a filename.
 class S3FileSystem : public FileSystem {
  public:
-  explicit S3FileSystem(std::shared_ptr<const Config> config);
+  S3FileSystem(
+      std::string_view bucketName,
+      const std::shared_ptr<const config::ConfigBase> config);
 
   std::string name() const override;
 
   std::unique_ptr<ReadFile> openFileForRead(
-      std::string_view path,
+      std::string_view s3Path,
       const FileOptions& options = {}) override;
 
   std::unique_ptr<WriteFile> openFileForWrite(
-      std::string_view path,
+      std::string_view s3Path,
       const FileOptions& options) override;
 
   void remove(std::string_view path) override {
@@ -62,7 +79,8 @@ class S3FileSystem : public FileSystem {
     VELOX_UNSUPPORTED("list for S3 not implemented");
   }
 
-  void mkdir(std::string_view path) override {
+  void mkdir(std::string_view path, const DirectoryOptions& options = {})
+      override {
     VELOX_UNSUPPORTED("mkdir for S3 not implemented");
   }
 
@@ -71,6 +89,8 @@ class S3FileSystem : public FileSystem {
   }
 
   std::string getLogLevelName() const;
+
+  std::string getLogPrefix() const;
 
  protected:
   class Impl;

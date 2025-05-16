@@ -84,11 +84,12 @@ HashStringAllocator::Position AddressableNonNullValueList::appendSerialized(
 
 namespace {
 
-ByteInputStream prepareRead(const AddressableNonNullValueList::Entry& entry) {
+HashStringAllocator::InputStream prepareRead(
+    const AddressableNonNullValueList::Entry& entry) {
   auto header = entry.offset.header;
   auto seek = entry.offset.position - header->begin();
 
-  auto stream = HashStringAllocator::prepareRead(header, entry.size + seek);
+  HashStringAllocator::InputStream stream(header);
   stream.seekp(seek);
   return stream;
 }
@@ -126,7 +127,7 @@ void AddressableNonNullValueList::readSerialized(
     const Entry& position,
     char* dest) {
   auto stream = prepareRead(position);
-  stream.readBytes(dest, position.size);
+  stream.ByteInputStream::readBytes(dest, position.size);
 }
 
 } // namespace facebook::velox::aggregate::prestosql

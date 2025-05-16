@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/functions/prestosql/aggregates/EntropyAggregates.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/functions/prestosql/aggregates/AggregateNames.h"
@@ -48,8 +49,8 @@ struct EntropyAccumulator {
     if (count == 0) {
       return;
     }
-    sumC_ += (double)count;
-    sumCLogC_ += (double)count * std::log(count);
+    sumC_ += static_cast<double>(count);
+    sumCLogC_ += static_cast<double>(count) * std::log(count);
   }
 
   void merge(double sumCOther, double sumCLogCOther) {
@@ -125,7 +126,8 @@ class EntropyAggregate : public exec::Aggregate {
         // The "sum" is the constant value times the number of rows.
         // Use double to prevent overflows (this is the same as what is done in
         // updateNonNullValue).
-        const auto sum = (double)numRows * (double)value;
+        const auto sum =
+            static_cast<double>(numRows) * static_cast<double>(value);
         EntropyAccumulator accData(sum, sum * std::log(value));
         updateNonNullValue(group, accData);
       }
@@ -378,7 +380,7 @@ void registerEntropyAggregate(
               VELOX_UNSUPPORTED(
                   "Unsupported input type: {}. "
                   "Expected SMALLINT, INTEGER, BIGINT.",
-                  inputType->toString())
+                  inputType->toString());
           }
         } else {
           checkRowType(

@@ -51,24 +51,24 @@ void verifyStats(
     const size_t repeat,
     const std::vector<size_t>& nodeSizePerStride,
     const bool hasFlatMapCol) {
-  ASSERT_EQ(1, rowReader.getReader().getFooter().stripesSize())
+  ASSERT_EQ(1, rowReader.getReader().footer().stripesSize())
       << "Only one stripe expected";
 
-  ASSERT_EQ(true, rowReader.getReader().getFooter().hasRawDataSize())
+  ASSERT_EQ(true, rowReader.getReader().footer().hasRawDataSize())
       << "File raw data size does not exist";
 
   ASSERT_EQ(
       nodeSizePerStride.at(0) * repeat,
-      rowReader.getReader().getFooter().rawDataSize())
+      rowReader.getReader().footer().rawDataSize())
       << "File raw data size does not match";
 
   // Verify File Column's raw Size.
   for (auto nodeId = 0; nodeId < nodeSizePerStride.size(); nodeId++) {
     ASSERT_EQ(
         nodeSizePerStride.at(nodeId) * repeat,
-        rowReader.getReader().getColumnStatistics(nodeId)->getRawSize())
+        rowReader.getReader().columnStatistics(nodeId)->getRawSize())
         << "RawSize does not match. Node " << nodeId << " "
-        << rowReader.getReader().getColumnStatistics(nodeId)->toString();
+        << rowReader.getReader().columnStatistics(nodeId)->toString();
   }
 
   bool preload = true;
@@ -77,27 +77,27 @@ void verifyStats(
 
   // Verify Stripe content length + index length equals size of the column 0.
   auto totalStreamSize = stripeInfo.dataLength() + stripeInfo.indexLength();
-  auto node_0_Size = rowReader.getReader().getColumnStatistics(0)->getSize();
+  auto node_0_Size = rowReader.getReader().columnStatistics(0)->getSize();
 
   ASSERT_EQ(node_0_Size, totalStreamSize) << "Total size does not match";
 
   // Compute Node Size and verify the File Footer Node Size matches.
   auto& stripeFooter = *stripeMetadata->footer;
   std::unordered_map<uint32_t, uint64_t> nodeSizes;
-  for (auto&& ss : stripeFooter.streams()) {
+  for (auto&& ss : stripeFooter.streamsDwrf()) {
     nodeSizes[ss.node()] += ss.length();
   }
 
   computeCumulativeNodeSize(
-      nodeSizes, *TypeWithId::create(rowReader.getReader().getSchema()));
+      nodeSizes, *TypeWithId::create(rowReader.getReader().schema()));
   for (auto nodeId = 0;
-       nodeId < rowReader.getReader().getFooter().statisticsSize();
+       nodeId < rowReader.getReader().footer().statisticsSize();
        nodeId++) {
     ASSERT_EQ(
         nodeSizes[nodeId],
-        rowReader.getReader().getColumnStatistics(nodeId)->getSize().value())
+        rowReader.getReader().columnStatistics(nodeId)->getSize().value())
         << "Size does not match. Node " << nodeId << " "
-        << rowReader.getReader().getColumnStatistics(nodeId)->toString();
+        << rowReader.getReader().columnStatistics(nodeId)->toString();
   }
 
   // Verify Stride Stats.
@@ -106,7 +106,7 @@ void verifyStats(
           rowReader.readerBaseShared(), std::move(stripeMetadata)),
       &rowReader.getColumnSelector(),
       nullptr,
-      rowReader.getRowReaderOptions(),
+      rowReader.rowReaderOptions(),
       stripeInfo.offset(),
       static_cast<int64_t>(stripeInfo.numberOfRows()),
       rowReader,
@@ -145,7 +145,7 @@ using PopulateBatch =
 class ColumnWriterStatsTest : public ::testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {

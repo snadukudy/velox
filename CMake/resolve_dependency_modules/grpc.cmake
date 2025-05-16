@@ -13,19 +13,20 @@
 # limitations under the License.
 include_guard(GLOBAL)
 
-set_source(absl)
-resolve_dependency(absl CONFIG REQUIRED)
+velox_set_source(absl)
+velox_resolve_dependency(absl CONFIG REQUIRED)
 
 set(VELOX_GRPC_BUILD_VERSION 1.48.1)
 set(VELOX_GRPC_BUILD_SHA256_CHECKSUM
     320366665d19027cda87b2368c03939006a37e0388bfd1091c8d2a96fbc93bd8)
-string(CONCAT VELOX_GRPC_SOURCE_URL
-              "https://github.com/grpc/grpc/archive/refs/tags/"
-              "v${VELOX_GRPC_BUILD_VERSION}.tar.gz")
+string(
+  CONCAT VELOX_GRPC_SOURCE_URL
+         "https://github.com/grpc/grpc/archive/refs/tags/"
+         "v${VELOX_GRPC_BUILD_VERSION}.tar.gz")
 
-resolve_dependency_url(GRPC)
+velox_resolve_dependency_url(GRPC)
 
-message(STATUS "Building Google Cloud CPP from source")
+message(STATUS "Building gRPC from source")
 
 FetchContent_Declare(
   gRPC
@@ -33,6 +34,9 @@ FetchContent_Declare(
   URL_HASH ${VELOX_GRPC_BUILD_SHA256_CHECKSUM}
   OVERRIDE_FIND_PACKAGE EXCLUDE_FROM_ALL)
 
+# We need to specify CACHE explicitly even when we have
+# set(CMAKE_POLICY_DEFAULT_CMP0077 NEW). Because gRPC doesn't use option(). gRPC
+# uses set(... CACHE). So CMP0077 isn't affected.
 set(gRPC_ABSL_PROVIDER
     "package"
     CACHE STRING "Provider of absl library")

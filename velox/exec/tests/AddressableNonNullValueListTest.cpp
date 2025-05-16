@@ -23,10 +23,10 @@ namespace facebook::velox::aggregate::prestosql {
 namespace {
 
 class AddressableNonNullValueListTest : public testing::Test,
-                                        public test::VectorTestBase {
+                                        public velox::test::VectorTestBase {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   using T = AddressableNonNullValueList::Entry;

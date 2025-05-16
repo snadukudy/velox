@@ -35,6 +35,7 @@ class IcebergSplitReader : public SplitReader {
       const std::shared_ptr<const HiveConfig>& hiveConfig,
       const RowTypePtr& readerOutputType,
       const std::shared_ptr<io::IoStatistics>& ioStats,
+      const std::shared_ptr<filesystems::File::IoStats>& fsStats,
       FileHandleFactory* fileHandleFactory,
       folly::Executor* executor,
       const std::shared_ptr<common::ScanSpec>& scanSpec);
@@ -43,8 +44,7 @@ class IcebergSplitReader : public SplitReader {
 
   void prepareSplit(
       std::shared_ptr<common::MetadataFilter> metadataFilter,
-      dwio::common::RuntimeStatistics& runtimeStats,
-      const std::shared_ptr<HiveColumnHandle>& rowIndexColumn) override;
+      dwio::common::RuntimeStatistics& runtimeStats) override;
 
   uint64_t next(uint64_t size, VectorPtr& output) override;
 
@@ -52,10 +52,8 @@ class IcebergSplitReader : public SplitReader {
   // The read offset to the beginning of the split in number of rows for the
   // current batch for the base data file
   uint64_t baseReadOffset_;
-
   // The file position for the first row in the split
   uint64_t splitOffset_;
-
   std::list<std::unique_ptr<PositionalDeleteFileReader>>
       positionalDeleteFileReaders_;
   BufferPtr deleteBitmap_;

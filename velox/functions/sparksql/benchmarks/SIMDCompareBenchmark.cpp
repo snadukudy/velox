@@ -18,7 +18,8 @@
 #include <folly/init/Init.h>
 
 #include "velox/benchmarks/ExpressionBenchmarkBuilder.h"
-#include "velox/functions/sparksql/Register.h"
+#include "velox/functions/sparksql/registration/Register.h"
+#include "velox/vector/fuzzer/VectorFuzzer.h"
 
 using namespace facebook;
 
@@ -26,7 +27,7 @@ using namespace facebook::velox;
 
 int main(int argc, char** argv) {
   folly::Init init(&argc, &argv);
-  memory::MemoryManager::initialize({});
+  memory::MemoryManager::initialize(memory::MemoryManager::Options{});
   functions::sparksql::registerFunctions("");
   std::vector<TypePtr> inputTypes = {
       TINYINT(),
@@ -41,12 +42,29 @@ int main(int argc, char** argv) {
   ExpressionBenchmarkBuilder benchmarkBuilder;
   for (auto nullRatio : {0.0, 0.1, 0.9}) {
     for (auto& inputType : inputTypes) {
+      VectorFuzzer::Options opts;
+      opts.vectorSize = 10000;
+      opts.nullRatio = nullRatio;
+      VectorFuzzer fuzzer(opts, benchmarkBuilder.pool());
+      std::vector<VectorPtr> childrenVectors = {
+          fuzzer.fuzzDictionary(fuzzer.fuzzFlat(inputType)),
+          fuzzer.fuzzFlat(inputType)};
       benchmarkBuilder
           .addBenchmarkSet(
               fmt::format(
-                  "{}#{}\%null", inputType->toString(), nullRatio * 100),
+                  "Dict#{}#{}\%null", inputType->toString(), nullRatio * 100),
+              fuzzer.fuzzRow(
+                  std::move(childrenVectors), {"c0", "c1"}, opts.vectorSize))
+          .addExpression("equalto", "equalto(c0, c1)")
+          .addExpression("greaterthan", "greaterthan(c0, c1)")
+          .addExpression("greaterthanorequal", "greaterthanorequal(c0, c1)")
+          .withIterations(100);
+      benchmarkBuilder
+          .addBenchmarkSet(
+              fmt::format(
+                  "Flat#{}#{}\%null", inputType->toString(), nullRatio * 100),
               ROW({"c0", "c1"}, {inputType, inputType}))
-          .withFuzzerOptions({.vectorSize = 10000, .nullRatio = nullRatio})
+          .withFuzzerOptions(opts)
           .addExpression("equalto", "equalto(c0, c1)")
           .addExpression("greaterthan", "greaterthan(c0, c1)")
           .addExpression("greaterthanorequal", "greaterthanorequal(c0, c1)")

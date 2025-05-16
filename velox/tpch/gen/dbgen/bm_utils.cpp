@@ -1,4 +1,19 @@
 /*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
  * Copyright owned by the Transaction Processing Performance Council.
  *
  * A copy of the license is included under extension/tpch/dbgen/LICENSE
@@ -13,7 +28,6 @@
  * Various routines that handle distributions, value selections and
  * seed value management for the DSS benchmark. Current functions:
  * tpch_env_config -- set config vars with optional environment override
- * yes_no -- ask simple yes/no question and return boolean result
  * tpch_a_rnd(min, max) -- random alphanumeric within length range
  * pick_str(size, set) -- select a string from the set of size
  * read_dist(file, name, distribution *) -- read named dist from file
@@ -77,7 +91,7 @@
 /* End of lines added by Chuck McDevitt for WIN32 support */
 #include "dbgen/dsstypes.h" // @manual
 
-static char alpha_num[65] =
+static const char* alpha_num =
     "0123456789abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ,";
 
 #if defined(__STDC__) || defined(__cplusplus)
@@ -89,6 +103,9 @@ static char alpha_num[65] =
 #ifndef WIN32
 char* getenv PROTO((const char* name));
 #endif
+
+namespace facebook::velox::tpch::dbgen {
+
 void usage();
 void permute_dist(distribution* d, seed_t* seed);
 
@@ -99,40 +116,10 @@ void permute_dist(distribution* d, seed_t* seed);
 const char* tpch_env_config(const char* var, const char* dflt) {
   static char* evar;
 
-  if ((evar = getenv(var)) != NULL)
+  if ((evar = getenv(var)) != nullptr)
     return (evar);
   else
     return (dflt);
-}
-
-/*
- * return the answer to a yes/no question as a boolean
- */
-long yes_no(char* prompt) {
-  char reply[128];
-  (void)prompt;
-#ifdef WIN32
-/* Disable warning about conditional expression is constant */
-#pragma warning(disable : 4127)
-#endif
-
-  while (1) {
-#ifdef WIN32
-#pragma warning(default : 4127)
-#endif
-    printf("%s [Y/N]: ", prompt);
-    fgets(reply, 128, stdin);
-    switch (*reply) {
-      case 'y':
-      case 'Y':
-        return (1);
-      case 'n':
-      case 'N':
-        return (0);
-      default:
-        printf("Please answer 'yes' or 'no'.\n");
-    }
-  }
 }
 
 /*
@@ -166,8 +153,8 @@ void e_str(distribution* d, int min, int max, seed_t* seed, char* dest) {
 
   tpch_a_rnd(min, max, seed, dest);
   pick_str(d, seed, strtmp);
-  len = (int)strlen(strtmp);
-  RANDOM(loc, 0, ((int)strlen(dest) - 1 - len), seed);
+  len = static_cast<int>(strlen(strtmp));
+  RANDOM(loc, 0, (static_cast<int>(strlen(dest)) - 1 - len), seed);
   memcpy(dest + loc, strtmp, sizeof(char) * len);
 
   return;
@@ -234,7 +221,11 @@ long julian(long date) {
   return (result + offset);
 }
 
+} // namespace facebook::velox::tpch::dbgen
+
 #include "dbgen/dists_dss.h" // @manual
+
+namespace facebook::velox::tpch::dbgen {
 
 static char
 read_line_into_buffer(char* buffer, size_t bufsiz, const char** src) {
@@ -261,9 +252,9 @@ void read_dist(const char* path, const char* name, distribution* target) {
   long weight, count = 0, name_set = 0;
 
   while (read_line_into_buffer(line, sizeof(line), &src)) {
-    if ((c = strchr(line, '\n')) != NULL)
+    if ((c = strchr(line, '\n')) != nullptr)
       *c = '\0';
-    if ((c = strchr(line, '#')) != NULL)
+    if ((c = strchr(line, '#')) != nullptr)
       *c = '\0';
     if (*line == '\0')
       continue;
@@ -271,7 +262,7 @@ void read_dist(const char* path, const char* name, distribution* target) {
     if (!name_set) {
       if (dsscasecmp(strtok(line, "\n\t "), "BEGIN"))
         continue;
-      if (dsscasecmp(strtok(NULL, "\n\t "), name))
+      if (dsscasecmp(strtok(nullptr, "\n\t "), name))
         continue;
       name_set = 1;
       continue;
@@ -286,12 +277,14 @@ void read_dist(const char* path, const char* name, distribution* target) {
 
     if (!dsscasecmp(token, "count")) {
       target->count = weight;
-      target->list = (set_member*)malloc((size_t)(weight * sizeof(set_member)));
+      target->list = reinterpret_cast<set_member*>(
+          malloc(static_cast<size_t>(weight * sizeof(set_member))));
       MALLOC_CHECK(target->list);
       target->max = 0;
       continue;
     }
-    target->list[count].text = (char*)malloc((size_t)((int)strlen(token) + 1));
+    target->list[count].text = reinterpret_cast<char*>(
+        malloc(static_cast<size_t>((static_cast<int>(strlen(token)) + 1))));
     MALLOC_CHECK(target->list[count].text);
     strcpy(target->list[count].text, token);
     target->max += weight;
@@ -304,7 +297,7 @@ void read_dist(const char* path, const char* name, distribution* target) {
     fprintf(stderr, "Read error on dist '%s'\n", name);
     exit(1);
   }
-  target->permute = (long*)NULL;
+  target->permute = reinterpret_cast<long*>(NULL);
   return;
 }
 
@@ -324,7 +317,7 @@ void agg_str(distribution* set, long count, seed_t* seed, char* dest) {
     strcat(dest, DIST_MEMBER(set, DIST_PERMUTE(d, i)));
     strcat(dest, " ");
   }
-  *(dest + (int)strlen(dest) - 1) = '\0';
+  *(dest + static_cast<int>(strlen(dest)) - 1) = '\0';
 
   return;
 }
@@ -407,7 +400,8 @@ char** mk_ascdate(void) {
   dss_time_t t;
   DSS_HUGE i;
 
-  m = (char**)malloc((size_t)(TOTDATE * sizeof(char*)));
+  m = reinterpret_cast<char**>(
+      malloc(static_cast<size_t>(TOTDATE * sizeof(char*))));
   MALLOC_CHECK(m);
   for (i = 0; i < TOTDATE; i++) {
     mk_time(i + 1, &t);
@@ -460,3 +454,5 @@ set_state(
 
   return (result);
 }
+
+} // namespace facebook::velox::tpch::dbgen

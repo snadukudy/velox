@@ -32,6 +32,7 @@ PositionalDeleteFileReader::PositionalDeleteFileReader(
     folly::Executor* executor,
     const std::shared_ptr<const HiveConfig>& hiveConfig,
     const std::shared_ptr<io::IoStatistics>& ioStats,
+    const std::shared_ptr<filesystems::File::IoStats>& fsStats,
     dwio::common::RuntimeStatistics& runtimeStats,
     uint64_t splitOffset,
     const std::string& connectorId)
@@ -39,8 +40,10 @@ PositionalDeleteFileReader::PositionalDeleteFileReader(
       baseFilePath_(baseFilePath),
       fileHandleFactory_(fileHandleFactory),
       executor_(executor),
+      connectorQueryCtx_(connectorQueryCtx),
       hiveConfig_(hiveConfig),
       ioStats_(ioStats),
+      fsStats_(fsStats),
       pool_(connectorQueryCtx->memoryPool()),
       filePathColumn_(IcebergMetadataColumn::icebergDeleteFilePathColumn()),
       posColumn_(IcebergMetadataColumn::icebergDeletePosColumn()),
@@ -49,12 +52,9 @@ PositionalDeleteFileReader::PositionalDeleteFileReader(
       deleteRowReader_(nullptr),
       deletePositionsOutput_(nullptr),
       deletePositionsOffset_(0),
-      endOfFile_(false) {
+      totalNumRowsScanned_(0) {
   VELOX_CHECK(deleteFile_.content == FileContent::kPositionalDeletes);
-
-  if (deleteFile_.recordCount == 0) {
-    return;
-  }
+  VELOX_CHECK(deleteFile_.recordCount);
 
   // TODO: check if the lowerbounds and upperbounds in deleteFile overlap with
   //  this batch. If not, no need to proceed.
@@ -62,8 +62,7 @@ PositionalDeleteFileReader::PositionalDeleteFileReader(
   // Create the ScanSpec for this delete file
   auto scanSpec = std::make_shared<common::ScanSpec>("<root>");
   scanSpec->addField(posColumn_->name, 0);
-  auto* pathSpec =
-      scanSpec->getOrCreateChild(common::Subfield(filePathColumn_->name));
+  auto* pathSpec = scanSpec->getOrCreateChild(filePathColumn_->name);
   pathSpec->setFilter(std::make_unique<common::BytesValues>(
       std::vector<std::string>({baseFilePath_}), false));
 
@@ -86,11 +85,12 @@ PositionalDeleteFileReader::PositionalDeleteFileReader(
 
   dwio::common::ReaderOptions deleteReaderOpts(pool_);
   configureReaderOptions(
-      deleteReaderOpts,
       hiveConfig_,
       connectorQueryCtx,
       deleteFileSchema,
-      deleteSplit_);
+      deleteSplit_,
+      /*tableParameters=*/{},
+      deleteReaderOpts);
 
   auto deleteFileHandleCachePtr =
       fileHandleFactory_->generate(deleteFile_.filePath);
@@ -99,6 +99,7 @@ PositionalDeleteFileReader::PositionalDeleteFileReader(
       deleteReaderOpts,
       connectorQueryCtx,
       ioStats_,
+      fsStats_,
       executor_);
 
   auto deleteReader =
@@ -114,8 +115,12 @@ PositionalDeleteFileReader::PositionalDeleteFileReader(
           deleteReader.get(),
           deleteSplit_->filePath,
           deleteSplit_->partitionKeys,
-          {})) {
-    ++runtimeStats.skippedSplits;
+          {},
+          hiveConfig_->readTimestampPartitionValueAsLocalTime(
+              connectorQueryCtx_->sessionProperties()))) {
+    // We only count the number of base splits skipped as skippedSplits runtime
+    // statistics in Velox.  Skipped delta split is only counted as skipped
+    // bytes.
     runtimeStats.skippedSplitBytes += deleteSplit_->length;
     deleteSplit_.reset();
     return;
@@ -123,12 +128,14 @@ PositionalDeleteFileReader::PositionalDeleteFileReader(
 
   dwio::common::RowReaderOptions deleteRowReaderOpts;
   configureRowReaderOptions(
-      deleteRowReaderOpts,
       {},
       scanSpec,
       nullptr,
       deleteFileSchema,
-      deleteSplit_);
+      deleteSplit_,
+      nullptr,
+      nullptr,
+      deleteRowReaderOpts);
 
   deleteRowReader_.reset();
   deleteRowReader_ = deleteReader->createRowReader(deleteRowReaderOpts);
@@ -137,13 +144,14 @@ PositionalDeleteFileReader::PositionalDeleteFileReader(
 void PositionalDeleteFileReader::readDeletePositions(
     uint64_t baseReadOffset,
     uint64_t size,
-    int8_t* deleteBitmap) {
+    BufferPtr deleteBitmapBuffer) {
   // We are going to read to the row number up to the end of the batch. For the
   // same base file, the deleted rows are in ascending order in the same delete
-  // file
+  // file. rowNumberUpperBound is the upperbound for the row number in this
+  // batch, excluding boundaries
   int64_t rowNumberUpperBound = splitOffset_ + baseReadOffset + size;
 
-  // Finish unused delete positions from last batch
+  // Finish unused delete positions from last batch.
   if (deletePositionsOutput_ &&
       deletePositionsOffset_ < deletePositionsOutput_->size()) {
     updateDeleteBitmap(
@@ -151,7 +159,7 @@ void PositionalDeleteFileReader::readDeletePositions(
             ->childAt(0),
         baseReadOffset,
         rowNumberUpperBound,
-        deleteBitmap);
+        deleteBitmapBuffer);
 
     if (readFinishedForBatch(rowNumberUpperBound)) {
       return;
@@ -164,16 +172,16 @@ void PositionalDeleteFileReader::readDeletePositions(
 
   // Read the new delete positions for this batch into deletePositionsOutput_
   // and update the delete bitmap
-
   auto outputType = posColumn_->type;
-
   RowTypePtr outputRowType = ROW({posColumn_->name}, {posColumn_->type});
   if (!deletePositionsOutput_) {
     deletePositionsOutput_ = BaseVector::create(outputRowType, 0, pool_);
   }
 
-  while (!readFinishedForBatch(rowNumberUpperBound)) {
+  do {
     auto rowsScanned = deleteRowReader_->next(size, deletePositionsOutput_);
+    totalNumRowsScanned_ += rowsScanned;
+
     if (rowsScanned > 0) {
       VELOX_CHECK(
           !deletePositionsOutput_->mayHaveNulls(),
@@ -184,42 +192,72 @@ void PositionalDeleteFileReader::readDeletePositions(
         deletePositionsOutput_->loadedVector();
         deletePositionsOffset_ = 0;
 
+        // Convert the row numbers to set bits, up to rowNumberUpperBound.
+        // Beyond that the buffer of deleteBitMap is not available.
         updateDeleteBitmap(
             std::dynamic_pointer_cast<RowVector>(deletePositionsOutput_)
                 ->childAt(0),
             baseReadOffset,
             rowNumberUpperBound,
-            deleteBitmap);
+            deleteBitmapBuffer);
       }
     } else {
       // Reaching the end of the file
-      endOfFile_ = true;
       deleteSplit_.reset();
-      return;
+      break;
     }
-  }
+  } while (!readFinishedForBatch(rowNumberUpperBound));
 }
 
-bool PositionalDeleteFileReader::endOfFile() {
-  return endOfFile_;
+bool PositionalDeleteFileReader::noMoreData() {
+  return totalNumRowsScanned_ >= deleteFile_.recordCount &&
+      deletePositionsOutput_ &&
+      deletePositionsOffset_ >= deletePositionsOutput_->size();
 }
 
 void PositionalDeleteFileReader::updateDeleteBitmap(
     VectorPtr deletePositionsVector,
     uint64_t baseReadOffset,
     int64_t rowNumberUpperBound,
-    int8_t* deleteBitmap) {
+    BufferPtr deleteBitmapBuffer) {
+  auto deleteBitmap = deleteBitmapBuffer->asMutable<uint8_t>();
+
   // Convert the positions in file into positions relative to the start of the
   // split.
   const int64_t* deletePositions =
       deletePositionsVector->as<FlatVector<int64_t>>()->rawValues();
-  int64_t offset = baseReadOffset + splitOffset_;
+  int64_t rowNumberLowerBound = baseReadOffset + splitOffset_;
+
+  // If the rowNumberLowerBound is greater than the last position in this delete
+  // rows batch, nothing to delete.
+  if (rowNumberLowerBound >
+      deletePositions[deletePositionsVector->size() - 1]) {
+    return;
+  }
+
+  // Skip the delete positions in deletePositionsVector until they are in the
+  // [rowNumberLowerBound, rowNumberUpperBound) range.
+  while (deletePositionsOffset_ < deletePositionsVector->size() &&
+         deletePositions[deletePositionsOffset_] < rowNumberLowerBound) {
+    deletePositionsOffset_++;
+  }
   while (deletePositionsOffset_ < deletePositionsVector->size() &&
          deletePositions[deletePositionsOffset_] < rowNumberUpperBound) {
     bits::setBit(
-        deleteBitmap, deletePositions[deletePositionsOffset_] - offset);
+        deleteBitmap,
+        deletePositions[deletePositionsOffset_] - rowNumberLowerBound);
     deletePositionsOffset_++;
   }
+
+  deleteBitmapBuffer->setSize(std::max(
+      static_cast<uint64_t>(deleteBitmapBuffer->size()),
+      deletePositionsOffset_ == 0 ||
+              (deletePositionsOffset_ < deletePositionsVector->size() &&
+               deletePositions[deletePositionsOffset_] >= rowNumberUpperBound)
+          ? 0
+          : bits::nbytes(
+                deletePositions[deletePositionsOffset_ - 1] + 1 -
+                rowNumberLowerBound)));
 }
 
 bool PositionalDeleteFileReader::readFinishedForBatch(
@@ -231,9 +269,14 @@ bool PositionalDeleteFileReader::readFinishedForBatch(
   const int64_t* deletePositions =
       deletePositionsVector->as<FlatVector<int64_t>>()->rawValues();
 
-  if (deletePositionsOutput_->size() != 0 &&
-      deletePositionsOffset_ < deletePositionsVector->size() &&
-      deletePositions[deletePositionsOffset_] >= rowNumberUpperBound) {
+  // We've read enough of the delete positions from this delete file when 1) it
+  // reaches the end of the file, or 2) the last read delete position is greater
+  // than the largest base file row number that is going to be read in this
+  // batch
+  if (totalNumRowsScanned_ >= deleteFile_.recordCount ||
+      (deletePositionsVector->size() != 0 &&
+       (deletePositionsOffset_ < deletePositionsVector->size() &&
+        deletePositions[deletePositionsOffset_] >= rowNumberUpperBound))) {
     return true;
   }
   return false;

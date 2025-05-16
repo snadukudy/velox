@@ -33,6 +33,8 @@ using namespace facebook::velox::exec;
 TEST(FilterTest, alwaysFalse) {
   AlwaysFalse alwaysFalse;
   EXPECT_FALSE(alwaysFalse.testInt64(1));
+  EXPECT_FALSE(alwaysFalse.testInt128Range(0, 0, false));
+  EXPECT_FALSE(alwaysFalse.testInt128Range(0, 0, true));
   EXPECT_FALSE(alwaysFalse.testNonNull());
   EXPECT_FALSE(alwaysFalse.testNull());
 
@@ -44,6 +46,8 @@ TEST(FilterTest, alwaysFalse) {
 TEST(FilterTest, alwaysTrue) {
   AlwaysTrue alwaysTrue;
   EXPECT_TRUE(alwaysTrue.testInt64(1));
+  EXPECT_TRUE(alwaysTrue.testInt128Range(0, 0, false));
+  EXPECT_TRUE(alwaysTrue.testInt128Range(0, 0, true));
   EXPECT_TRUE(alwaysTrue.testNonNull());
   EXPECT_TRUE(alwaysTrue.testNull());
   xsimd::batch<int64_t> int64s(1);
@@ -66,6 +70,8 @@ TEST(FilterTest, isNotNull) {
   IsNotNull notNull;
   EXPECT_TRUE(notNull.testNonNull());
   EXPECT_TRUE(notNull.testInt64(10));
+  EXPECT_TRUE(notNull.testInt128Range(0, 0, false));
+  EXPECT_TRUE(notNull.testInt128Range(0, 0, true));
 
   EXPECT_FALSE(notNull.testNull());
 }
@@ -76,6 +82,9 @@ TEST(FilterTest, isNull) {
 
   EXPECT_FALSE(isNull.testNonNull());
   EXPECT_FALSE(isNull.testInt64(10));
+  EXPECT_FALSE(isNull.testInt128(10));
+  EXPECT_FALSE(isNull.testInt128Range(0, 0, false));
+  EXPECT_TRUE(isNull.testInt128Range(0, 0, true));
 
   EXPECT_EQ("Filter(IsNull, deterministic, null allowed)", isNull.toString());
 }
@@ -644,6 +653,8 @@ TEST(FilterTest, doubleRange) {
   EXPECT_FALSE(filter->testNull());
   EXPECT_FALSE(filter->testDouble(1.2));
   EXPECT_FALSE(filter->testDouble(-19.267));
+  EXPECT_TRUE(filter->testDouble(std::nanf("nan1")));
+  EXPECT_TRUE(filter->testDouble(std::nanf("nan2")));
   {
     double n4[] = {-1e100, std::nan("nan"), 1.3, 1e200};
     checkSimd(filter.get(), n4, verify);
@@ -666,6 +677,16 @@ TEST(FilterTest, doubleRange) {
 
   EXPECT_THROW(betweenDouble(NAN, NAN), VeloxRuntimeError)
       << "able to create a DoubleRange with NaN";
+
+  // A filter that has upper value set but really is unbounded.
+  filter = std::make_unique<common::DoubleRange>(
+      3, false, false, 0, true, false, true);
+  EXPECT_TRUE(filter->testDoubleRange(1, 100, false));
+  EXPECT_FALSE(filter->testDoubleRange(0, 1, false));
+  EXPECT_TRUE(filter->testDoubleRange(0, 1, true));
+  EXPECT_FALSE(filter->testDouble(1));
+  EXPECT_TRUE(filter->testDouble(3));
+  EXPECT_TRUE(filter->testDouble(100));
 }
 
 TEST(FilterTest, floatRange) {
@@ -705,9 +726,32 @@ TEST(FilterTest, floatRange) {
     checkSimd(filter.get(), n8, verify);
   }
 
+  filter = greaterThanFloat(1.2);
+  EXPECT_FALSE(filter->testFloat(1.1f));
+
+  EXPECT_FALSE(filter->testNull());
+  EXPECT_FALSE(filter->testFloat(1.2f));
+  EXPECT_TRUE(filter->testFloat(15.632f));
+  EXPECT_TRUE(filter->testFloat(std::nanf("nan1")));
+  EXPECT_TRUE(filter->testFloat(std::nanf("nan2")));
+  {
+    float n8[] = {1.0, std::nanf("nan"), 1.3, 1e20, -1e20, 0, 1.1, 1.2};
+    checkSimd(filter.get(), n8, verify);
+  }
+
   EXPECT_THROW(
       betweenFloat(std::nanf("NAN"), std::nanf("NAN")), VeloxRuntimeError)
       << "able to create a FloatRange with NaN";
+
+  // A filter that has upper value set but really is unbounded.
+  filter = std::make_unique<common::FloatRange>(
+      3, false, false, 0, true, false, true);
+  EXPECT_TRUE(filter->testDoubleRange(1, 100, false));
+  EXPECT_FALSE(filter->testDoubleRange(0, 1, false));
+  EXPECT_TRUE(filter->testDoubleRange(0, 1, true));
+  EXPECT_FALSE(filter->testFloat(1));
+  EXPECT_TRUE(filter->testFloat(3));
+  EXPECT_TRUE(filter->testFloat(100));
 }
 
 TEST(FilterTest, bytesRange) {
@@ -1035,7 +1079,7 @@ TEST(FilterTest, multiRange) {
   EXPECT_TRUE(filter->testDouble(1.3));
 
   EXPECT_FALSE(filter->testNull());
-  EXPECT_FALSE(filter->testDouble(std::nan("nan")));
+  EXPECT_TRUE(filter->testDouble(std::nan("nan")));
   EXPECT_FALSE(filter->testDouble(1.2));
 
   filter = orFilter(lessThanFloat(1.2), greaterThanFloat(1.2));
@@ -1044,7 +1088,7 @@ TEST(FilterTest, multiRange) {
   EXPECT_TRUE(filter->testFloat(1.1f));
   EXPECT_FALSE(filter->testFloat(1.2f));
   EXPECT_TRUE(filter->testFloat(1.3f));
-  EXPECT_FALSE(filter->testFloat(std::nanf("nan")));
+  EXPECT_TRUE(filter->testFloat(std::nanf("nan")));
 
   // != ''
   filter = orFilter(lessThan(""), greaterThan(""));
@@ -1054,51 +1098,39 @@ TEST(FilterTest, multiRange) {
 
 TEST(FilterTest, multiRangeWithNaNs) {
   // x <> 1.2 with nanAllowed true
-  auto filter =
-      orFilter(lessThanFloat(1.2), greaterThanFloat(1.2), false, true);
+  auto filter = orFilter(lessThanFloat(1.2), greaterThanFloat(1.2), false);
   EXPECT_TRUE(filter->testFloat(std::nanf("nan")));
   EXPECT_FALSE(filter->testFloat(1.2f));
   EXPECT_TRUE(filter->testFloat(1.1f));
 
-  filter = orFilter(lessThanDouble(1.2), greaterThanDouble(1.2), false, true);
+  filter = orFilter(lessThanDouble(1.2), greaterThanDouble(1.2), false);
   EXPECT_TRUE(filter->testDouble(std::nan("nan")));
   EXPECT_FALSE(filter->testDouble(1.2));
   EXPECT_TRUE(filter->testDouble(1.1));
 
   // x <> 1.2 with nanAllowed false
   filter = orFilter(lessThanFloat(1.2), greaterThanFloat(1.2));
-  EXPECT_FALSE(filter->testFloat(std::nanf("nan")));
+  EXPECT_TRUE(filter->testFloat(std::nanf("nan")));
   EXPECT_TRUE(filter->testFloat(1.0f));
 
   filter = orFilter(lessThanDouble(1.2), greaterThanDouble(1.2));
-  EXPECT_FALSE(filter->testDouble(std::nan("nan")));
+  EXPECT_TRUE(filter->testDouble(std::nan("nan")));
   EXPECT_TRUE(filter->testDouble(1.4));
 
   // x NOT IN (1.2, 1.3) with nanAllowed true
-  filter = orFilter(lessThanFloat(1.2), greaterThanFloat(1.3), false, true);
+  filter = orFilter(lessThanFloat(1.2), greaterThanFloat(1.3), false);
   EXPECT_TRUE(filter->testFloat(std::nanf("nan")));
   EXPECT_FALSE(filter->testFloat(1.2f));
   EXPECT_FALSE(filter->testFloat(1.3f));
   EXPECT_TRUE(filter->testFloat(1.4f));
   EXPECT_TRUE(filter->testFloat(1.1f));
 
-  filter = orFilter(lessThanDouble(1.2), greaterThanDouble(1.3), false, true);
+  filter = orFilter(lessThanDouble(1.2), greaterThanDouble(1.3), false);
   EXPECT_TRUE(filter->testDouble(std::nan("nan")));
   EXPECT_FALSE(filter->testDouble(1.2));
   EXPECT_FALSE(filter->testDouble(1.3));
   EXPECT_TRUE(filter->testDouble(1.4));
   EXPECT_TRUE(filter->testDouble(1.1));
-
-  // x NOT IN (1.2) with nanAllowed false
-  filter = orFilter(lessThanFloat(1.2), greaterThanFloat(1.2));
-  EXPECT_FALSE(filter->testFloat(std::nanf("nan")));
-  EXPECT_FALSE(filter->testFloat(1.2f));
-  EXPECT_TRUE(filter->testFloat(1.3f));
-
-  filter = orFilter(lessThanDouble(1.2), greaterThanDouble(1.2));
-  EXPECT_FALSE(filter->testDouble(std::nan("nan")));
-  EXPECT_FALSE(filter->testDouble(1.2));
-  EXPECT_TRUE(filter->testDouble(1.3));
 }
 
 TEST(FilterTest, createBigintValues) {
@@ -1736,7 +1768,6 @@ TEST(FilterTest, mergeWithBytesMultiRange) {
 
 TEST(FilterTest, hugeIntRange) {
   auto filter = equalHugeint(HugeInt::build(1, 1), false);
-  auto testInt128 = [&](int128_t x) { return filter->testInt128(x); };
   auto max = DecimalUtil::kLongDecimalMax;
   auto min = DecimalUtil::kLongDecimalMin;
 

@@ -38,6 +38,19 @@ Mathematical Functions
 
         SELECT cosine_similarity(MAP(ARRAY[], ARRAY[]), MAP(ARRAY['a', 'b'], ARRAY[2, 3])); -- NaN
 
+.. function:: cosine_similarity(array(double), array(double)) -> double
+
+    Returns the `cosine similarity <https://en.wikipedia.org/wiki/Cosine_similarity>`_ between the vectors represented as array(double).
+    If any input array is empty, the function returns NaN. If the input arrays have different sizes, the function throws VeloxUserError.
+
+        SELECT cosine_similarity(ARRAY[1], ARRAY[2]); -- 1.0
+
+        SELECT cosine_similarity(ARRAY[1.0, 2.0], ARRAY[NULL, 3.0]); -- NULL
+
+        SELECT cosine_similarity(ARRAY[], ARRAY[2, 3]); -- Throws VeloxUserError
+
+        SELECT cosine_similarity(ARRAY[], ARRAY[]); -- NaN
+
 .. function:: degrees(x) -> double
 
     Converts angle x in radians to degrees.
@@ -192,11 +205,15 @@ Mathematical Functions
    :noindex:
 
     Returns the zero-based bin number of ``x`` according to the bins specified
-    by the array ``bins``. The ``bins`` parameter must be an array of doubles and
-    is assumed to be in sorted ascending order.
+    by the array ``bins``. The ``bins`` parameter must be an array of doubles, should not
+    contain ``null`` or non-finite elements, and is assumed to be in sorted ascending order.
 
     For example, if ``bins`` is ``ARRAY[0, 2, 4]``, then we have four bins:
     ``(-infinity(), 0)``, ``[0, 2)``, ``[2, 4)`` and ``[4, infinity())``.
+
+    Note: The function returns an error if it encounters a ``null`` or non-finite
+    element in ``bins``, but due to the binary search algorithm some such elements
+    might go unnoticed and the function will return a result.
 
 
 ====================================

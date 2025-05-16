@@ -14,7 +14,6 @@
 project(Arrow)
 
 if(VELOX_ENABLE_ARROW)
-  find_package(Thrift)
   if(Thrift_FOUND)
     set(THRIFT_SOURCE "SYSTEM")
   else()
@@ -24,6 +23,7 @@ if(VELOX_ENABLE_ARROW)
   set(ARROW_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/arrow_ep")
   set(ARROW_CMAKE_ARGS
       -DARROW_PARQUET=OFF
+      -DARROW_DEPENDENCY_SOURCE=AUTO
       -DARROW_WITH_THRIFT=ON
       -DARROW_WITH_LZ4=ON
       -DARROW_WITH_SNAPPY=ON
@@ -38,7 +38,10 @@ if(VELOX_ENABLE_ARROW)
       -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
       -DARROW_BUILD_STATIC=ON
       -DThrift_SOURCE=${THRIFT_SOURCE}
-      -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH})
+      -DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+      # Remove with Arrow upgrade to Arrow 20.
+      -DARROW_CXXFLAGS=-Wno-documentation)
   set(ARROW_LIBDIR ${ARROW_PREFIX}/install/${CMAKE_INSTALL_LIBDIR})
 
   add_library(thrift STATIC IMPORTED GLOBAL)
@@ -56,12 +59,12 @@ if(VELOX_ENABLE_ARROW)
 
   set(VELOX_ARROW_BUILD_VERSION 15.0.0)
   set(VELOX_ARROW_BUILD_SHA256_CHECKSUM
-      01dd3f70e85d9b5b933ec92c0db8a4ef504a5105f78d2d8622e84279fb45c25d)
+      ab74c60c46938505c8cd7599b1d2826c68450645d5860d0ff40f67e371a5d0b5)
   set(VELOX_ARROW_SOURCE_URL
-      "https://archive.apache.org/dist/arrow/arrow-${VELOX_ARROW_BUILD_VERSION}/apache-arrow-${VELOX_ARROW_BUILD_VERSION}.tar.gz"
+      "https://github.com/apache/arrow/archive/refs/tags/apache-arrow-${VELOX_ARROW_BUILD_VERSION}.tar.gz"
   )
 
-  resolve_dependency_url(ARROW)
+  velox_resolve_dependency_url(ARROW)
 
   ExternalProject_Add(
     arrow_ep
@@ -70,26 +73,23 @@ if(VELOX_ENABLE_ARROW)
     URL_HASH ${VELOX_ARROW_BUILD_SHA256_CHECKSUM}
     SOURCE_SUBDIR cpp
     CMAKE_ARGS ${ARROW_CMAKE_ARGS}
-    BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow.a ${ARROW_LIBDIR}/libparquet.a
-                     ${ARROW_LIBDIR}/libarrow_testing.a ${THRIFT_LIB})
+    BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow.a
+                     ${ARROW_LIBDIR}/libarrow_testing.a ${THRIFT_LIB}
+    PATCH_COMMAND git apply ${CMAKE_CURRENT_LIST_DIR}/thrift-download.patch)
 
   add_library(arrow STATIC IMPORTED GLOBAL)
   add_library(arrow_testing STATIC IMPORTED GLOBAL)
-  add_library(parquet STATIC IMPORTED GLOBAL)
   add_dependencies(arrow arrow_ep)
   add_dependencies(arrow_testing arrow)
-  add_dependencies(parquet arrow)
   file(MAKE_DIRECTORY ${ARROW_PREFIX}/install/include)
   set_target_properties(
-    arrow arrow_testing parquet PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
-                                           ${ARROW_PREFIX}/install/include)
+    arrow arrow_testing PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                                   ${ARROW_PREFIX}/install/include)
   set_target_properties(arrow PROPERTIES IMPORTED_LOCATION
                                          ${ARROW_LIBDIR}/libarrow.a)
   set_property(TARGET arrow PROPERTY INTERFACE_LINK_LIBRARIES ${RE2} thrift)
   set_target_properties(
     arrow_testing PROPERTIES IMPORTED_LOCATION
                              ${ARROW_LIBDIR}/libarrow_testing.a)
-  set_target_properties(parquet PROPERTIES IMPORTED_LOCATION
-                                           ${ARROW_LIBDIR}/libparquet.a)
 
 endif()

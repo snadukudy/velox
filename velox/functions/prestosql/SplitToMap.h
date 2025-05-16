@@ -41,6 +41,19 @@ struct SplitToMapFunction {
         OnDuplicateKey::kFail);
   }
 
+  // Overloaded call function to handle UnknownValue cases
+  template <typename TEntryDelimiter, typename TKeyValueDelimiter>
+  Status call(
+      out_type<Map<Varchar, Array<Varchar>>>& out,
+      const arg_type<Varchar>& input,
+      const TEntryDelimiter& entryDelimiter,
+      const TKeyValueDelimiter& keyValueDelimiter) {
+    static_assert(
+        std::is_same_v<TEntryDelimiter, arg_type<UnknownValue>> ||
+        std::is_same_v<TKeyValueDelimiter, arg_type<UnknownValue>>);
+    return Status::OK();
+  }
+
   Status call(
       out_type<Map<Varchar, Varchar>>& out,
       const arg_type<Varchar>& input,
@@ -105,7 +118,7 @@ struct SplitToMapFunction {
           onDuplicateKey,
           keyValuePairs));
 
-      pos = nextEntryPos + 1;
+      pos = nextEntryPos + entryDelimiter.size();
       nextEntryPos = input.find(entryDelimiter, pos);
     }
 
@@ -140,12 +153,20 @@ struct SplitToMapFunction {
     VELOX_RETURN_IF(
         delimiterPos == std::string::npos,
         Status::UserError(
-            "Key-value delimiter must appear exactly once in each entry. Bad input: '{}'",
+            "No delimiter found. Key-value delimiter must appear exactly once in each entry. Bad input: '{}'",
+            entry));
+    VELOX_RETURN_IF(
+        entry.find(
+            keyValueDelimiter, delimiterPos + keyValueDelimiter.size()) !=
+            std::string::npos,
+        Status::UserError(
+            "More than one delimiter found. Key-value delimiter must appear exactly once in each entry. Bad input: '{}'",
             entry));
 
     const auto key = std::string_view(entry.data(), delimiterPos);
     const auto value = std::string_view(
-        entry.data() + delimiterPos + 1, entry.size() - delimiterPos - 1);
+        entry.data() + delimiterPos + keyValueDelimiter.size(),
+        entry.size() - delimiterPos - keyValueDelimiter.size());
 
     switch (onDuplicateKey) {
       case OnDuplicateKey::kFail: {

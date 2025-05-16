@@ -15,10 +15,12 @@ if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
 
-add_library(
+velox_add_library(
   velox_memory
   Allocation.cpp
   AllocationPool.cpp
+  ArbitrationOperation.cpp
+  ArbitrationParticipant.cpp
   ByteStream.cpp
   HashStringAllocator.cpp
   MallocAllocator.cpp
@@ -28,12 +30,14 @@ add_library(
   MemoryPool.cpp
   MmapAllocator.cpp
   MmapArena.cpp
+  RawVector.cpp
   SharedArbitrator.cpp
   StreamArena.cpp)
 
-target_link_libraries(
+velox_link_libraries(
   velox_memory
   PUBLIC velox_common_base
+         velox_common_config
          velox_exception
          velox_flag_definitions
          velox_time

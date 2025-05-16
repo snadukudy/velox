@@ -24,9 +24,9 @@
 #include "velox/expression/PeeledEncoding.h"
 #include "velox/expression/PrestoCastHooks.h"
 #include "velox/expression/ScopedVarSetter.h"
-#include "velox/external/date/tz.h"
 #include "velox/functions/lib/RowsTranslationUtil.h"
 #include "velox/type/Type.h"
+#include "velox/type/tz/TimeZoneMap.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/FunctionVector.h"
 #include "velox/vector/SelectivityVector.h"
@@ -95,7 +95,7 @@ Status detail::parseDecimalComponents(
     }
     // Make sure all chars after sign are digits, as as folly::tryTo allows
     // leading and trailing whitespaces.
-    for (auto i = (size_t)withSign; i < size - pos; ++i) {
+    for (auto i = static_cast<size_t>(withSign); i < size - pos; ++i) {
       if (!std::isdigit(s[pos + i])) {
         return Status::UserError(
             "Non-digit character '{}' is not allowed in the exponent part.",
@@ -145,15 +145,17 @@ Status detail::parseHugeInt(
 }
 
 namespace {
-const date::time_zone* getTimeZoneFromConfig(const core::QueryConfig& config) {
+
+const tz::TimeZone* getTimeZoneFromConfig(const core::QueryConfig& config) {
   if (config.adjustTimestampToTimezone()) {
     const auto sessionTzName = config.sessionTimezone();
     if (!sessionTzName.empty()) {
-      return date::locate_zone(sessionTzName);
+      return tz::locateZone(sessionTzName);
     }
   }
   return nullptr;
 }
+
 } // namespace
 
 VectorPtr CastExpr::castFromDate(
@@ -173,7 +175,7 @@ VectorPtr CastExpr::castFromDate(
         try {
           // TODO Optimize to avoid creating an intermediate string.
           auto output = DATE()->toString(inputFlatVector->valueAt(row));
-          auto writer = exec::StringWriter<>(resultFlatVector, row);
+          auto writer = exec::StringWriter(resultFlatVector, row);
           writer.resize(output.size());
           ::memcpy(writer.data(), output.data(), output.size());
           writer.finalize();
@@ -296,7 +298,7 @@ VectorPtr CastExpr::castFromIntervalDayTime(
           // TODO Optimize to avoid creating an intermediate string.
           auto output =
               INTERVAL_DAY_TIME()->valueToString(inputFlatVector->valueAt(row));
-          auto writer = exec::StringWriter<>(resultFlatVector, row);
+          auto writer = exec::StringWriter(resultFlatVector, row);
           writer.resize(output.size());
           ::memcpy(writer.data(), output.data(), output.size());
           writer.finalize();
@@ -380,7 +382,7 @@ VectorPtr CastExpr::applyMap(
 
   // Cast keys
   VectorPtr newMapKeys;
-  if (fromType.keyType() == toType.keyType()) {
+  if (*fromType.keyType() == *toType.keyType()) {
     newMapKeys = input->mapKeys();
   } else {
     {
@@ -397,7 +399,7 @@ VectorPtr CastExpr::applyMap(
 
   // Cast values
   VectorPtr newMapValues;
-  if (fromType.valueType() == toType.valueType()) {
+  if (*fromType.valueType() == *toType.valueType()) {
     newMapValues = mapValues;
   } else {
     {
@@ -580,7 +582,7 @@ VectorPtr CastExpr::applyRow(
       outputChild->addNulls(rows);
     } else {
       const auto& inputChild = input->children()[fromChildrenIndex];
-      if (toChildType == inputChild->type()) {
+      if (*toChildType == *inputChild->type()) {
         outputChild = inputChild;
       } else {
         // Apply cast for the child.
@@ -716,7 +718,7 @@ void CastExpr::applyPeeled(
 
     auto applyCustomCast = [&]() {
       if (castToOperator) {
-        castToOperator->castTo(input, context, rows, toType, result);
+        castToOperator->castTo(input, context, rows, toType, result, hooks_);
       } else {
         castFromOperator->castFrom(input, context, rows, toType, result);
       }

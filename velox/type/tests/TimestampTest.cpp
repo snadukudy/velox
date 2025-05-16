@@ -18,8 +18,9 @@
 #include <random>
 
 #include "velox/common/base/tests/GTestUtils.h"
-#include "velox/external/date/tz.h"
+#include "velox/common/testutil/RandomSeed.h"
 #include "velox/type/Timestamp.h"
+#include "velox/type/tz/TimeZoneMap.h"
 
 namespace facebook::velox {
 namespace {
@@ -34,6 +35,30 @@ std::string timestampToString(
   const auto view = Timestamp::tsToStringView(ts, options, result.data());
   result.resize(view.size());
   return result;
+}
+
+TEST(TimestampTest, fromDaysAndNanos) {
+  EXPECT_EQ(
+      Timestamp(Timestamp::kSecondsInDay + 2, 1),
+      Timestamp::fromDaysAndNanos(
+          Timestamp::kJulianToUnixEpochDays + 1,
+          2 * Timestamp::kNanosInSecond + 1));
+  EXPECT_EQ(
+      Timestamp(Timestamp::kSecondsInDay + 2, 0),
+      Timestamp::fromDaysAndNanos(
+          Timestamp::kJulianToUnixEpochDays + 1,
+          2 * Timestamp::kNanosInSecond));
+  EXPECT_EQ(
+      Timestamp(
+          Timestamp::kSecondsInDay * 5 - 3, Timestamp::kNanosInSecond - 6),
+      Timestamp::fromDaysAndNanos(
+          Timestamp::kJulianToUnixEpochDays + 5,
+          -2 * Timestamp::kNanosInSecond - 6));
+  EXPECT_EQ(
+      Timestamp(Timestamp::kSecondsInDay * 5 - 2, 0),
+      Timestamp::fromDaysAndNanos(
+          Timestamp::kJulianToUnixEpochDays + 5,
+          -2 * Timestamp::kNanosInSecond));
 }
 
 TEST(TimestampTest, fromMillisAndMicros) {
@@ -130,6 +155,8 @@ TEST(TimestampTest, arithmeticOverflow) {
           0));
   ASSERT_NO_THROW(Timestamp::minMillis().toMillis());
   ASSERT_NO_THROW(Timestamp::maxMillis().toMillis());
+  ASSERT_NO_THROW(Timestamp(-9223372036855, 224'192'000).toMicros());
+  ASSERT_NO_THROW(Timestamp(9223372036854, 775'807'000).toMicros());
 }
 
 TEST(TimestampTest, toAppend) {
@@ -235,16 +262,6 @@ TEST(TimestampTest, toStringPrestoCastBehavior) {
 
 namespace {
 
-uint64_t randomSeed() {
-  if (const char* env = getenv("VELOX_TEST_USE_RANDOM_SEED")) {
-    auto seed = std::random_device{}();
-    LOG(INFO) << "Random seed: " << seed;
-    return seed;
-  } else {
-    return 42;
-  }
-}
-
 std::string toStringAlt(
     const Timestamp& t,
     TimestampToStringOptions::Precision precision) {
@@ -284,7 +301,7 @@ bool checkUtcToEpoch(int year, int mon, int mday, int hour, int min, int sec) {
 } // namespace
 
 TEST(TimestampTest, compareWithToStringAlt) {
-  std::default_random_engine gen(randomSeed());
+  std::default_random_engine gen(common::testutil::getRandomSeed(42));
   std::uniform_int_distribution<int64_t> distSec(
       Timestamp::kMinSeconds, Timestamp::kMaxSeconds);
   std::uniform_int_distribution<uint64_t> distNano(0, Timestamp::kMaxNanos);
@@ -325,7 +342,7 @@ TEST(TimestampTest, utcToEpoch) {
 }
 
 TEST(TimestampTest, utcToEpochRandomInputs) {
-  std::default_random_engine gen(randomSeed());
+  std::default_random_engine gen(common::testutil::getRandomSeed(42));
   std::uniform_int_distribution<int32_t> dist(INT32_MIN, INT32_MAX);
   for (int i = 0; i < 10'000; ++i) {
     checkUtcToEpoch(
@@ -365,43 +382,18 @@ TEST(TimestampTest, decreaseOperator) {
   VELOX_ASSERT_THROW(--kMin, "Timestamp nanos out of range");
 }
 
-TEST(TimestampTest, outOfRange) {
-  // There are two ranges for timezone conversion.
-  //
-  // #1. external/date cannot handle years larger than 32k (date::year::max()).
-  // Any conversions exceeding that threshold will fail right away.
-  auto* timezone = date::locate_zone("GMT");
-  Timestamp t1(-3217830796800, 0);
-
-  VELOX_ASSERT_THROW(
-      t1.toTimePoint(), "Timestamp is outside of supported range");
-  VELOX_ASSERT_THROW(
-      t1.toTimezone(*timezone), "Timestamp is outside of supported range");
-
-  // #2. external/date doesn't understand OS_TZDB repetition rules. Therefore,
-  // for timezones with pre-defined repetition rules for daylight savings, for
-  // example, it will throw for anything larger than 2037 (which is what is
-  // currently materialized in OS_TZDBs). America/Los_Angeles is an example of
-  // such timezone.
-  timezone = date::locate_zone("America/Los_Angeles");
-  Timestamp t2(32517359891, 0);
-  VELOX_ASSERT_THROW(
-      t2.toTimezone(*timezone),
-      "Unable to convert timezone 'America/Los_Angeles' past");
-}
-
 // In debug mode, Timestamp constructor will throw exception if range check
 // fails.
 #ifdef NDEBUG
 TEST(TimestampTest, overflow) {
   Timestamp t(std::numeric_limits<int64_t>::max(), 0);
   VELOX_ASSERT_THROW(
-      t.toTimePoint(false),
+      t.toTimePointMs(false),
       fmt::format(
           "Could not convert Timestamp({}, {}) to milliseconds",
           std::numeric_limits<int64_t>::max(),
           0));
-  ASSERT_NO_THROW(t.toTimePoint(true));
+  ASSERT_NO_THROW(t.toTimePointMs(true));
 }
 #endif
 

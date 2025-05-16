@@ -23,14 +23,19 @@
 #include <string>
 
 #include "arrow/util/checked_cast.h"
-#include "arrow/util/logging.h"
+
+#include "velox/common/base/Exceptions.h"
 #include "velox/dwio/parquet/writer/arrow/Exception.h"
 #include "velox/dwio/parquet/writer/arrow/Types.h"
-#include "velox/dwio/parquet/writer/arrow/generated/parquet_types.h"
 
 using arrow::internal::checked_cast;
 
 namespace facebook::velox::parquet::arrow {
+
+fmt::underlying_t<LogicalType::TimeUnit::unit> format_as(
+    LogicalType::TimeUnit::unit unit) {
+  return fmt::underlying(unit);
+}
 
 bool IsCodecSupported(Compression::type codec) {
   switch (codec) {
@@ -400,7 +405,7 @@ std::shared_ptr<const LogicalType> LogicalType::FromConvertedType(
 }
 
 std::shared_ptr<const LogicalType> LogicalType::FromThrift(
-    const format::LogicalType& type) {
+    const facebook::velox::parquet::thrift::LogicalType& type) {
   if (type.__isset.STRING) {
     return StringLogicalType::Make();
   } else if (type.__isset.MAP) {
@@ -487,7 +492,7 @@ std::shared_ptr<const LogicalType> LogicalType::Date() {
 std::shared_ptr<const LogicalType> LogicalType::Time(
     bool is_adjusted_to_utc,
     LogicalType::TimeUnit::unit time_unit) {
-  DCHECK(time_unit != LogicalType::TimeUnit::UNKNOWN);
+  VELOX_DCHECK_NE(time_unit, LogicalType::TimeUnit::UNKNOWN);
   return TimeLogicalType::Make(is_adjusted_to_utc, time_unit);
 }
 
@@ -496,7 +501,7 @@ std::shared_ptr<const LogicalType> LogicalType::Timestamp(
     LogicalType::TimeUnit::unit time_unit,
     bool is_from_converted_type,
     bool force_set_converted_type) {
-  DCHECK(time_unit != LogicalType::TimeUnit::UNKNOWN);
+  VELOX_DCHECK_NE(time_unit, LogicalType::TimeUnit::UNKNOWN);
   return TimestampLogicalType::Make(
       is_adjusted_to_utc,
       time_unit,
@@ -511,7 +516,7 @@ std::shared_ptr<const LogicalType> LogicalType::Interval() {
 std::shared_ptr<const LogicalType> LogicalType::Int(
     int bit_width,
     bool is_signed) {
-  DCHECK(
+  VELOX_DCHECK(
       bit_width == 64 || bit_width == 32 || bit_width == 16 || bit_width == 8);
   return IntLogicalType::Make(bit_width, is_signed);
 }
@@ -579,7 +584,7 @@ class LogicalType::Impl {
     return json.str();
   }
 
-  virtual format::LogicalType ToThrift() const {
+  virtual facebook::velox::parquet::thrift::LogicalType ToThrift() const {
     // logical types inheriting this method should never be serialized
     std::stringstream ss;
     ss << "Logical type " << ToString() << " should not be serialized";
@@ -670,7 +675,7 @@ std::string LogicalType::ToJSON() const {
   return impl_->ToJSON();
 }
 
-format::LogicalType LogicalType::ToThrift() const {
+facebook::velox::parquet::thrift::LogicalType LogicalType::ToThrift() const {
   return impl_->ToThrift();
 }
 
@@ -894,12 +899,12 @@ class LogicalType::Impl::Inapplicable : public virtual LogicalType::Impl {
     return #n___;                         \
   }
 
-#define OVERRIDE_TOTHRIFT(t___, s___)             \
-  format::LogicalType ToThrift() const override { \
-    format::LogicalType type;                     \
-    format::t___ subtype;                         \
-    type.__set_##s___(subtype);                   \
-    return type;                                  \
+#define OVERRIDE_TOTHRIFT(t___, s___)                                       \
+  facebook::velox::parquet::thrift::LogicalType ToThrift() const override { \
+    facebook::velox::parquet::thrift::LogicalType type;                     \
+    facebook::velox::parquet::thrift::t___ subtype;                         \
+    type.__set_##s___(subtype);                                             \
+    return type;                                                            \
   }
 
 class LogicalType::Impl::String final
@@ -1009,7 +1014,7 @@ class LogicalType::Impl::Decimal final : public LogicalType::Impl::Compatible,
       schema::DecimalMetadata* out_decimal_metadata) const override;
   std::string ToString() const override;
   std::string ToJSON() const override;
-  format::LogicalType ToThrift() const override;
+  facebook::velox::parquet::thrift::LogicalType ToThrift() const override;
   bool Equals(const LogicalType& other) const override;
 
   int32_t precision() const {
@@ -1089,9 +1094,10 @@ std::string LogicalType::Impl::Decimal::ToJSON() const {
   return json.str();
 }
 
-format::LogicalType LogicalType::Impl::Decimal::ToThrift() const {
-  format::LogicalType type;
-  format::DecimalType decimal_type;
+facebook::velox::parquet::thrift::LogicalType
+LogicalType::Impl::Decimal::ToThrift() const {
+  facebook::velox::parquet::thrift::LogicalType type;
+  facebook::velox::parquet::thrift::DecimalType decimal_type;
   decimal_type.__set_precision(precision_);
   decimal_type.__set_scale(scale_);
   type.__set_DECIMAL(decimal_type);
@@ -1175,7 +1181,7 @@ class LogicalType::Impl::Time final : public LogicalType::Impl::Compatible,
       schema::DecimalMetadata* out_decimal_metadata) const override;
   std::string ToString() const override;
   std::string ToJSON() const override;
-  format::LogicalType ToThrift() const override;
+  facebook::velox::parquet::thrift::LogicalType ToThrift() const override;
   bool Equals(const LogicalType& other) const override;
 
   bool is_adjusted_to_utc() const {
@@ -1247,19 +1253,20 @@ std::string LogicalType::Impl::Time::ToJSON() const {
   return json.str();
 }
 
-format::LogicalType LogicalType::Impl::Time::ToThrift() const {
-  format::LogicalType type;
-  format::TimeType time_type;
-  format::TimeUnit time_unit;
-  DCHECK(unit_ != LogicalType::TimeUnit::UNKNOWN);
+facebook::velox::parquet::thrift::LogicalType
+LogicalType::Impl::Time::ToThrift() const {
+  facebook::velox::parquet::thrift::LogicalType type;
+  facebook::velox::parquet::thrift::TimeType time_type;
+  facebook::velox::parquet::thrift::TimeUnit time_unit;
+  VELOX_DCHECK_NE(unit_, LogicalType::TimeUnit::UNKNOWN);
   if (unit_ == LogicalType::TimeUnit::MILLIS) {
-    format::MilliSeconds millis;
+    facebook::velox::parquet::thrift::MilliSeconds millis;
     time_unit.__set_MILLIS(millis);
   } else if (unit_ == LogicalType::TimeUnit::MICROS) {
-    format::MicroSeconds micros;
+    facebook::velox::parquet::thrift::MicroSeconds micros;
     time_unit.__set_MICROS(micros);
   } else if (unit_ == LogicalType::TimeUnit::NANOS) {
-    format::NanoSeconds nanos;
+    facebook::velox::parquet::thrift::NanoSeconds nanos;
     time_unit.__set_NANOS(nanos);
   }
   time_type.__set_isAdjustedToUTC(adjusted_);
@@ -1318,7 +1325,7 @@ class LogicalType::Impl::Timestamp final
       schema::DecimalMetadata* out_decimal_metadata) const override;
   std::string ToString() const override;
   std::string ToJSON() const override;
-  format::LogicalType ToThrift() const override;
+  facebook::velox::parquet::thrift::LogicalType ToThrift() const override;
   bool Equals(const LogicalType& other) const override;
 
   bool is_adjusted_to_utc() const {
@@ -1414,19 +1421,20 @@ std::string LogicalType::Impl::Timestamp::ToJSON() const {
   return json.str();
 }
 
-format::LogicalType LogicalType::Impl::Timestamp::ToThrift() const {
-  format::LogicalType type;
-  format::TimestampType timestamp_type;
-  format::TimeUnit time_unit;
-  DCHECK(unit_ != LogicalType::TimeUnit::UNKNOWN);
+facebook::velox::parquet::thrift::LogicalType
+LogicalType::Impl::Timestamp::ToThrift() const {
+  facebook::velox::parquet::thrift::LogicalType type;
+  facebook::velox::parquet::thrift::TimestampType timestamp_type;
+  facebook::velox::parquet::thrift::TimeUnit time_unit;
+  VELOX_DCHECK_NE(unit_, LogicalType::TimeUnit::UNKNOWN);
   if (unit_ == LogicalType::TimeUnit::MILLIS) {
-    format::MilliSeconds millis;
+    facebook::velox::parquet::thrift::MilliSeconds millis;
     time_unit.__set_MILLIS(millis);
   } else if (unit_ == LogicalType::TimeUnit::MICROS) {
-    format::MicroSeconds micros;
+    facebook::velox::parquet::thrift::MicroSeconds micros;
     time_unit.__set_MICROS(micros);
   } else if (unit_ == LogicalType::TimeUnit::NANOS) {
-    format::NanoSeconds nanos;
+    facebook::velox::parquet::thrift::NanoSeconds nanos;
     time_unit.__set_NANOS(nanos);
   }
   timestamp_type.__set_isAdjustedToUTC(adjusted_);
@@ -1525,7 +1533,7 @@ class LogicalType::Impl::Int final : public LogicalType::Impl::Compatible,
       schema::DecimalMetadata* out_decimal_metadata) const override;
   std::string ToString() const override;
   std::string ToJSON() const override;
-  format::LogicalType ToThrift() const override;
+  facebook::velox::parquet::thrift::LogicalType ToThrift() const override;
   bool Equals(const LogicalType& other) const override;
 
   int bit_width() const {
@@ -1622,10 +1630,11 @@ std::string LogicalType::Impl::Int::ToJSON() const {
   return json.str();
 }
 
-format::LogicalType LogicalType::Impl::Int::ToThrift() const {
-  format::LogicalType type;
-  format::IntType int_type;
-  DCHECK(width_ == 64 || width_ == 32 || width_ == 16 || width_ == 8);
+facebook::velox::parquet::thrift::LogicalType LogicalType::Impl::Int::ToThrift()
+    const {
+  facebook::velox::parquet::thrift::LogicalType type;
+  facebook::velox::parquet::thrift::IntType int_type;
+  VELOX_DCHECK(width_ == 64 || width_ == 32 || width_ == 16 || width_ == 8);
   int_type.__set_bitWidth(static_cast<int8_t>(width_));
   int_type.__set_isSigned(signed_);
   type.__set_INTEGER(int_type);

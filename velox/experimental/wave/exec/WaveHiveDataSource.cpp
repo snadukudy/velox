@@ -60,6 +60,7 @@ void WaveHiveDataSource::setFromDataSource(
   split_ = std::move(source->split_);
   if (source->splitReader_ && source->splitReader_->emptySplit()) {
     runtimeStats_.skippedSplits += source->runtimeStats_.skippedSplits;
+    runtimeStats_.processedSplits += source->runtimeStats_.processedSplits;
     runtimeStats_.skippedSplitBytes += source->runtimeStats_.skippedSplitBytes;
     return;
   }
@@ -112,10 +113,6 @@ void WaveHiveDataSource::schedule(WaveStream& stream, int32_t maxRows) {
   stream.setSplitReader(splitReader_);
 }
 
-vector_size_t WaveHiveDataSource::outputSize(WaveStream& stream) const {
-  return splitReader_->outputSize(stream);
-}
-
 bool WaveHiveDataSource::isFinished() {
   if (!splitReader_) {
     return false;
@@ -160,7 +157,8 @@ void WaveHiveDataSource::registerConnector() {
     return;
   }
   registered = true;
-  auto config = std::make_shared<const core::MemConfig>();
+  auto config = std::make_shared<const config::ConfigBase>(
+      std::unordered_map<std::string, std::string>());
 
   // Create hive connector with config...
   auto hiveConnector =

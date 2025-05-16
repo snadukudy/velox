@@ -37,7 +37,7 @@ using namespace facebook::velox::exec::test;
 class ParquetTpchTest : public testing::Test {
  protected:
   static void SetUpTestSuite() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
 
     duckDb_ = std::make_shared<DuckDbQueryRunner>();
     tempDirectory_ = TempDirectoryPath::create();
@@ -49,22 +49,31 @@ class ParquetTpchTest : public testing::Test {
 
     parse::registerTypeResolver();
     filesystems::registerLocalFileSystem();
+    dwio::common::registerFileSinks();
 
     parquet::registerParquetReaderFactory();
     parquet::registerParquetWriterFactory();
 
+    connector::registerConnectorFactory(
+        std::make_shared<connector::hive::HiveConnectorFactory>());
     auto hiveConnector =
         connector::getConnectorFactory(
             connector::hive::HiveConnectorFactory::kHiveConnectorName)
             ->newConnector(
-                kHiveConnectorId, std::make_shared<core::MemConfig>());
+                kHiveConnectorId,
+                std::make_shared<config::ConfigBase>(
+                    std::unordered_map<std::string, std::string>()));
     connector::registerConnector(hiveConnector);
 
+    connector::registerConnectorFactory(
+        std::make_shared<connector::tpch::TpchConnectorFactory>());
     auto tpchConnector =
         connector::getConnectorFactory(
             connector::tpch::TpchConnectorFactory::kTpchConnectorName)
             ->newConnector(
-                kTpchConnectorId, std::make_shared<core::MemConfig>());
+                kTpchConnectorId,
+                std::make_shared<config::ConfigBase>(
+                    std::unordered_map<std::string, std::string>()));
     connector::registerConnector(tpchConnector);
 
     saveTpchTablesAsParquet();
@@ -72,6 +81,10 @@ class ParquetTpchTest : public testing::Test {
   }
 
   static void TearDownTestSuite() {
+    connector::unregisterConnectorFactory(
+        connector::hive::HiveConnectorFactory::kHiveConnectorName);
+    connector::unregisterConnectorFactory(
+        connector::tpch::TpchConnectorFactory::kTpchConnectorName);
     connector::unregisterConnector(kHiveConnectorId);
     connector::unregisterConnector(kTpchConnectorId);
     parquet::unregisterParquetReaderFactory();
@@ -94,7 +107,7 @@ class ParquetTpchTest : public testing::Test {
                       .planNode();
       auto split =
           exec::Split(std::make_shared<connector::tpch::TpchConnectorSplit>(
-              kTpchConnectorId, 1, 0));
+              kTpchConnectorId, /*cacheable=*/true, 1, 0));
 
       auto rows =
           AssertQueryBuilder(plan).splits({split}).copyResults(pool.get());
@@ -121,23 +134,24 @@ class ParquetTpchTest : public testing::Test {
       const TpchPlan& tpchPlan,
       const std::string& duckQuery,
       const std::optional<std::vector<uint32_t>>& sortingKeys) const {
-    bool noMoreSplits = false;
     constexpr int kNumSplits = 10;
     constexpr int kNumDrivers = 4;
-    auto addSplits = [&](Task* task) {
-      if (!noMoreSplits) {
-        for (const auto& entry : tpchPlan.dataFiles) {
-          for (const auto& path : entry.second) {
-            auto const splits = HiveConnectorTestBase::makeHiveConnectorSplits(
-                path, kNumSplits, tpchPlan.dataFileFormat);
-            for (const auto& split : splits) {
-              task->addSplit(entry.first, Split(split));
-            }
-          }
-          task->noMoreSplits(entry.first);
-        }
+    auto addSplits = [&](TaskCursor* taskCursor) {
+      if (taskCursor->noMoreSplits()) {
+        return;
       }
-      noMoreSplits = true;
+      auto& task = taskCursor->task();
+      for (const auto& entry : tpchPlan.dataFiles) {
+        for (const auto& path : entry.second) {
+          auto const splits = HiveConnectorTestBase::makeHiveConnectorSplits(
+              path, kNumSplits, tpchPlan.dataFileFormat);
+          for (const auto& split : splits) {
+            task->addSplit(entry.first, Split(split));
+          }
+        }
+        task->noMoreSplits(entry.first);
+      }
+      taskCursor->setNoMoreSplits();
     };
     CursorParameters params;
     params.maxDrivers = kNumDrivers;
@@ -169,6 +183,11 @@ TEST_F(ParquetTpchTest, Q2) {
 TEST_F(ParquetTpchTest, Q3) {
   std::vector<uint32_t> sortingKeys{1, 2};
   assertQuery(3, std::move(sortingKeys));
+}
+
+TEST_F(ParquetTpchTest, Q4) {
+  std::vector<uint32_t> sortingKeys{0};
+  assertQuery(4, std::move(sortingKeys));
 }
 
 TEST_F(ParquetTpchTest, Q5) {

@@ -24,14 +24,15 @@ if(${VELOX_PROTOBUF_BUILD_VERSION} LESS 22.0)
       "v${VELOX_PROTOBUF_BUILD_VERSION}/protobuf-all-${VELOX_PROTOBUF_BUILD_VERSION}.tar.gz"
   )
 else()
-  set_source(absl)
-  resolve_dependency(absl CONFIG REQUIRED)
-  string(CONCAT VELOX_PROTOBUF_SOURCE_URL
-                "https://github.com/protocolbuffers/protobuf/archive/"
-                "v${VELOX_PROTOBUF_BUILD_VERSION}.tar.gz")
+  velox_set_source(absl)
+  velox_resolve_dependency(absl CONFIG REQUIRED)
+  string(
+    CONCAT VELOX_PROTOBUF_SOURCE_URL
+           "https://github.com/protocolbuffers/protobuf/archive/"
+           "v${VELOX_PROTOBUF_BUILD_VERSION}.tar.gz")
 endif()
 
-resolve_dependency_url(PROTOBUF)
+velox_resolve_dependency_url(PROTOBUF)
 
 message(STATUS "Building Protobuf from source")
 
@@ -42,8 +43,6 @@ FetchContent_Declare(
   OVERRIDE_FIND_PACKAGE EXCLUDE_FROM_ALL SYSTEM)
 
 set(protobuf_BUILD_TESTS OFF)
-set(protobuf_ABSL_PROVIDER
-    "package"
-    CACHE STRING "Provider of absl library")
+set(protobuf_ABSL_PROVIDER "package")
 FetchContent_MakeAvailable(protobuf)
 set(Protobuf_INCLUDE_DIRS ${protobuf_SOURCE_DIR}/src)

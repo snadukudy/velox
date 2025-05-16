@@ -47,4 +47,16 @@ void simdjsonErrorsToExceptions(
 simdjson::simdjson_result<simdjson::ondemand::document> simdjsonParse(
     const simdjson::padded_string_view& json);
 
+/// Returns a simdjson::padded_string_view object from the input
+/// std::string_view object to avoid creating a new copy of the
+/// std::string_view. NOTE: The user MUST ensure that the input 'json' already
+/// has simdjson::SIMDJSON_PADDING at the end.
+simdjson::padded_string_view reusePaddedStringView(
+    const std::string_view& json);
+
+/// Parse the input json string using a thread local on demand parser. Allow
+/// incomplete json input.
+simdjson::simdjson_result<simdjson::ondemand::document> simdjsonParseIncomplete(
+    const simdjson::padded_string_view& json);
+
 } // namespace facebook::velox

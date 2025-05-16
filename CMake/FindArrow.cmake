@@ -12,34 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+include(FindPackageHandleStandardArgs)
+
 find_library(ARROW_LIB libarrow.a)
-find_library(PARQUET_LIB libparquet.a)
 find_library(ARROW_TESTING_LIB libarrow_testing.a)
-if("${ARROW_LIB}" STREQUAL "ARROW_LIB-NOTFOUND"
-   OR "${ARROW_TESTING_LIB}" STREQUAL "ARROW_TESTING_LIB-NOTFOUND")
-  set(Arrow_FOUND false)
-  return()
-endif()
-find_package(Thrift)
-if(NOT Thrift_FOUND)
-  # Requires building arrow from source with thrift bundled.
-  set(Arrow_FOUND false)
-  return()
-endif()
-add_library(thrift ALIAS thrift::thrift)
-
-set(Arrow_FOUND true)
-
-add_library(arrow STATIC IMPORTED GLOBAL)
-add_library(parquet STATIC IMPORTED GLOBAL)
-add_library(arrow_testing STATIC IMPORTED GLOBAL)
-
 find_path(ARROW_INCLUDE_PATH arrow/api.h)
-set_target_properties(
-  arrow arrow_testing parquet PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
-                                         ${ARROW_INCLUDE_PATH})
-set_target_properties(arrow PROPERTIES IMPORTED_LOCATION ${ARROW_LIB}
-                                       INTERFACE_LINK_LIBRARIES thrift)
-set_target_properties(parquet PROPERTIES IMPORTED_LOCATION ${PARQUET_LIB})
-set_target_properties(arrow_testing PROPERTIES IMPORTED_LOCATION
-                                               ${ARROW_TESTING_LIB})
+find_package(Thrift)
+
+find_package_handle_standard_args(
+  Arrow
+  DEFAULT_MSG
+  ARROW_LIB
+  ARROW_TESTING_LIB
+  ARROW_INCLUDE_PATH
+  Thrift_FOUND)
+
+# Only add the libraries once.
+if(Arrow_FOUND AND NOT TARGET arrow)
+  add_library(arrow STATIC IMPORTED GLOBAL)
+  add_library(arrow_testing STATIC IMPORTED GLOBAL)
+  add_library(thrift ALIAS thrift::thrift)
+
+  set_target_properties(
+    arrow arrow_testing PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                                   ${ARROW_INCLUDE_PATH})
+  set_target_properties(arrow PROPERTIES IMPORTED_LOCATION ${ARROW_LIB}
+                                         INTERFACE_LINK_LIBRARIES thrift)
+  set_target_properties(arrow_testing PROPERTIES IMPORTED_LOCATION
+                                                 ${ARROW_TESTING_LIB})
+endif()

@@ -218,7 +218,7 @@ FlatMapColumnReader<T>::FlatMapColumnReader(
     ColumnReaderFactory& factory)
     : ColumnReader(fileType, stripe, streamLabels, std::move(flatMapContext)),
       requestedType_{requestedType},
-      returnFlatVector_{stripe.getRowReaderOptions().getReturnFlatVector()},
+      returnFlatVector_{stripe.rowReaderOptions().returnFlatVector()},
       executor_{executor} {
   DWIO_ENSURE_EQ(fileType_->id(), fileType->id());
 
@@ -377,8 +377,8 @@ void FlatMapColumnReader<T>::next(
     return;
   }
 
-  size_t startIndices[nodeBatches.size()];
-  size_t nodeIndices[nodeBatches.size()];
+  std::vector<size_t> startIndices(nodeBatches.size());
+  std::vector<size_t> nodeIndices(nodeBatches.size());
 
   auto& mapValueType = requestedType_->type()->asMap().valueType();
   if (totalChildren > 0) {
@@ -605,7 +605,7 @@ std::vector<std::unique_ptr<KeyNode<T>>> getKeyNodesForStructEncoding(
       factory);
 
   const auto& mapColumnIdAsStruct =
-      stripe.getRowReaderOptions().getMapColumnIdAsStruct();
+      stripe.rowReaderOptions().mapColumnIdAsStruct();
   auto it = mapColumnIdAsStruct.find(requestedType->id());
   DWIO_ENSURE(it != mapColumnIdAsStruct.end());
 
@@ -629,7 +629,7 @@ FlatMapStructEncodingColumnReader<T>::FlatMapStructEncodingColumnReader(
           std::move(flatMapContext)),
       requestedType_{requestedType},
       keyNodes_{getKeyNodesForStructEncoding<T>(
-          requestedType,
+          requestedType_,
           fileType,
           stripe,
           streamLabels,
@@ -644,7 +644,14 @@ FlatMapStructEncodingColumnReader<T>::FlatMapStructEncodingColumnReader(
           executor_,
           0,
           keyNodes_.size(),
-          decodingParallelismFactor} {
+          decodingParallelismFactor},
+      actualType_{ROW(
+          std::vector<std::string>{
+              stripe.rowReaderOptions().mapColumnIdAsStruct().at(
+                  requestedType_->id())},
+          std::vector<std::shared_ptr<const Type>>(
+              keyNodes_.size(),
+              requestedType_->type()->asMap().valueType()))} {
   DWIO_ENSURE_EQ(fileType_->id(), fileType->id());
   DWIO_ENSURE(!keyNodes_.empty()); // "For struct encoding, keys to project
                                    // must be configured.";
@@ -753,9 +760,7 @@ void FlatMapStructEncodingColumnReader<T>::next(
   } else {
     result = std::make_shared<RowVector>(
         &memoryPool_,
-        ROW(std::vector<std::string>(keyNodes_.size()),
-            std::vector<std::shared_ptr<const Type>>(
-                keyNodes_.size(), requestedType_->type()->asMap().valueType())),
+        actualType_,
         nulls,
         numValues,
         std::move(children),
@@ -766,7 +771,7 @@ void FlatMapStructEncodingColumnReader<T>::next(
 inline bool isRequiringStructEncoding(
     const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
     const dwio::common::RowReaderOptions& rowOptions) {
-  return rowOptions.getMapColumnIdAsStruct().count(requestedType->id()) > 0;
+  return rowOptions.mapColumnIdAsStruct().count(requestedType->id()) > 0;
 }
 
 template <typename T>
@@ -779,7 +784,7 @@ std::unique_ptr<ColumnReader> createFlatMapColumnReader(
     size_t decodingParallelismFactor,
     FlatMapContext flatMapContext,
     ColumnReaderFactory& factory) {
-  if (isRequiringStructEncoding(requestedType, stripe.getRowReaderOptions())) {
+  if (isRequiringStructEncoding(requestedType, stripe.rowReaderOptions())) {
     return std::make_unique<FlatMapStructEncodingColumnReader<T>>(
         requestedType,
         fileType,

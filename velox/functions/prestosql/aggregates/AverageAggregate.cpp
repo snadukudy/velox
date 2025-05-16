@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/functions/prestosql/aggregates/AverageAggregate.h"
 #include "velox/functions/lib/aggregates/AverageAggregateBase.h"
 #include "velox/functions/prestosql/aggregates/AggregateNames.h"
 
@@ -42,6 +43,15 @@ void registerAverageAggregate(
                              .argumentType(inputType)
                              .build());
   }
+
+  // Interval input type in Presto has special case and returns INTERVAL, not
+  // DOUBLE.
+  signatures.push_back(exec::AggregateFunctionSignatureBuilder()
+                           .returnType("interval day to second")
+                           .intermediateType("row(double,bigint)")
+                           .argumentType("interval day to second")
+                           .build());
+
   // Real input type in Presto has special case and returns REAL, not DOUBLE.
   signatures.push_back(exec::AggregateFunctionSignatureBuilder()
                            .returnType("real")
@@ -82,6 +92,10 @@ void registerAverageAggregate(
               if (inputType->isShortDecimal()) {
                 return std::make_unique<DecimalAverageAggregateBase<int64_t>>(
                     resultType);
+              }
+              if (inputType->isIntervalDayTime()) {
+                return std::make_unique<
+                    AverageAggregateBase<int64_t, double, int64_t>>(resultType);
               }
               return std::make_unique<
                   AverageAggregateBase<int64_t, double, double>>(resultType);
@@ -142,7 +156,7 @@ void registerAverageAggregate(
           }
         }
       },
-      {false /*orderSensitive*/},
+      {false /*orderSensitive*/, false /*companionFunction*/},
       withCompanionFunctions,
       overwrite);
 }

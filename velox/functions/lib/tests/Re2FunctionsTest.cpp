@@ -24,6 +24,7 @@
 
 #include "velox/common/base/VeloxException.h"
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/testutil/OptionalEmpty.h"
 #include "velox/functions/prestosql/tests/utils/FunctionBaseTest.h"
 #include "velox/parse/TypeResolver.h"
 #include "velox/type/StringView.h"
@@ -44,6 +45,13 @@ std::shared_ptr<exec::VectorFunction> makeRegexExtract(
   return makeRe2Extract(name, inputArgs, config, /*emptyNoMatch=*/false);
 }
 
+std::shared_ptr<exec::VectorFunction> makeRegexExtractEmptyNoMatch(
+    const std::string& name,
+    const std::vector<exec::VectorFunctionArg>& inputArgs,
+    const core::QueryConfig& config) {
+  return makeRe2Extract(name, inputArgs, config, /*emptyNoMatch=*/true);
+}
+
 class Re2FunctionsTest : public test::FunctionBaseTest {
  public:
   static void SetUpTestCase() {
@@ -54,6 +62,10 @@ class Re2FunctionsTest : public test::FunctionBaseTest {
         "re2_search", re2SearchSignatures(), makeRe2Search);
     exec::registerStatefulVectorFunction(
         "re2_extract", re2ExtractSignatures(), makeRegexExtract);
+    exec::registerStatefulVectorFunction(
+        "re2_extract_empty_no_match",
+        re2ExtractSignatures(),
+        makeRegexExtractEmptyNoMatch);
     exec::registerStatefulVectorFunction(
         "re2_extract_all", re2ExtractAllSignatures(), makeRe2ExtractAll);
     exec::registerStatefulVectorFunction("like", likeSignatures(), makeLike);
@@ -369,6 +381,9 @@ void testRe2Extract(F&& regexExtract) {
   EXPECT_EQ(regexExtract(std::nullopt, "\\d+", 0), std::nullopt);
   EXPECT_EQ(regexExtract(" 123 ", std::nullopt, 0), std::nullopt);
   EXPECT_EQ(regexExtract(" 123 ", "\\d+", std::nullopt), std::nullopt);
+  // Group case that mismatch.
+  EXPECT_EQ(
+      regexExtract("rat cat\nbat dog", "ra(.)|blah(.)(.)", 2), std::nullopt);
 }
 
 TEST_F(Re2FunctionsTest, regexExtract) {
@@ -377,6 +392,21 @@ TEST_F(Re2FunctionsTest, regexExtract) {
                      std::optional<int> group) {
     return evaluateOnce<std::string>(
         "re2_extract(c0, c1, c2)", str, pattern, group);
+  });
+}
+
+template <typename F>
+void testRe2ExtractEmptyNoMatch(F&& regexExtract) {
+  // Group case that mismatch.
+  EXPECT_EQ(regexExtract("rat cat\nbat dog", "ra(.)|blah(.)(.)", 2), "");
+}
+
+TEST_F(Re2FunctionsTest, regexExtractEmptyNoMatch) {
+  testRe2ExtractEmptyNoMatch([&](std::optional<std::string> str,
+                                 std::optional<std::string> pattern,
+                                 std::optional<int> group) {
+    return evaluateOnce<std::string>(
+        "re2_extract_empty_no_match(c0, c1, c2)", str, pattern, group);
   });
 }
 
@@ -460,6 +490,9 @@ TEST_F(Re2FunctionsTest, likePattern) {
       false);
 
   testLike("abc", "MEDIUM POLISHED%", false);
+
+  testLike("aabbccddeeff", "%aa%bb%", true);
+  testLike("aaccddeeff", "%aa%bb%", false);
 }
 
 TEST_F(Re2FunctionsTest, likeDeterminePatternKind) {
@@ -936,6 +969,7 @@ TEST_F(Re2FunctionsTest, likePatternAndEscape) {
   testLike("a%c", "%#%%", '#', true);
   testLike("%cd", "%#%%", '#', true);
   testLike("cde", "%#%%", '#', false);
+  testLike("///__", "%//%/%", '/', false);
 
   testLike(
       "abcd",
@@ -974,9 +1008,9 @@ void Re2FunctionsTest::testRe2ExtractAll(
     const std::vector<std::optional<std::string>>& patterns,
     const std::vector<std::optional<T>>& groupIds,
     const std::vector<std::optional<std::vector<std::string>>>& output) {
-  std::string constantPattern = "";
-  std::string constantGroupId = "";
-  std::string expression = "";
+  std::string constantPattern;
+  std::string constantGroupId;
+  std::string expression;
 
   auto result = [&] {
     auto input = makeFlatVector<StringView>(
@@ -1096,6 +1130,20 @@ TEST_F(Re2FunctionsTest, regexExtractAllConstantPatternConstantGroupId) {
   testRe2ExtractAll(inputs, constantPattern, bigGroupIds, expectedOutputs);
 }
 
+TEST_F(Re2FunctionsTest, regexExtractAllMismatchedGroup) {
+  auto sourceVector =
+      makeFlatVector<std::string>({"rat cat\nbat dog"}, VARCHAR());
+  auto patternVector =
+      makeFlatVector<std::string>({"ra(.)|blah(.)(.)"}, VARCHAR());
+  auto groupIdVector = makeFlatVector<int>(std::vector{2}, INTEGER());
+  auto expectedVector = makeNullableArrayVector<std::string>(
+      std::vector<std::vector<std::optional<std::string>>>{{std::nullopt}});
+  auto result = evaluate(
+      "regexp_extract_all(c0, c1, c2)",
+      makeRowVector({sourceVector, patternVector, groupIdVector}));
+  assertEqualVectors(expectedVector, result);
+}
+
 TEST_F(Re2FunctionsTest, regexExtractAllConstantPatternVariableGroupId) {
   const std::vector<std::optional<std::string>> inputs = {
       "  123a   2b   14m  ",
@@ -1176,19 +1224,25 @@ TEST_F(Re2FunctionsTest, regexExtractAllNoMatch) {
   const std::vector<std::optional<int32_t>> noGroupId = {};
   const std::vector<std::optional<int32_t>> groupIds0 = {0};
 
-  testRe2ExtractAll({""}, {"[0-9]+"}, noGroupId, {{{}}});
-  testRe2ExtractAll({"(╯°□°)╯︵ ┻━┻"}, {"[0-9]+"}, noGroupId, {{{}}});
-  testRe2ExtractAll({"abcde"}, {"[0-9]+"}, groupIds0, {{{}}});
+  testRe2ExtractAll(
+      {""}, {"[0-9]+"}, noGroupId, {common::testutil::optionalEmpty});
+  testRe2ExtractAll(
+      {"(╯°□°)╯︵ ┻━┻"},
+      {"[0-9]+"},
+      noGroupId,
+      {common::testutil::optionalEmpty});
+  testRe2ExtractAll(
+      {"abcde"}, {"[0-9]+"}, groupIds0, {common::testutil::optionalEmpty});
   testRe2ExtractAll(
       {"rYBKVn6DnfSI2an4is4jbvf4btGpV"},
       {"81jnp58n31BtMdlUsP1hiF4QWSYv411"},
       noGroupId,
-      {{{}}});
+      {common::testutil::optionalEmpty});
   testRe2ExtractAll(
       {"rYBKVn6DnfSI2an4is4jbvf4btGpV"},
       {"81jnp58n31BtMdlUsP1hiF4QWSYv411"},
       groupIds0,
-      {{{}}});
+      {common::testutil::optionalEmpty});
 
   // Test empty pattern.
   testRe2ExtractAll<int32_t>(
@@ -1308,15 +1362,18 @@ TEST_F(Re2FunctionsTest, tryException) {
   }
 }
 
-// Make sure we do not compile more than kMaxCompiledRegexes.
+// Make sure we do not compile more than "expression.max_compiled_regexes".
 TEST_F(Re2FunctionsTest, likeRegexLimit) {
-  int count = 26;
-  VectorPtr pattern = makeFlatVector<StringView>(count);
-  VectorPtr input = makeFlatVector<StringView>(count);
+  const auto maxCompiledRegexes =
+      core::QueryConfig({}).exprMaxCompiledRegexes();
+  const auto aboveMaxCompiledRegexes = maxCompiledRegexes + 5;
+
+  VectorPtr pattern = makeFlatVector<StringView>(aboveMaxCompiledRegexes);
+  VectorPtr input = makeFlatVector<StringView>(aboveMaxCompiledRegexes);
   VectorPtr result;
 
   auto flatInput = input->asFlatVector<StringView>();
-  for (int i = 0; i < count; i++) {
+  for (auto i = 0; i < aboveMaxCompiledRegexes; i++) {
     flatInput->set(i, "");
   }
 
@@ -1342,19 +1399,21 @@ TEST_F(Re2FunctionsTest, likeRegexLimit) {
   };
 
   auto verifyNoRegexCompilationForPattern = [&](PatternKind patternKind) {
-    // Over 20 all optimized, will pass.
-    for (int i = 0; i < count; i++) {
+    // Over maxCompiledRegexes all optimized, will pass.
+    for (auto i = 0; i < aboveMaxCompiledRegexes; i++) {
       std::string patternAtIdx = getPatternAtIdx(patternKind, i);
       flatPattern->set(i, StringView(patternAtIdx));
     }
     result = evaluate("like(c0 , c1)", makeRowVector({input, pattern}));
     // Pattern '%%%', of type kAtleastN, matches with empty input.
     assertEqualVectors(
-        makeConstant((patternKind == PatternKind::kAtLeastN), count), result);
+        makeConstant(
+            (patternKind == PatternKind::kAtLeastN), aboveMaxCompiledRegexes),
+        result);
   };
 
   // Infer regex compilation does not happen for optimized patterns by verifying
-  // less than kMaxCompiledRegexes are compiled for each optimized pattern type.
+  // less than maxCompiledRegexes are compiled for each optimized pattern type.
   verifyNoRegexCompilationForPattern(PatternKind::kExactlyN);
   verifyNoRegexCompilationForPattern(PatternKind::kAtLeastN);
   verifyNoRegexCompilationForPattern(PatternKind::kFixed);
@@ -1362,8 +1421,8 @@ TEST_F(Re2FunctionsTest, likeRegexLimit) {
   verifyNoRegexCompilationForPattern(PatternKind::kSuffix);
   verifyNoRegexCompilationForPattern(PatternKind::kSubstring);
 
-  // Over 20, all require regex, will fail.
-  for (int i = 0; i < 26; i++) {
+  // Over maxCompiledRegexes, all require regex, will fail.
+  for (auto i = 0; i < aboveMaxCompiledRegexes; i++) {
     std::string localPattern =
         fmt::format("b%[0-9]+.*{}.*{}.*[0-9]+", 'c' + i, 'c' + i);
     flatPattern->set(i, StringView(localPattern));
@@ -1373,21 +1432,21 @@ TEST_F(Re2FunctionsTest, likeRegexLimit) {
       evaluate("like(c0, c1)", makeRowVector({input, pattern})),
       "Max number of regex reached");
 
-  // First 20 rows should return false, the rest raise and error and become
-  // null.
+  // First maxCompiledRegexes rows should return false, the rest raise and error
+  // and become null.
   result = evaluate("try(like(c0, c1))", makeRowVector({input, pattern}));
   auto expected = makeFlatVector<bool>(
-      26,
+      aboveMaxCompiledRegexes,
       [](auto /*row*/) { return false; },
-      [](auto row) { return row >= 20; });
+      [&](auto row) { return row >= maxCompiledRegexes; });
   assertEqualVectors(expected, result);
 
   // All are complex but the same, should pass.
-  for (int i = 0; i < 26; i++) {
+  for (auto i = 0; i < aboveMaxCompiledRegexes; i++) {
     flatPattern->set(i, "b%[0-9]+.*{}.*{}.*[0-9]+");
   }
   result = evaluate("like(c0, c1)", makeRowVector({input, pattern}));
-  assertEqualVectors(makeConstant(false, 26), result);
+  assertEqualVectors(makeConstant(false, aboveMaxCompiledRegexes), result);
 }
 
 TEST_F(Re2FunctionsTest, invalidEscapeChar) {
@@ -1431,19 +1490,24 @@ TEST_F(Re2FunctionsTest, regexExtractAllLarge) {
       "No group 4611686018427387904 in regex '(\\d+)([a-z]+)")
 }
 
-// Make sure we do not compile more than kMaxCompiledRegexes.
+// Make sure we do not compile more than "expression.max_compiled_regexes".
 TEST_F(Re2FunctionsTest, limit) {
+  const auto maxCompiledRegexes =
+      core::QueryConfig({}).exprMaxCompiledRegexes();
+  const auto aboveMaxCompiledRegexes = maxCompiledRegexes + 5;
+
   auto data = makeRowVector({
       makeFlatVector<std::string>(
-          100,
+          aboveMaxCompiledRegexes,
           [](auto row) { return fmt::format("Apples and oranges {}", row); }),
       makeFlatVector<std::string>(
-          100,
+          aboveMaxCompiledRegexes,
           [](auto row) { return fmt::format("Apples (.*) oranges {}", row); }),
       makeFlatVector<std::string>(
-          100,
-          [](auto row) {
-            return fmt::format("Apples (.*) oranges {}", row % 20);
+          aboveMaxCompiledRegexes,
+          [&](auto row) {
+            return fmt::format(
+                "Apples (.*) oranges {}", row % maxCompiledRegexes);
           }),
   });
 
@@ -1500,5 +1564,27 @@ TEST_F(Re2FunctionsTest, split) {
   assertEqualVectors(expected, result);
 }
 
+TEST_F(Re2FunctionsTest, parseSubstrings) {
+  auto test = [&](const std::string& input,
+                  const std::vector<std::string>& expected) {
+    ASSERT_EQ(PatternMetadata::parseSubstrings(input), expected);
+  };
+  // Cases that not supported by substrings-search.
+  // Note: we always return LikeGeneric for escape-case, see makeLike().
+  test("%%", {});
+  // Not supports prefix.
+  test("aa%bb%%", {});
+  // Not supports sufix.
+  test("%aa%bb", {});
+  // Not supports '_'.
+  test("%aa_%", {});
+  // Not supports '#'.
+  test("%aa#%", {});
+
+  // Cases that supported by substrings-search.
+  test("%aa%", {"aa"});
+  test("%aa%bb%%", {"aa", "bb"});
+  test("%aa%bb%%%cc%", {"aa", "bb", "cc"});
+}
 } // namespace
 } // namespace facebook::velox::functions

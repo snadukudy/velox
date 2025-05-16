@@ -17,13 +17,14 @@
 #include "velox/vector/tests/VectorTestUtils.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
+using namespace facebook;
 using namespace facebook::velox;
 
 class VectorPrepareForReuseTest : public testing::Test,
-                                  public test::VectorTestBase {
+                                  public velox::test::VectorTestBase {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   VectorPrepareForReuseTest() = default;

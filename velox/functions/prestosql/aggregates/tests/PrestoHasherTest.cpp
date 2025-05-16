@@ -16,7 +16,9 @@
 
 #include <gtest/gtest.h>
 
+#include "velox/common/testutil/OptionalEmpty.h"
 #include "velox/functions/prestosql/aggregates/PrestoHasher.h"
+#include "velox/functions/prestosql/types/IPAddressType.h"
 #include "velox/functions/prestosql/types/TimestampWithTimeZoneType.h"
 #include "velox/type/tz/TimeZoneMap.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
@@ -29,7 +31,7 @@ class PrestoHasherTest : public testing::Test,
                          public facebook::velox::test::VectorTestBase {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   template <typename T>
@@ -292,7 +294,7 @@ TEST_F(PrestoHasherTest, arrays) {
        {{10, 11}},
        {{12, std::nullopt}},
        std::nullopt,
-       {{}}});
+       common::testutil::optionalEmpty});
 
   assertHash(
       baseArrayVector,
@@ -319,7 +321,7 @@ TEST_F(PrestoHasherTest, arrays) {
       {{std::nullopt}},
       {{1, 2, 3}},
       {{1024, std::nullopt, -99, -999}},
-      {{}},
+      common::testutil::optionalEmpty,
       {{std::nullopt, -1}},
   });
 
@@ -406,7 +408,7 @@ TEST_F(PrestoHasherTest, timestampWithTimezone) {
           if (timestampWithTimeZone.has_value()) {
             auto timestamp = timestampWithTimeZone.value().first;
             auto tz = timestampWithTimeZone.value().second;
-            const int16_t tzid = util::getTimeZoneID(tz);
+            const int16_t tzid = tz::getTimeZoneID(tz);
             auto timestampWithTimezone = pack(timestamp, tzid);
             timestampWithTimeZoneVector.push_back(timestampWithTimezone);
             bits::clearNull(rawNulls, i);
@@ -430,4 +432,22 @@ TEST_F(PrestoHasherTest, timestampWithTimezone) {
       {-3461822077982309083, -3461822077982309083, -8497890125589769483, 0});
 }
 
+TEST_F(PrestoHasherTest, ipAddress) {
+  auto makeIpAdressFromString = [](const std::string& ipAddr) -> int128_t {
+    auto ret = ipaddress::tryGetIPv6asInt128FromString(ipAddr);
+    return ret.value();
+  };
+
+  auto ipAddresses = makeNullableFlatVector(
+      std::vector<std::optional<int128_t>>{
+          makeIpAdressFromString("2001:db8::ff00:42:8329"),
+          makeIpAdressFromString("192.168.1.1"),
+          makeIpAdressFromString("::ffff:1.2.3.4"),
+          std::nullopt},
+      IPADDRESS());
+
+  assertHash(
+      ipAddresses,
+      {-4694347089639306204, 2704428192845283049, -1632332718929005309, 0});
+}
 } // namespace facebook::velox::aggregate::test

@@ -36,11 +36,39 @@ class LocalExchangeMemoryManager {
   /// caller to fulfill.
   std::vector<ContinuePromise> decreaseMemoryUsage(int64_t removed);
 
+  /// Returns the maximum buffer size in bytes.
+  int64_t maxBufferBytes() const {
+    return maxBufferSize_;
+  }
+
+  /// Returns the current buffer size in bytes.
+  int64_t bufferedBytes() const {
+    return bufferedBytes_;
+  }
+
  private:
   const int64_t maxBufferSize_;
   std::mutex mutex_;
-  int64_t bufferedBytes_{0};
+  tsan_atomic<int64_t> bufferedBytes_{0};
   std::vector<ContinuePromise> promises_;
+};
+
+/// A vector pool to reuse the RowVector and DictionaryVectors.  Only
+/// exclusively owned vectors will be reused.
+class LocalExchangeVectorPool {
+ public:
+  explicit LocalExchangeVectorPool(int64_t capacity) : capacity_(capacity) {}
+
+  /// `size' is the estimated size of the `vector' (e.g. taking shared
+  /// dictionary into consideration).
+  void push(const RowVectorPtr& vector, int64_t size);
+
+  RowVectorPtr pop();
+
+ private:
+  const int64_t capacity_;
+  int64_t totalSize_{0};
+  folly::Synchronized<std::queue<std::pair<RowVectorPtr, int64_t>>> pool_;
 };
 
 /// Buffers data for a single partition produced by local exchange. Allows
@@ -53,8 +81,11 @@ class LocalExchangeQueue {
  public:
   LocalExchangeQueue(
       std::shared_ptr<LocalExchangeMemoryManager> memoryManager,
+      std::shared_ptr<LocalExchangeVectorPool> vectorPool,
       int partition)
-      : memoryManager_{std::move(memoryManager)}, partition_{partition} {}
+      : memoryManager_{std::move(memoryManager)},
+        vectorPool_{std::move(vectorPool)},
+        partition_{partition} {}
 
   std::string toString() const {
     return fmt::format("LocalExchangeQueue({})", partition_);
@@ -70,6 +101,10 @@ class LocalExchangeQueue {
   BlockingReason
   enqueue(RowVectorPtr input, int64_t inputBytes, ContinueFuture* future);
 
+  /// Called by a producer to indicate the producer pipeline has been drained
+  /// under barrier processing.
+  void drain();
+
   /// Called by a producer to indicate that no more data will be added.
   void noMoreData();
 
@@ -80,8 +115,13 @@ class LocalExchangeQueue {
   /// once there is data to fetch or if all producers report completion.
   ///
   /// @param pool Memory pool used to copy the data before returning.
-  BlockingReason
-  next(ContinueFuture* future, memory::MemoryPool* pool, RowVectorPtr* data);
+  /// @param drained Set to true if all the producers of this queue have been
+  /// drained under barrier processing.
+  BlockingReason next(
+      ContinueFuture* future,
+      memory::MemoryPool* pool,
+      RowVectorPtr* data,
+      bool& drained);
 
   bool isFinished();
 
@@ -89,13 +129,26 @@ class LocalExchangeQueue {
   /// called before all the data has been processed. No-op otherwise.
   void close();
 
+  /// Get a reusable vector from the vector pool.  Return nullptr if none is
+  /// available.
+  RowVectorPtr getVector() {
+    return vectorPool_->pop();
+  }
+
+  /// Returns true if all producers have sent no more data signal.
+  bool testingProducersDone() const;
+
  private:
   using Queue = std::queue<std::pair<RowVectorPtr, int64_t>>;
 
   bool isFinishedLocked(const Queue& queue) const;
 
-  std::shared_ptr<LocalExchangeMemoryManager> memoryManager_;
+  bool testAndClearDrainedLocked();
+
+  const std::shared_ptr<LocalExchangeMemoryManager> memoryManager_;
+  const std::shared_ptr<LocalExchangeVectorPool> vectorPool_;
   const int partition_;
+
   folly::Synchronized<Queue> queue_;
   // Satisfied when data becomes available or all producers report that they
   // finished producing, e.g. queue_ is not empty or noMoreProducers_ is true
@@ -103,6 +156,11 @@ class LocalExchangeQueue {
   std::vector<ContinuePromise> consumerPromises_;
   int pendingProducers_{0};
   bool noMoreProducers_{false};
+  // The number of drained producers when the task is under barrier processing.
+  // If it equals to 'pendingProducers_', then the queue is drained. The
+  // consumer receives the drained signal on the next call to 'next', and
+  // 'drainedProducers_' is reset to zero.
+  int drainedProducers_{0};
   bool closed_{false};
 };
 
@@ -121,6 +179,10 @@ class LocalExchange : public SourceOperator {
     return fmt::format("LocalExchange({})", partition_);
   }
 
+  bool startDrain() override {
+    return false;
+  }
+
   BlockingReason isBlocked(ContinueFuture* future) override;
 
   RowVectorPtr getOutput() override;
@@ -129,12 +191,7 @@ class LocalExchange : public SourceOperator {
 
   /// Close exchange queue. If called before all data has been processed,
   /// notifies the producer that no more data is needed.
-  void close() override {
-    Operator::close();
-    if (queue_) {
-      queue_->close();
-    }
-  }
+  void close() override;
 
  private:
   const int partition_;
@@ -150,7 +207,8 @@ class LocalPartition : public Operator {
   LocalPartition(
       int32_t operatorId,
       DriverCtx* ctx,
-      const std::shared_ptr<const core::LocalPartitionNode>& planNode);
+      const std::shared_ptr<const core::LocalPartitionNode>& planNode,
+      bool eagerFlush);
 
   std::string toString() const override {
     return fmt::format("LocalPartition({})", numPartitions_);
@@ -158,13 +216,16 @@ class LocalPartition : public Operator {
 
   void addInput(RowVectorPtr input) override;
 
-  RowVectorPtr getOutput() override {
-    return nullptr;
+  RowVectorPtr getOutput() override;
+
+  /// Always true but the caller will check isBlocked before adding input, hence
+  /// the blocked state does not accumulate input.
+  bool needsInput() const override {
+    return true;
   }
 
-  // Always true but the caller will check isBlocked before adding input, hence
-  // the blocked state does not accumulate input.
-  bool needsInput() const override {
+  bool startDrain() override {
+    VELOX_CHECK(isDraining());
     return true;
   }
 
@@ -174,7 +235,18 @@ class LocalPartition : public Operator {
 
   bool isFinished() override;
 
- private:
+ protected:
+  void prepareForInput(RowVectorPtr& input);
+
+  void allocateIndexBuffers(const std::vector<vector_size_t>& sizes);
+
+  RowVectorPtr processPartition(
+      const RowVectorPtr& input,
+      vector_size_t size,
+      int partition,
+      const BufferPtr& indices,
+      const vector_size_t* rawIndices);
+
   const std::vector<std::shared_ptr<LocalExchangeQueue>> queues_;
   const size_t numPartitions_;
   std::unique_ptr<core::PartitionFunction> partitionFunction_;
@@ -184,6 +256,26 @@ class LocalPartition : public Operator {
 
   /// Reusable memory for hash calculation.
   std::vector<uint32_t> partitions_;
+  /// Reusable buffers for input partitioning.
+  std::vector<BufferPtr> indexBuffers_;
+  std::vector<vector_size_t*> rawIndices_;
+
+ private:
+  RowVectorPtr wrapChildren(
+      const RowVectorPtr& input,
+      vector_size_t size,
+      const BufferPtr& indices,
+      RowVectorPtr reusable);
+
+  void copy(
+      const RowVectorPtr& input,
+      const folly::Range<const BaseVector::CopyRange*>& ranges,
+      VectorPtr& target);
+
+  const uint64_t singlePartitionBufferSize_;
+  std::vector<BaseVector::CopyRange> copyRanges_;
+  std::vector<VectorPtr> partitionBuffers_;
+  const bool partitionBufferPreserveEncoding_;
 };
 
 } // namespace facebook::velox::exec

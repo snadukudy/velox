@@ -21,7 +21,6 @@ target_link_libraries(
   velox_functions_json_test
   velox_functions_json
   Folly::folly
-  gtest
-  gtest_main
-  gflags::gflags
+  GTest::gtest
+  GTest::gtest_main
   glog::glog)

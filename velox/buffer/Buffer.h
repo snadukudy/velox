@@ -29,7 +29,10 @@
 namespace facebook {
 namespace velox {
 
+class Buffer;
 class AlignedBuffer;
+
+using BufferPtr = boost::intrusive_ptr<Buffer>;
 
 // Represents vector payloads, like arrays of numbers or strings or
 // associated null flags. Buffers are reference counted and must be
@@ -172,6 +175,30 @@ class Buffer {
     return os;
   }
 
+  /// Slice a buffer with specific type T.
+  /// For boolean type and if the 'offset' is not multiple of 8, return a
+  /// shifted copy, new buffer is allocated from 'pool'.
+  /// Otherwise return a BufferView into the original buffer (with shared
+  /// ownership of original buffer).
+  ///
+  /// @param buffer A pointer to the buffer to be sliced. Must not be null.
+  /// @param offset The element position in the buffer where the slice begins.
+  /// Must be less or equal than the buffer size.
+  /// @param length The number of elements to include in the slice. Must be
+  /// less or equal than the buffer size - 'offset'.
+  /// @param pool A pointer to a memory pool for allocating new buffers,
+  /// required if a new buffer needs to be created.
+  template <typename T>
+  static BufferPtr slice(
+      const BufferPtr& buffer,
+      size_t offset,
+      size_t length,
+      memory::MemoryPool* pool) {
+    VELOX_CHECK_NOT_NULL(buffer, "Buffer must not be null.");
+    return sliceBufferZeroCopy(
+        sizeof(T), is_pod_like_v<T>, buffer, offset, length);
+  }
+
  protected:
   // Writes a magic word at 'capacity_'. No-op for a BufferView. The actual
   // logic is inside a separate virtual function, allowing override by derived
@@ -246,6 +273,14 @@ class Buffer {
   uint64_t padding_[2] = {static_cast<uint64_t>(-1), static_cast<uint64_t>(-1)};
   // Needs to use setCapacity() from static method reallocate().
   friend class AlignedBuffer;
+
+ private:
+  static BufferPtr sliceBufferZeroCopy(
+      size_t typeSize,
+      bool podType,
+      const BufferPtr& buffer,
+      size_t offset,
+      size_t length);
 };
 
 static_assert(
@@ -262,7 +297,12 @@ inline MutableRange<bool> Buffer::asMutableRange<bool>() {
   return MutableRange<bool>(asMutable<uint64_t>(), 0, size() * 8);
 }
 
-using BufferPtr = boost::intrusive_ptr<Buffer>;
+template <>
+BufferPtr Buffer::slice<bool>(
+    const BufferPtr& buffer,
+    size_t offset,
+    size_t length,
+    memory::MemoryPool* pool);
 
 static inline void intrusive_ptr_add_ref(Buffer* buffer) {
   buffer->addRef();
@@ -312,10 +352,20 @@ class AlignedBuffer : public Buffer {
   static BufferPtr allocate(
       size_t numElements,
       velox::memory::MemoryPool* pool,
-      const std::optional<T>& initValue = std::nullopt) {
+      const std::optional<T>& initValue = std::nullopt,
+      bool allocateExact = false) {
     size_t size = checkedMultiply(numElements, sizeof(T));
-    size_t preferredSize =
-        pool->preferredSize(checkedPlus<size_t>(size, kPaddedSize));
+    size_t preferredSize = 0;
+    if (allocateExact) {
+      const size_t tSize = (size / kSizeofAlignedBuffer) * kSizeofAlignedBuffer;
+
+      preferredSize =
+          checkedPlus<size_t>(tSize, kSizeofAlignedBuffer + kPaddedSize);
+    } else {
+      preferredSize =
+          pool->preferredSize(checkedPlus<size_t>(size, kPaddedSize));
+    }
+
     void* memory = pool->allocate(preferredSize);
     auto* buffer = new (memory) ImplClass<T>(pool, preferredSize - kPaddedSize);
     // set size explicitly instead of setSize because `fillNewMemory` already
@@ -354,7 +404,7 @@ class AlignedBuffer : public Buffer {
       return;
     }
     velox::memory::MemoryPool* pool = old->pool();
-    if (!is_pod_like_v<T>) {
+    if constexpr (!is_pod_like_v<T>) {
       // We always take this code path for non-POD types because
       // pool->reallocate below would move memory around without calling move
       // constructor.
@@ -501,11 +551,13 @@ template <>
 inline BufferPtr AlignedBuffer::allocate<bool>(
     size_t numElements,
     velox::memory::MemoryPool* pool,
-    const std::optional<bool>& initValue) {
+    const std::optional<bool>& initValue,
+    bool allocateExact) {
   return allocate<char>(
       bits::nbytes(numElements),
       pool,
-      initValue ? std::optional<char>(*initValue ? -1 : 0) : std::nullopt);
+      initValue ? std::optional<char>(*initValue ? -1 : 0) : std::nullopt,
+      allocateExact);
 }
 
 template <>

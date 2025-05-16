@@ -72,6 +72,14 @@ Task Execution
      - The distribution of driver execution time in range of [0, 30s] with
        30 buckets. It is configured to report the latency at P50, P90, P99,
        and P100 percentiles.
+   * - task_batch_process_time_ms
+     - Average
+     - Tracks the averaged task batch processing time. This only applies for
+       sequential task execution mode.
+   * - task_barrier_process_time_ms
+     - Histogram
+     - Tracks task barrier execution time in range of [0, 30s] with 30 buckets
+       and each bucket with time window of 1s. We report P50, P90, P99, and P100.
 
 Memory Management
 -----------------
@@ -92,17 +100,29 @@ Memory Management
      - The distribution of cache shrink latency in range of [0, 100s] with 10
        buckets. It is configured to report the latency at P50, P90, P99, and
        P100 percentiles.
-   * - memory_reclaim_count
+   * - op_memory_reclaim_count
      - Count
      - The count of operator memory reclaims.
-   * - memory_reclaim_exec_ms
+   * - op_memory_reclaim_time_ms
      - Histogram
-     - The distribution of memory reclaim execution time in range of [0, 600s]
+     - The distribution of operator memory reclaim execution time in range of
+       [0, 600s] with 20 buckets. It is configured to report latency at P50, P90,
+       P99, and P100 percentiles.
+   * - op_memory_reclaim_bytes
+     - Histogram
+     - The distribution of operator reclaimed bytes in range of [0, 4GB] with 64 buckets
+       and reports P50, P90, P99, and P100.
+   * - query_memory_reclaim_count
+     - Count
+     - The count of query memory reclaims.
+   * - query_memory_reclaim_time_ms
+     - Histogram
+     - The distribution of query memory reclaim execution time in range of [0, 600s]
        with 20 buckets. It is configured to report latency at P50, P90, P99, and
        P100 percentiles.
-   * - memory_reclaim_bytes
+   * - query_memory_reclaim_bytes
      - Histogram
-     - The distribution of reclaimed bytes in range of [0, 4GB] with 64 buckets
+     - The distribution of query reclaimed bytes in range of [0, 4GB] with 64 buckets
        and reports P50, P90, P99, and P100.
    * - task_memory_reclaim_count
      - Count
@@ -120,6 +140,9 @@ Memory Management
    * - task_memory_reclaim_wait_timeout_count
      - Count
      - The number of times that the task memory reclaim wait timeouts.
+   * - task_splits_count
+     - Count
+     - The total number of splits received by all tasks.
    * - memory_non_reclaimable_count
      - Count
      - The number of times that the memory reclaim fails because the operator is executing a
@@ -144,9 +167,14 @@ Memory Management
        initiate the memory arbitration request. This indicates the velox runtime doesn't have
        enough memory to run all the queries at their peak memory usage. We have to trigger
        spilling to let them run through completion.
-   * - arbitrator_slow_global_arbitration_count
+   * - arbitrator_global_arbitration_num_reclaim_victims
+     - Histogram
+     - The distribution of the number of query memory pools selected to reclaim memory by one
+       global memory arbitration round in range of [0, 32] with 32 buckets. It is configured to
+       report latency at P50, P90, P99, and P100 percentiles.
+   * - arbitrator_global_arbitration_failed_victim_count
      - Count
-     - The number of global arbitration that reclaims used memory by slow disk spilling.
+     - The number of victim query memory pool having nothing to spill.
    * - arbitrator_aborted_count
      - Count
      - The number of times a query level memory pool is aborted as a result of
@@ -159,18 +187,24 @@ Memory Management
        its request, the arbitration request would surpass the maximum allowed
        capacity for the requester, or the arbitration process couldn't release
        the requested amount of memory.
-   * - arbitrator_wait_time_ms
+   * - arbitrator_global_arbitration_time_ms
      - Histogram
-     - The distribution of the amount of time an arbitration request stays in
-       arbitration queues and waits the arbitration r/w locks in range of [0, 600s]
-       with 20 buckets. It is configured to report the latency at P50, P90, P99,
-       and P100 percentiles.
-   * - arbitrator_arbitration_time_ms
+     - The time distribution of a global arbitration run [0, 600s] with 20 buckets.
+       It is configured to report the latency at P50, P90, P99, and P100 percentiles.
+   * - arbitrator_global_arbitration_wait_count
+     - Count
+     - The number of times that an arbitration operation wait for global
+       arbitration to free up memory.
+   * - arbitrator_global_arbitration_wait_time_ms
+     - Histogram
+     - The time distribution of a global arbitration wait [0, 300s] with 20
+       buckets. It is configured to report the latency at P50, P90, P99, and P100
+       percentiles.
+   * - arbitrator_op_exec_time_ms
      - Histogram
      - The distribution of the amount of time it take to complete a single
-       arbitration request stays queued in range of [0, 600s] with 20
-       buckets. It is configured to report the latency at P50, P90, P99,
-       and P100 percentiles.
+       arbitration operation in range of [0, 600s] with 20 buckets. It is configured
+       to report the latency at P50, P90, P99 and P100 percentiles.
    * - arbitrator_free_capacity_bytes
      - Average
      - The average of total free memory capacity which is managed by the
@@ -412,6 +446,9 @@ Storage
    * - storage_global_throttled_count
      - Count
      - The number of times that storage IOs get throttled in a storage cluster.
+   * - storage_network_throttled_count
+     - Count
+     - The number of times that storage IOs get throttled in a storage cluster because of network.
 
 Spilling
 --------
@@ -529,3 +566,97 @@ Hive Connector
      - The distribution of hive file open latency in range of [0, 100s] with 10
        buckets. It is configured to report latency at P50, P90, P99, and P100
        percentiles.
+   * - hive_sort_writer_finish_time_ms
+     - Histogram
+     - The distribution of hive sort writer finish processing time slice in range
+       of[0, 120s] with 60 buckets. It is configured to report latency at P50,
+       P90, P99, and P100 percentiles.
+
+Index Join
+----------
+
+.. list-table::
+   :widths: 40 10 50
+   :header-rows: 1
+
+   * - Metric Name
+     - Type
+     - Description
+   * - index_lookup_wait_time_ms
+     - Histogram
+     - The time distribution of index lookup time in range of [0, 16s] with 512
+       buckets and reports P50, P90, P99, and P100.
+   * - index_lookup_blocked_wait_time_ms
+     - Histogram
+     - The time distribution of index lookup operator blocked wait time in range
+       of [0, 16s] with 512 buckets and reports P50, P90, P99, and P100.
+   * - index_lookup_result_raw_bytes
+     - Histogram
+     - The distribution of index lookup result raw bytes in range of [0, 128MB]
+       with 128 buckets. It is configured to report the capacity at P50, P90, P99,
+       and P100 percentiles.
+   * - index_lookup_result_bytes
+     - Histogram
+     - The distribution of index lookup result bytes in range of [0, 128MB] with
+       128 buckets. It is configured to report the capacity at P50, P90, P99, and
+       P100 percentiles.
+
+Table Scan
+----------
+
+.. list-table::
+   :widths: 40 10 50
+   :header-rows: 1
+
+   * - Metric Name
+     - Type
+     - Description
+   * - table_scan_batch_process_time_ms
+     - Histogram
+     - The time distribution of table scan batch processing time in range of [0,
+       16s] with 512 buckets and reports P50, P90, P99, and P100.
+   * - table_scan_batch_bytes
+     - Histogram
+     - The size distribution of table scan output batch in range of [0, 512MB]
+       with 512 buckets and reports P50, P90, P99, and P100
+
+S3 FileSystem
+--------------
+
+.. list-table::
+   :widths: 40 10 50
+   :header-rows: 1
+
+   * - Metric Name
+     - Type
+     - Description
+   * - s3_active_connections
+     - Sum
+     - The number of connections open for S3 read operations.
+   * - s3_started_uploads
+     - Count
+     - The number of S3 upload calls that were started.
+   * - s3_successful_uploads
+     - Count
+     - The number of S3 upload calls that were completed.
+   * - s3_failed_uploads
+     - Count
+     - The number of S3 upload calls that failed.
+   * - s3_metadata_calls
+     - Count
+     - The number of S3 head (metadata) calls.
+   * - s3_get_metadata_errors
+     - Count
+     - The number of S3 head (metadata) calls that failed.
+   * - s3_get_metadata_retries
+     - Count
+     - The number of retries made during S3 head (metadata) calls.
+   * - s3_get_object_calls
+     - Count
+     - The number of S3 getObject calls.
+   * - s3_get_object_errors
+     - Count
+     - The number of S3 getObject calls that failed.
+   * - s3_get_object_retries
+     - Count
+     - The number of retries made during S3 getObject calls.

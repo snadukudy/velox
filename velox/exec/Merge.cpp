@@ -21,6 +21,19 @@
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
+namespace {
+std::unique_ptr<VectorSerde::Options> getVectorSerdeOptions(
+    const core::QueryConfig& queryConfig,
+    VectorSerde::Kind kind) {
+  std::unique_ptr<VectorSerde::Options> options =
+      kind == VectorSerde::Kind::kPresto
+      ? std::make_unique<serializer::presto::PrestoVectorSerde::PrestoOptions>()
+      : std::make_unique<VectorSerde::Options>();
+  options->compressionKind =
+      common::stringToCompressionKind(queryConfig.shuffleCompressionKind());
+  return options;
+}
+} // namespace
 
 Merge::Merge(
     int32_t operatorId,
@@ -76,7 +89,7 @@ void Merge::initializeTreeOfLosers() {
 BlockingReason Merge::isBlocked(ContinueFuture* future) {
   TestValue::adjust("facebook::velox::exec::Merge::isBlocked", this);
 
-  auto reason = addMergeSources(future);
+  const auto reason = addMergeSources(future);
   if (reason != BlockingReason::kNotBlocked) {
     return reason;
   }
@@ -87,6 +100,8 @@ BlockingReason Merge::isBlocked(ContinueFuture* future) {
     finished_ = true;
     return BlockingReason::kNotBlocked;
   }
+
+  startSources();
 
   // No merging is needed if there is only one source.
   if (streams_.empty() && sources_.size() > 1) {
@@ -99,13 +114,30 @@ BlockingReason Merge::isBlocked(ContinueFuture* future) {
     }
   }
 
-  if (!sourceBlockingFutures_.empty()) {
-    *future = std::move(sourceBlockingFutures_.back());
-    sourceBlockingFutures_.pop_back();
-    return BlockingReason::kWaitForProducer;
+  if (sourceBlockingFutures_.empty()) {
+    return BlockingReason::kNotBlocked;
   }
 
-  return BlockingReason::kNotBlocked;
+  *future = std::move(sourceBlockingFutures_.back());
+  sourceBlockingFutures_.pop_back();
+  return BlockingReason::kWaitForProducer;
+}
+
+void Merge::startSources() {
+  VELOX_CHECK_LE(numStartedSources_, sources_.size());
+  // Start the merge source once.
+  if (numStartedSources_ >= sources_.size()) {
+    return;
+  }
+  VELOX_CHECK_EQ(numStartedSources_, 0);
+  VELOX_CHECK(streams_.empty());
+  VELOX_CHECK(sourceBlockingFutures_.empty());
+  // TODO: support lazy start for local merge with a large number of sources
+  // to cap the memory usage.
+  for (auto& source : sources_) {
+    source->start();
+  }
+  numStartedSources_ = sources_.size();
 }
 
 bool Merge::isFinished() {
@@ -116,6 +148,8 @@ RowVectorPtr Merge::getOutput() {
   if (finished_) {
     return nullptr;
   }
+
+  VELOX_CHECK_EQ(numStartedSources_, sources_.size());
 
   // No merging is needed if there is only one source.
   if (sources_.size() == 1) {
@@ -304,7 +338,11 @@ MergeExchange::MergeExchange(
           mergeExchangeNode->sortingKeys(),
           mergeExchangeNode->sortingOrders(),
           mergeExchangeNode->id(),
-          "MergeExchange") {}
+          "MergeExchange"),
+      serde_(getNamedVectorSerde(mergeExchangeNode->serdeKind())),
+      serdeOptions_(getVectorSerdeOptions(
+          driverCtx->queryConfig(),
+          mergeExchangeNode->serdeKind())) {}
 
 BlockingReason MergeExchange::addMergeSources(ContinueFuture* future) {
   if (operatorCtx_->driverCtx()->driverId != 0) {
@@ -315,53 +353,68 @@ BlockingReason MergeExchange::addMergeSources(ContinueFuture* future) {
   if (noMoreSplits_) {
     return BlockingReason::kNotBlocked;
   }
+
   for (;;) {
     exec::Split split;
     auto reason = operatorCtx_->task()->getSplitOrFuture(
         operatorCtx_->driverCtx()->splitGroupId, planNodeId(), split, *future);
-    if (reason == BlockingReason::kNotBlocked) {
-      if (split.hasConnectorSplit()) {
-        auto remoteSplit = std::dynamic_pointer_cast<RemoteConnectorSplit>(
-            split.connectorSplit);
-        VELOX_CHECK(remoteSplit, "Wrong type of split");
-        remoteSourceTaskIds_.push_back(remoteSplit->taskId);
-      } else {
-        noMoreSplits_ = true;
-        if (!remoteSourceTaskIds_.empty()) {
-          const auto maxMergeExchangeBufferSize =
-              operatorCtx_->driverCtx()
-                  ->queryConfig()
-                  .maxMergeExchangeBufferSize();
-          const auto maxQueuedBytesPerSource = std::min<int64_t>(
-              std::max<int64_t>(
-                  maxMergeExchangeBufferSize / remoteSourceTaskIds_.size(),
-                  MergeSource::kMaxQueuedBytesLowerLimit),
-              MergeSource::kMaxQueuedBytesUpperLimit);
-          for (uint32_t remoteSourceIndex = 0;
-               remoteSourceIndex < remoteSourceTaskIds_.size();
-               ++remoteSourceIndex) {
-            auto* pool = operatorCtx_->task()->addMergeSourcePool(
-                operatorCtx_->planNodeId(),
-                operatorCtx_->driverCtx()->pipelineId,
-                remoteSourceIndex);
-            sources_.emplace_back(MergeSource::createMergeExchangeSource(
-                this,
-                remoteSourceTaskIds_[remoteSourceIndex],
-                operatorCtx_->task()->destination(),
-                maxQueuedBytesPerSource,
-                pool,
-                operatorCtx_->task()->queryCtx()->executor()));
-          }
-        }
-        // TODO Delay this call until all input data has been processed.
-        operatorCtx_->task()->multipleSplitsFinished(
-            false, remoteSourceTaskIds_.size(), 0);
-        return BlockingReason::kNotBlocked;
-      }
-    } else {
+    if (reason != BlockingReason::kNotBlocked) {
       return reason;
     }
+
+    if (split.hasConnectorSplit()) {
+      auto remoteSplit =
+          std::dynamic_pointer_cast<RemoteConnectorSplit>(split.connectorSplit);
+      VELOX_CHECK_NOT_NULL(remoteSplit, "Wrong type of split");
+      remoteSourceTaskIds_.push_back(remoteSplit->taskId);
+      continue;
+    }
+
+    noMoreSplits_ = true;
+    if (!remoteSourceTaskIds_.empty()) {
+      const auto maxMergeExchangeBufferSize =
+          operatorCtx_->driverCtx()->queryConfig().maxMergeExchangeBufferSize();
+      const auto maxQueuedBytesPerSource = std::min<int64_t>(
+          std::max<int64_t>(
+              maxMergeExchangeBufferSize / remoteSourceTaskIds_.size(),
+              MergeSource::kMaxQueuedBytesLowerLimit),
+          MergeSource::kMaxQueuedBytesUpperLimit);
+      for (uint32_t remoteSourceIndex = 0;
+           remoteSourceIndex < remoteSourceTaskIds_.size();
+           ++remoteSourceIndex) {
+        auto* pool = operatorCtx_->task()->addMergeSourcePool(
+            operatorCtx_->planNodeId(),
+            operatorCtx_->driverCtx()->pipelineId,
+            remoteSourceIndex);
+        sources_.emplace_back(MergeSource::createMergeExchangeSource(
+            this,
+            remoteSourceTaskIds_[remoteSourceIndex],
+            operatorCtx_->task()->destination(),
+            maxQueuedBytesPerSource,
+            pool,
+            operatorCtx_->task()->queryCtx()->executor()));
+      }
+    }
+    // TODO Delay this call until all input data has been processed.
+    operatorCtx_->task()->multipleSplitsFinished(
+        false, remoteSourceTaskIds_.size(), 0);
+    return BlockingReason::kNotBlocked;
   }
 }
 
+void MergeExchange::close() {
+  for (auto& source : sources_) {
+    source->close();
+  }
+  Operator::close();
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        Operator::kShuffleSerdeKind,
+        RuntimeCounter(static_cast<int64_t>(serde_->kind())));
+    lockedStats->addRuntimeStat(
+        Operator::kShuffleCompressionKind,
+        RuntimeCounter(static_cast<int64_t>(serdeOptions_->compressionKind)));
+  }
+}
 } // namespace facebook::velox::exec

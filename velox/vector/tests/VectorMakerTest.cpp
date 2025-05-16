@@ -18,6 +18,7 @@
 
 #include "velox/common/base/VeloxException.h"
 #include "velox/common/memory/Memory.h"
+#include "velox/common/testutil/OptionalEmpty.h"
 #include "velox/vector/tests/utils/VectorMaker.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
@@ -27,7 +28,7 @@ using facebook::velox::test::VectorMaker;
 class VectorMakerTest : public ::testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   std::shared_ptr<memory::MemoryPool> pool_{
@@ -479,13 +480,13 @@ TEST_F(VectorMakerTest, nestedArrayVectorFromJson) {
       {{2, 3, 4}},
       {{std::nullopt, 7}},
       {{1, 3, 7, 9}},
-      {{}},
+      common::testutil::optionalEmpty,
       {{std::nullopt}},
       {{1, 2, std::nullopt}},
-      {{}},
+      common::testutil::optionalEmpty,
       std::nullopt,
       {{1, 2, 3}},
-      {{}},
+      common::testutil::optionalEmpty,
       {{4, 5}},
   });
 
@@ -596,7 +597,9 @@ TEST_F(VectorMakerTest, arrayOfRowVectorFromTuples) {
   auto expected = maker_.arrayVector(offsets, elements);
 
   ASSERT_EQ(expected->size(), arrayVector->size());
-  ASSERT_EQ(*expected->type(), *arrayVector->type());
+  // check equivalent because arrayVector's row type doesn't have name for each
+  // column ('', '' ..) whereas expected's row type have names ('c0', 'c1' ..)
+  ASSERT_TRUE((*expected->type()).equivalent((*arrayVector->type())));
   for (auto i = 0; i < expected->size(); i++) {
     ASSERT_TRUE(expected->equalValueAt(arrayVector.get(), i, i));
   }

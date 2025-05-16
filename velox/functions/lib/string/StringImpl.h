@@ -21,14 +21,13 @@
 #include <stdlib.h>
 #include <cstdint>
 #include <cstring>
-#include <sstream>
-#include <string>
 #include <string_view>
 #include <vector>
 #include "folly/CPortability.h"
 #include "folly/Likely.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/external/md5/md5.h"
+#include "velox/functions/lib/Utf8Utils.h"
 #include "velox/functions/lib/string/StringCore.h"
 #include "velox/type/StringView.h"
 
@@ -62,20 +61,6 @@ FOLLY_ALWAYS_INLINE bool lower(TOutString& output, const TInString& input) {
         lowerUnicode(output.data(), output.size(), input.data(), input.size());
     output.resize(size);
   }
-  return true;
-}
-
-/// Inplace ascii lower
-template <typename T>
-FOLLY_ALWAYS_INLINE bool lowerAsciiInPlace(T& str) {
-  lowerAscii(str.data(), str.data(), str.size());
-  return true;
-}
-
-/// Inplace ascii upper
-template <typename T>
-FOLLY_ALWAYS_INLINE bool upperAsciiInPlace(T& str) {
-  upperAscii(str.data(), str.data(), str.size());
   return true;
 }
 
@@ -197,13 +182,17 @@ std::vector<int32_t> stringToCodePoints(const T& inputString) {
   return codePoints;
 }
 
-/// Returns the starting position in characters of the Nth instance(counting
-/// from the left if lpos==true and from the end otherwise) of the substring in
-/// string. Positions start with 1. If not found, 0 is returned. If subString is
-/// empty result is 1.
-template <bool isAscii, bool lpos = true, typename T>
-FOLLY_ALWAYS_INLINE int64_t
-stringPosition(const T& string, const T& subString, int64_t instance = 0) {
+/// Returns the starting position in characters of the Nth instance of the
+/// substring in string. Positions start with 1. If not found, 0 is returned. If
+/// subString is empty result is 1.
+/// @tparam lpos If true, counting from the start of the string. Counting from
+/// the end of the string otherwise.
+/// @param instance The 1-based instance of the substring to find in string.
+template <bool isAscii, bool lpos = true>
+FOLLY_ALWAYS_INLINE int64_t stringPosition(
+    std::string_view string,
+    std::string_view subString,
+    int64_t instance) {
   VELOX_USER_CHECK_GT(instance, 0, "'instance' must be a positive number");
   if (subString.size() == 0) {
     return 1;
@@ -211,15 +200,9 @@ stringPosition(const T& string, const T& subString, int64_t instance = 0) {
 
   int64_t byteIndex = -1;
   if constexpr (lpos) {
-    byteIndex = findNthInstanceByteIndexFromStart(
-        std::string_view(string.data(), string.size()),
-        std::string_view(subString.data(), subString.size()),
-        instance);
+    byteIndex = findNthInstanceByteIndexFromStart(string, subString, instance);
   } else {
-    byteIndex = findNthInstanceByteIndexFromEnd(
-        std::string_view(string.data(), string.size()),
-        std::string_view(subString.data(), subString.size()),
-        instance);
+    byteIndex = findNthInstanceByteIndexFromEnd(string, subString, instance);
   }
 
   if (byteIndex == -1) {
@@ -238,8 +221,11 @@ FOLLY_ALWAYS_INLINE void replace(
     TOutString& outputString,
     const TInString& inputString,
     const TInString& replaced,
-    const TInString& replacement) {
-  if (replaced.size() == 0) {
+    const TInString& replacement,
+    bool replaceFirst = false) {
+  if (replaceFirst) {
+    outputString.reserve(inputString.size() + replacement.size());
+  } else if (replaced.size() == 0) {
     // Add replacement before and after each character.
     outputString.reserve(
         inputString.size() + replacement.size() +
@@ -255,7 +241,8 @@ FOLLY_ALWAYS_INLINE void replace(
       std::string_view(inputString.data(), inputString.size()),
       std::string_view(replaced.data(), replaced.size()),
       std::string_view(replacement.data(), replacement.size()),
-      false);
+      false,
+      replaceFirst);
 
   outputString.resize(outputSize);
 }
@@ -265,7 +252,8 @@ template <typename TInOutString, typename TInString>
 FOLLY_ALWAYS_INLINE void replaceInPlace(
     TInOutString& string,
     const TInString& replaced,
-    const TInString& replacement) {
+    const TInString& replacement,
+    bool replaceFirst = false) {
   assert(replacement.size() <= replaced.size() && "invalid inplace replace");
 
   auto outputSize = stringCore::replace(
@@ -273,7 +261,8 @@ FOLLY_ALWAYS_INLINE void replaceInPlace(
       std::string_view(string.data(), string.size()),
       std::string_view(replaced.data(), replaced.size()),
       std::string_view(replacement.data(), replacement.size()),
-      true);
+      true,
+      replaceFirst);
 
   string.resize(outputSize);
 }
@@ -427,23 +416,50 @@ FOLLY_ALWAYS_INLINE int endsWithUnicodeWhiteSpace(
   return -1;
 }
 
-template <typename TOutString, typename TInString>
+template <bool isAscii, typename TOutString, typename TInString>
 FOLLY_ALWAYS_INLINE bool splitPart(
     TOutString& output,
     const TInString& input,
     const TInString& delimiter,
     const int64_t& index) {
+  VELOX_USER_CHECK_GT(index, 0, "Index must be greater than zero");
+
   std::string_view delim = std::string_view(delimiter.data(), delimiter.size());
   std::string_view inputSv = std::string_view(input.data(), input.size());
   int64_t iteration = 1;
   size_t curPos = 0;
   if (delim.size() == 0) {
-    if (index == 1) {
-      output.setNoCopy(StringView(input.data(), input.size()));
+    if constexpr (isAscii) {
+      if (index > input.size()) {
+        return false;
+      }
+
+      output.setNoCopy(StringView(input.data() + (index - 1), 1));
       return true;
+    } else {
+      int codePoint = 0;
+      while (curPos < inputSv.size()) {
+        auto codePointSize = tryGetUtf8CharLength(
+            input.data() + curPos, input.size() - curPos, codePoint);
+        VELOX_USER_CHECK(
+            codePointSize > 0 && codePointSize <= input.size() - curPos,
+            "Invalid UTF-8 encoding in characters: {}",
+            StringView(
+                input.data() + curPos,
+                std::min(input.size() - curPos, curPos + 12)));
+        if (iteration == index) {
+          output.setNoCopy(StringView(input.data() + curPos, codePointSize));
+          return true;
+        }
+
+        curPos += codePointSize;
+        iteration++;
+      }
+
+      return false;
     }
-    return false;
   }
+
   while (curPos <= inputSv.size()) {
     size_t start = curPos;
     curPos = inputSv.find(delim, curPos);
@@ -593,6 +609,8 @@ FOLLY_ALWAYS_INLINE void pad(
       "pad size must be in the range [0..{})",
       padMaxSize);
   VELOX_USER_CHECK(padString.size() > 0, "padString must not be empty");
+  int64_t padStringCharLength = length<isAscii>(padString);
+  VELOX_USER_CHECK(padStringCharLength > 0, "padString must be a valid string");
 
   int64_t stringCharLength = length<isAscii>(string);
   // If string has at most size characters, truncate it if necessary
@@ -608,7 +626,6 @@ FOLLY_ALWAYS_INLINE void pad(
     return;
   }
 
-  int64_t padStringCharLength = length<isAscii>(padString);
   // How many characters do we need to add to string.
   int64_t fullPaddingCharLength = size - stringCharLength;
   // How many full copies of padString need to be added.

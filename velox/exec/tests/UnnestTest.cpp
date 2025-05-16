@@ -13,17 +13,42 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/testutil/OptionalEmpty.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
-#include "velox/exec/tests/utils/OperatorTestBase.h"
+#include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/exec/tests/utils/TempFilePath.h"
 
 using namespace facebook::velox;
+using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
 
-class UnnestTest : public OperatorTestBase {};
+class UnnestTest : public HiveConnectorTestBase,
+                   public testing::WithParamInterface<vector_size_t> {
+  void SetUp() override {
+    HiveConnectorTestBase::SetUp();
+  }
 
-TEST_F(UnnestTest, basicArray) {
+  void TearDown() override {
+    HiveConnectorTestBase::TearDown();
+  }
+
+ protected:
+  CursorParameters makeCursorParameters(
+      const core::PlanNodePtr& planNode) const {
+    CursorParameters params;
+    params.planNode = planNode;
+    params.queryConfigs[core::QueryConfig::kPreferredOutputBatchRows] =
+        std::to_string(batchSize_);
+    return params;
+  }
+
+  const vector_size_t batchSize_{GetParam()};
+};
+
+TEST_P(UnnestTest, basicArray) {
   auto vector = makeRowVector({
       makeFlatVector<int64_t>(100, [](auto row) { return row; }),
       makeArrayVector<int32_t>(
@@ -38,15 +63,16 @@ TEST_F(UnnestTest, basicArray) {
   // TODO Add tests with empty arrays. This requires better support in DuckDB.
 
   auto op = PlanBuilder().values({vector}).unnest({"c0"}, {"c1"}).planNode();
-  assertQuery(op, "SELECT c0, UNNEST(c1) FROM tmp WHERE c0 % 7 > 0");
+  auto params = makeCursorParameters(op);
+  assertQuery(params, "SELECT c0, UNNEST(c1) FROM tmp WHERE c0 % 7 > 0");
 }
 
-TEST_F(UnnestTest, arrayWithOrdinality) {
+TEST_P(UnnestTest, arrayWithOrdinality) {
   auto array = vectorMaker_.arrayVectorNullable<int32_t>(
       {{{1, 2, std::nullopt, 4}},
        std::nullopt,
        {{5, 6}},
-       {{}},
+       common::testutil::optionalEmpty,
        {{{{std::nullopt}}}},
        {{7, 8, 9}}});
   auto vector = makeRowVector(
@@ -73,7 +99,8 @@ TEST_F(UnnestTest, arrayWithOrdinality) {
        makeNullableFlatVector<int32_t>(
            {1, 2, std::nullopt, 4, 5, 6, std::nullopt, 7, 8, 9}),
        makeNullableFlatVector<int64_t>({1, 2, 3, 4, 1, 2, 1, 1, 2, 3})});
-  assertQuery(op, expected);
+  auto params = makeCursorParameters(op);
+  assertQuery(params, expected);
 
   // Test with array wrapped in dictionary.
   auto reversedIndices = makeIndicesInReverse(6);
@@ -100,10 +127,11 @@ TEST_F(UnnestTest, arrayWithOrdinality) {
        makeNullableFlatVector<int32_t>(
            {7, 8, 9, std::nullopt, 5, 6, 1, 2, std::nullopt, 4}),
        makeNullableFlatVector<int64_t>({1, 2, 3, 1, 1, 2, 1, 2, 3, 4})});
-  assertQuery(op, expectedInDict);
+  params = makeCursorParameters(op);
+  assertQuery(params, expectedInDict);
 }
 
-TEST_F(UnnestTest, basicMap) {
+TEST_P(UnnestTest, basicMap) {
   auto vector = makeRowVector(
       {makeFlatVector<int64_t>(100, [](auto row) { return row; }),
        makeMapVector<int64_t, double>(
@@ -125,10 +153,11 @@ TEST_F(UnnestTest, basicMap) {
            [](auto /* row */) { return 2; },
            [](auto /* row */, auto index) { return index + 1; })});
   createDuckDbTable({duckDbVector});
-  assertQuery(op, "SELECT c0, UNNEST(c1), UNNEST(c2) FROM tmp");
+  auto params = makeCursorParameters(op);
+  assertQuery(params, "SELECT c0, UNNEST(c1), UNNEST(c2) FROM tmp");
 }
 
-TEST_F(UnnestTest, mapWithOrdinality) {
+TEST_P(UnnestTest, mapWithOrdinality) {
   auto map = makeMapVector<int32_t, double>(
       {{{1, 1.1}, {2, std::nullopt}},
        {{3, 3.3}, {4, 4.4}, {5, 5.5}},
@@ -147,7 +176,8 @@ TEST_F(UnnestTest, mapWithOrdinality) {
        makeNullableFlatVector<double>(
            {1.1, std::nullopt, 3.3, 4.4, 5.5, std::nullopt}),
        makeNullableFlatVector<int64_t>({1, 2, 1, 2, 3, 1})});
-  assertQuery(op, expected);
+  auto params = makeCursorParameters(op);
+  assertQuery(params, expected);
 
   // Test with map wrapped in dictionary.
   auto reversedIndices = makeIndicesInReverse(3);
@@ -165,10 +195,11 @@ TEST_F(UnnestTest, mapWithOrdinality) {
        makeNullableFlatVector<double>(
            {std::nullopt, 3.3, 4.4, 5.5, 1.1, std::nullopt}),
        makeNullableFlatVector<int64_t>({1, 1, 2, 3, 1, 2})});
-  assertQuery(op, expectedInDict);
+  params = makeCursorParameters(op);
+  assertQuery(params, expectedInDict);
 }
 
-TEST_F(UnnestTest, multipleColumns) {
+TEST_P(UnnestTest, multipleColumns) {
   std::vector<vector_size_t> offsets(100, 0);
   for (int i = 1; i < 100; ++i) {
     offsets[i] = offsets[i - 1] + i % 11 + 1;
@@ -215,11 +246,13 @@ TEST_F(UnnestTest, multipleColumns) {
            nullEvery(7)),
        makeArrayVector(offsets, makeConstant<int32_t>(7, 700))});
   createDuckDbTable({duckDbVector});
+  auto params = makeCursorParameters(op);
   assertQuery(
-      op, "SELECT c0, UNNEST(c1), UNNEST(c2), UNNEST(c3), UNNEST(c4) FROM tmp");
+      params,
+      "SELECT c0, UNNEST(c1), UNNEST(c2), UNNEST(c3), UNNEST(c4) FROM tmp");
 }
 
-TEST_F(UnnestTest, multipleColumnsWithOrdinality) {
+TEST_P(UnnestTest, multipleColumnsWithOrdinality) {
   std::vector<vector_size_t> offsets(100, 0);
   for (int i = 1; i < 100; ++i) {
     offsets[i] = offsets[i - 1] + i % 11 + 1;
@@ -284,8 +317,9 @@ TEST_F(UnnestTest, multipleColumnsWithOrdinality) {
              return index + 1;
            })});
   createDuckDbTable({duckDbVector});
+  auto params = makeCursorParameters(op);
   assertQuery(
-      op,
+      params,
       "SELECT c0, UNNEST(c1), UNNEST(c2), UNNEST(c3), UNNEST(c4), UNNEST(c5) FROM tmp");
 
   // Test with empty arrays and maps.
@@ -351,10 +385,11 @@ TEST_F(UnnestTest, multipleColumnsWithOrdinality) {
             std::nullopt,
             std::nullopt}),
        makeNullableFlatVector<int64_t>({1, 2, 3, 4, 1, 2, 3, 1, 2, 1})});
-  assertQuery(op, expected);
+  params = makeCursorParameters(op);
+  assertQuery(params, expected);
 }
 
-TEST_F(UnnestTest, allEmptyOrNullArrays) {
+TEST_P(UnnestTest, allEmptyOrNullArrays) {
   auto vector = makeRowVector(
       {makeFlatVector<int64_t>(100, [](auto row) { return row; }),
        makeArrayVector<int32_t>(
@@ -370,16 +405,17 @@ TEST_F(UnnestTest, allEmptyOrNullArrays) {
 
   auto op =
       PlanBuilder().values({vector}).unnest({"c0"}, {"c1", "c2"}).planNode();
-  assertQueryReturnsEmptyResult(op);
+  auto params = makeCursorParameters(op);
+  assertQueryReturnsEmptyResult(params);
 
   op = PlanBuilder()
            .values({vector})
            .unnest({"c0"}, {"c1", "c2"}, "ordinal")
            .planNode();
-  assertQueryReturnsEmptyResult(op);
+  assertQueryReturnsEmptyResult(params);
 }
 
-TEST_F(UnnestTest, allEmptyOrNullMaps) {
+TEST_P(UnnestTest, allEmptyOrNullMaps) {
   auto vector = makeRowVector(
       {makeFlatVector<int64_t>(100, [](auto row) { return row; }),
        makeMapVector<int64_t, double>(
@@ -397,21 +433,23 @@ TEST_F(UnnestTest, allEmptyOrNullMaps) {
 
   auto op =
       PlanBuilder().values({vector}).unnest({"c0"}, {"c1", "c2"}).planNode();
-  assertQueryReturnsEmptyResult(op);
+  auto params = makeCursorParameters(op);
+  assertQueryReturnsEmptyResult(params);
 
   op = PlanBuilder()
            .values({vector})
            .unnest({"c0"}, {"c1", "c2"}, "ordinal")
            .planNode();
-  assertQueryReturnsEmptyResult(op);
+  params = makeCursorParameters(op);
+  assertQueryReturnsEmptyResult(params);
 }
 
-TEST_F(UnnestTest, batchSize) {
+TEST_P(UnnestTest, batchSize) {
   auto data = makeRowVector({
-      makeFlatVector<int64_t>(10'000, [](auto row) { return row; }),
+      makeFlatVector<int64_t>(1'000, [](auto row) { return row; }),
   });
 
-  // Unnest 10K rows into 30K rows.
+  // Unnest 1K rows into 3K rows.
   core::PlanNodeId unnestId;
   auto plan = PlanBuilder()
                   .values({data})
@@ -421,40 +459,104 @@ TEST_F(UnnestTest, batchSize) {
                   .planNode();
 
   auto expected = makeRowVector({
-      makeFlatVector<int64_t>(10'000 * 3, [](auto row) { return 1 + row % 3; }),
+      makeFlatVector<int64_t>(1'000 * 3, [](auto row) { return 1 + row % 3; }),
   });
 
-  // 17 rows per output allows to unnest 6 input rows at a time.
-  {
-    auto task = AssertQueryBuilder(plan)
-                    .config(core::QueryConfig::kPreferredOutputBatchRows, "17")
-                    .assertResults({expected});
-    auto stats = exec::toPlanStats(task->taskStats());
+  auto task = AssertQueryBuilder(plan)
+                  .config(
+                      core::QueryConfig::kPreferredOutputBatchRows,
+                      std::to_string(batchSize_))
+                  .assertResults({expected});
+  auto stats = exec::toPlanStats(task->taskStats());
 
-    ASSERT_EQ(30'000, stats.at(unnestId).outputRows);
-    ASSERT_EQ(1 + 10'000 / 6, stats.at(unnestId).outputVectors);
+  ASSERT_EQ(3'000, stats.at(unnestId).outputRows);
+  int32_t expectedNumVectors = 3'000 / batchSize_;
+  if (3'000 % batchSize_ != 0) {
+    expectedNumVectors++;
   }
+  ASSERT_EQ(expectedNumVectors, stats.at(unnestId).outputVectors);
+}
 
-  // 2 rows per output allows to unnest 1 input row at a time.
-  {
-    auto task = AssertQueryBuilder(plan)
-                    .config(core::QueryConfig::kPreferredOutputBatchRows, "2")
-                    .assertResults({expected});
-    auto stats = exec::toPlanStats(task->taskStats());
-
-    ASSERT_EQ(30'000, stats.at(unnestId).outputRows);
-    ASSERT_EQ(10'000, stats.at(unnestId).outputVectors);
+TEST_P(UnnestTest, barrier) {
+  std::vector<RowVectorPtr> vectors;
+  std::vector<std::shared_ptr<TempFilePath>> tempFiles;
+  const int numSplits{5};
+  const int numRowsPerSplit{1'00};
+  for (int32_t i = 0; i < 5; ++i) {
+    auto vector = makeRowVector({
+        makeFlatVector<int64_t>(numRowsPerSplit, [](auto row) { return row; }),
+    });
+    vectors.push_back(vector);
+    tempFiles.push_back(TempFilePath::create());
   }
+  writeToFiles(toFilePaths(tempFiles), vectors);
+  createDuckDbTable(vectors);
 
-  // 100K rows per output allows to unnest all at once.
-  {
-    auto task =
-        AssertQueryBuilder(plan)
-            .config(core::QueryConfig::kPreferredOutputBatchRows, "100000")
-            .assertResults({expected});
-    auto stats = exec::toPlanStats(task->taskStats());
+  // Unnest 1K rows into 3K rows.
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId unnestPlanNodeId;
+  const auto plan = PlanBuilder(planNodeIdGenerator)
+                        .startTableScan()
+                        .outputType(std::dynamic_pointer_cast<const RowType>(
+                            vectors[0]->type()))
+                        .endTableScan()
+                        .project({"sequence(1, 3) as s"})
+                        .unnest({}, {"s"})
+                        .capturePlanNodeId(unnestPlanNodeId)
+                        .planNode();
 
-    ASSERT_EQ(30'000, stats.at(unnestId).outputRows);
-    ASSERT_EQ(1, stats.at(unnestId).outputVectors);
+  const auto expectedResult = makeRowVector({
+      makeFlatVector<int64_t>(
+          numRowsPerSplit * 3 * numSplits,
+          [](auto row) { return 1 + row % 3; }),
+  });
+
+  struct {
+    bool barrierExecution;
+    int numOutputRows;
+
+    std::string toString() const {
+      return fmt::format(
+          "barrierExecution {}, numOutputRows {}",
+          barrierExecution,
+          numOutputRows);
+    }
+  } testSettings[] = {{true, 23}, {false, 23}, {true, 200}, {false, 200}};
+  for (const auto& testData : testSettings) {
+    SCOPED_TRACE(testData.toString());
+    const int numExpectedOutputVectors =
+        bits::divRoundUp(numRowsPerSplit * 3, testData.numOutputRows) *
+        numSplits;
+    auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                    .config(core::QueryConfig::kSparkPartitionId, "0")
+                    .config(
+                        core::QueryConfig::kMaxSplitPreloadPerDriver,
+                        std::to_string(tempFiles.size()))
+                    .splits(makeHiveConnectorSplits(tempFiles))
+                    .serialExecution(true)
+                    .barrierExecution(testData.barrierExecution)
+                    .config(
+                        core::QueryConfig::kPreferredOutputBatchRows,
+                        std::to_string(testData.numOutputRows))
+                    .assertResults(expectedResult);
+    const auto taskStats = task->taskStats();
+    ASSERT_EQ(taskStats.numBarriers, testData.barrierExecution ? numSplits : 0);
+    ASSERT_EQ(taskStats.numFinishedSplits, numSplits);
+    ASSERT_EQ(
+        exec::toPlanStats(taskStats).at(unnestPlanNodeId).outputRows,
+        numSplits * numRowsPerSplit * 3);
+    // NOTE: unnest operator produce the same number of output batches no matter
+    // it is under barrier execution mode or not.
+    ASSERT_EQ(
+        exec::toPlanStats(taskStats).at(unnestPlanNodeId).outputVectors,
+        numExpectedOutputVectors);
   }
 }
+
+VELOX_INSTANTIATE_TEST_SUITE_P(
+    UnnestTest,
+    UnnestTest,
+    testing::ValuesIn(/*batchSize*/ {2, 17, 33, 1024}),
+    [](const testing::TestParamInfo<int32_t>& info) {
+      return fmt::format("outputBatchSize_{}", info.param);
+    });

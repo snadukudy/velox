@@ -106,8 +106,8 @@ ValueListReader::ValueListReader(ValueList& values)
     : size_{values.size()},
       lastNullsStart_{size_ % 64 == 0 ? size_ - 64 : size_ - size_ % 64},
       lastNulls_{values.lastNulls()},
-      dataStream_{HashStringAllocator::prepareRead(values.dataBegin())},
-      nullsStream_{HashStringAllocator::prepareRead(values.nullsBegin())} {}
+      dataStream_{values.dataBegin()},
+      nullsStream_{values.nullsBegin()} {}
 
 bool ValueListReader::next(BaseVector& output, vector_size_t outputIndex) {
   if (pos_ == lastNullsStart_) {

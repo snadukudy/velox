@@ -119,7 +119,7 @@ std::string mapTypeKindToName(const TypeKind& typeKind) {
   return found->second;
 }
 
-std::pair<int, int> getDecimalPrecisionScale(const Type& type) {
+std::pair<uint8_t, uint8_t> getDecimalPrecisionScale(const Type& type) {
   if (type.isShortDecimal()) {
     const auto& decimalType = static_cast<const ShortDecimalType&>(type);
     return {decimalType.precision(), decimalType.scale()};
@@ -160,6 +160,11 @@ std::vector<TypePtr> deserializeChildTypes(const folly::dynamic& obj) {
 } // namespace
 
 TypePtr Type::create(const folly::dynamic& obj) {
+  if (obj.find("ref") != obj.items().end()) {
+    const auto id = obj["ref"].asInt();
+    return deserializedTypeCache().get(id);
+  }
+
   std::vector<TypePtr> childTypes;
   if (obj.find("cTypes") != obj.items().end()) {
     childTypes = deserializeChildTypes(obj);
@@ -171,7 +176,12 @@ TypePtr Type::create(const folly::dynamic& obj) {
   }
   // Checks if 'typeName' specifies a custom type.
   if (customTypeExists(typeName)) {
-    return getCustomType(typeName);
+    std::vector<TypeParameter> params;
+    params.reserve(childTypes.size());
+    for (auto& child : childTypes) {
+      params.emplace_back(child);
+    }
+    return getCustomType(typeName, params);
   }
 
   // 'typeName' must be a built-in type.
@@ -212,8 +222,7 @@ void Type::registerSerDe() {
   auto& registry = velox::DeserializationRegistryForSharedPtr();
   registry.Register(
       Type::getClassName(),
-      static_cast<std::shared_ptr<const Type> (*)(const folly::dynamic&)>(
-          Type::create));
+      static_cast<TypePtr (*)(const folly::dynamic&)>(Type::create));
 
   registry.Register("IntervalDayTimeType", IntervalDayTimeType::deserialize);
   registry.Register(
@@ -242,6 +251,17 @@ bool ArrayType::equivalent(const Type& other) const {
   }
   auto& otherArray = other.asArray();
   return child_->equivalent(*otherArray.child_);
+}
+
+bool ArrayType::equals(const Type& other) const {
+  if (&other == this) {
+    return true;
+  }
+  if (!Type::hasSameTypeId(other)) {
+    return false;
+  }
+  auto& otherArray = other.asArray();
+  return *child_ == *otherArray.child_;
 }
 
 folly::dynamic ArrayType::serialize() const {
@@ -365,14 +385,6 @@ std::unique_ptr<std::vector<TypeParameter>> RowType::makeParameters() const {
       createTypeParameters(children_));
 }
 
-uint32_t RowType::size() const {
-  return children_.size();
-}
-
-const TypePtr& RowType::childAt(uint32_t idx) const {
-  return children_.at(idx);
-}
-
 namespace {
 template <typename T>
 std::string makeFieldNotFoundErrorMessage(
@@ -418,7 +430,7 @@ bool RowType::containsChild(std::string_view name) const {
   return std::find(names_.begin(), names_.end(), name) != names_.end();
 }
 
-uint32_t RowType::getChildIdx(const std::string& name) const {
+uint32_t RowType::getChildIdx(std::string_view name) const {
   auto index = getChildIdxIfExists(name);
   if (!index.has_value()) {
     VELOX_USER_FAIL(makeFieldNotFoundErrorMessage(name, names_));
@@ -427,7 +439,7 @@ uint32_t RowType::getChildIdx(const std::string& name) const {
 }
 
 std::optional<uint32_t> RowType::getChildIdxIfExists(
-    const std::string& name) const {
+    std::string_view name) const {
   for (uint32_t i = 0; i < names_.size(); i++) {
     if (names_.at(i) == name) {
       return i;
@@ -476,12 +488,12 @@ bool RowType::equals(const Type& other) const {
   return true;
 }
 
-bool RowType::operator==(const Type& other) const {
-  return this->equals(other);
-}
-
-bool RowType::operator==(const RowType& other) const {
-  return this->equals(other);
+size_t RowType::hashKind() const {
+  if (!hashKindComputed_.load(std::memory_order_relaxed)) {
+    hashKind_ = TypeBase<TypeKind::ROW>::hashKind();
+    hashKindComputed_ = true;
+  }
+  return hashKind_;
 }
 
 void RowType::printChildren(std::stringstream& ss, std::string_view delimiter)
@@ -524,17 +536,120 @@ std::string RowType::toString() const {
   return ss.str();
 }
 
+std::optional<int32_t> SerializedTypeCache::get(const Type& type) const {
+  auto it = cache_.find(&type);
+  if (it != cache_.end()) {
+    return it->second.first;
+  }
+
+  return std::nullopt;
+}
+
+int32_t SerializedTypeCache::put(const Type& type, folly::dynamic serialized) {
+  const int32_t id = cache_.size();
+
+  std::pair<int32_t, folly::dynamic> value{id, std::move(serialized)};
+  const bool ok = cache_.emplace(&type, std::move(value)).second;
+  VELOX_CHECK(ok);
+
+  return id;
+}
+
+folly::dynamic SerializedTypeCache::serialize() {
+  // Make sure to serialize the cache in the same order as it was
+  // populated.
+  std::vector<std::pair<int32_t, const folly::dynamic*>> cacheEntries;
+  for (const auto& [_, pair] : cache_) {
+    cacheEntries.emplace_back(std::make_pair<int32_t, const folly::dynamic*>(
+        (int32_t)pair.first, &pair.second));
+  }
+
+  std::sort(cacheEntries.begin(), cacheEntries.end(), [](auto& a, auto& b) {
+    return a.first < b.first;
+  });
+
+  folly::dynamic keys = folly::dynamic::array;
+  folly::dynamic values = folly::dynamic::array;
+
+  for (const auto& pair : cacheEntries) {
+    keys.push_back(pair.first);
+    values.push_back(*pair.second);
+  }
+
+  folly::dynamic cacheObj = folly::dynamic::object;
+  cacheObj["keys"] = keys;
+  cacheObj["values"] = values;
+
+  return cacheObj;
+}
+
+SerializedTypeCache& serializedTypeCache() {
+  thread_local SerializedTypeCache cache;
+  return cache;
+}
+
+void DeserializedTypeCache::deserialize(const folly::dynamic& obj) {
+  VELOX_CHECK(cache_.empty());
+
+  const auto& keys = obj["keys"];
+  const auto size = keys.size();
+
+  const auto& values = obj["values"];
+  VELOX_CHECK_EQ(size, values.size());
+  for (auto i = 0; i < size; ++i) {
+    auto type = velox::ISerializable::deserialize<Type>(values[i]);
+    const bool ok = cache_.emplace(keys[i].asInt(), type).second;
+    VELOX_CHECK(ok);
+  }
+}
+
+const TypePtr& DeserializedTypeCache::get(int32_t id) const {
+  auto it = cache_.find(id);
+  VELOX_CHECK(it != cache_.end());
+  return it->second;
+}
+
+DeserializedTypeCache& deserializedTypeCache() {
+  thread_local DeserializedTypeCache cache;
+  return cache;
+}
+
+namespace {
+folly::dynamic makeTypeRef(int32_t id) {
+  folly::dynamic ref = folly::dynamic::object;
+  ref["name"] = "Type";
+  ref["ref"] = id;
+  return ref;
+}
+} // namespace
+
 folly::dynamic RowType::serialize() const {
+  auto& cache = serializedTypeCache();
+  const bool useCache =
+      cache.isEnabled() && size() >= cache.options().minRowTypeSize;
+
+  if (useCache) {
+    if (auto id = cache.get(*this)) {
+      return makeTypeRef(id.value());
+    }
+  }
+
   folly::dynamic obj = folly::dynamic::object;
   obj["name"] = "Type";
   obj["type"] = TypeTraits<TypeKind::ROW>::name;
   obj["names"] = velox::ISerializable::serialize(names_);
   obj["cTypes"] = velox::ISerializable::serialize(children_);
+
+  if (useCache) {
+    const auto id = cache.put(*this, std::move(obj));
+    return makeTypeRef(id);
+  }
+
   return obj;
 }
 
 size_t Type::hashKind() const {
-  size_t hash = (int32_t)kind();
+  size_t hash = (int32_t)kind() + 1;
   for (auto& child : *this) {
     hash = hash * 31 + child->hashKind();
   }
@@ -569,6 +684,17 @@ bool MapType::equivalent(const Type& other) const {
       valueType_->equivalent(*otherMap.valueType_);
 }
 
+bool MapType::equals(const Type& other) const {
+  if (&other == this) {
+    return true;
+  }
+  if (!Type::hasSameTypeId(other)) {
+    return false;
+  }
+  auto& otherMap = other.asMap();
+  return *keyType_ == *otherMap.keyType_ && *valueType_ == *otherMap.valueType_;
+}
+
 FunctionType::FunctionType(
     std::vector<std::shared_ptr<const Type>>&& argumentTypes,
     std::shared_ptr<const Type> returnType)
@@ -591,6 +717,29 @@ bool FunctionType::equivalent(const Type& other) const {
 
   for (auto i = 0; i < children_.size(); ++i) {
     if (!children_.at(i)->equivalent(*otherTyped.children_.at(i))) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool FunctionType::equals(const Type& other) const {
+  if (&other == this) {
+    return true;
+  }
+
+  if (!Type::hasSameTypeId(other)) {
+    return false;
+  }
+
+  auto& otherTyped = *reinterpret_cast<const FunctionType*>(&other);
+  if (children_.size() != otherTyped.size()) {
+    return false;
+  }
+
+  for (auto i = 0; i < children_.size(); ++i) {
+    if (*children_.at(i) != *otherTyped.children_.at(i)) {
       return false;
     }
   }
@@ -629,10 +778,7 @@ bool OpaqueType::equivalent(const Type& other) const {
   return true;
 }
 
-bool OpaqueType::operator==(const Type& other) const {
-  if (&other == this) {
-    return true;
-  }
+bool OpaqueType::equals(const Type& other) const {
   if (!this->equivalent(other)) {
     return false;
   }
@@ -684,6 +830,12 @@ OpaqueType::DeserializeFunc<void> OpaqueType::getDeserializeFunc() const {
 std::shared_ptr<const OpaqueType> OpaqueType::deserializeExtra(
     const folly::dynamic&) const {
   return nullptr;
+}
+
+void OpaqueType::clearSerializationRegistry() {
+  auto& registry = OpaqueSerdeRegistry::get();
+  registry.mapping.clear();
+  registry.reverse.clear();
 }
 
 void OpaqueType::registerSerializationTypeErased(
@@ -839,6 +991,33 @@ bool Type::containsUnknown() const {
   return false;
 }
 
+std::string Type::toSummaryString(TypeSummaryOptions options) const {
+  std::ostringstream out;
+  out << kindName();
+
+  const auto cnt = std::min(options.maxChildren, size());
+  if (cnt > 0) {
+    out << "(";
+    for (auto i = 0; i < cnt; ++i) {
+      if (i > 0) {
+        out << ", ";
+      }
+      out << childAt(i)->kindName();
+    }
+
+    if (cnt < size()) {
+      out << ", ..." << (size() - cnt) << " more";
+    }
+    out << ")";
+  } else {
+    if (kind_ == TypeKind::ROW) {
+      out << "(" << size() << ")";
+    }
+  }
+
+  return out.str();
+}
+
 namespace {
 
 std::unordered_map<std::string, std::unique_ptr<const CustomTypeFactories>>&
@@ -850,6 +1029,18 @@ typeFactories() {
 }
 
 } // namespace
+
+std::unordered_map<std::string, std::type_index>& getTypeIndexByOpaqueAlias() {
+  static std::unordered_map<std::string, std::type_index>
+      typeIndexByOpaqueAlias;
+  return typeIndexByOpaqueAlias;
+}
+
+std::unordered_map<std::type_index, std::string>& getOpaqueAliasByTypeIndex() {
+  static std::unordered_map<std::type_index, std::string>
+      opaqueAliasByTypeIndexMap;
+  return opaqueAliasByTypeIndexMap;
+}
 
 bool registerCustomType(
     const std::string& name,
@@ -888,10 +1079,12 @@ getTypeFactories(const std::string& name) {
   return nullptr;
 }
 
-TypePtr getCustomType(const std::string& name) {
+TypePtr getCustomType(
+    const std::string& name,
+    const std::vector<TypeParameter>& parameters) {
   auto factories = getTypeFactories(name);
   if (factories) {
-    return factories->getType();
+    return factories->getType(parameters);
   }
 
   return nullptr;
@@ -901,6 +1094,21 @@ exec::CastOperatorPtr getCustomTypeCastOperator(const std::string& name) {
   auto factories = getTypeFactories(name);
   if (factories) {
     return factories->getCastOperator();
+  }
+
+  return nullptr;
+}
+
+CustomTypeFactories::~CustomTypeFactories() = default;
+
+AbstractInputGenerator::~AbstractInputGenerator() = default;
+
+AbstractInputGeneratorPtr getCustomTypeInputGenerator(
+    const std::string& name,
+    const InputGeneratorConfig& config) {
+  auto factories = getTypeFactories(name);
+  if (factories) {
+    return factories->getInputGenerator(config);
   }
 
   return nullptr;
@@ -1169,7 +1377,24 @@ TypePtr getType(
     return parametricBuiltinTypes().at(name)(parameters);
   }
 
-  return getCustomType(name);
+  return getCustomType(name, parameters);
 }
 
+std::type_index getTypeIdForOpaqueTypeAlias(const std::string& name) {
+  auto it = getTypeIndexByOpaqueAlias().find(name);
+  VELOX_CHECK(
+      it != getTypeIndexByOpaqueAlias().end(),
+      "Could not find type '{}'. Did you call registerOpaqueType?",
+      name);
+  return it->second;
+}
+
+std::string getOpaqueAliasForTypeId(std::type_index typeIndex) {
+  auto it = getOpaqueAliasByTypeIndex().find(typeIndex);
+  VELOX_CHECK(
+      it != getOpaqueAliasByTypeIndex().end(),
+      "Could not find type index '{}'. Did you call registerOpaqueType?",
+      typeIndex.name());
+  return it->second;
+}
 } // namespace facebook::velox

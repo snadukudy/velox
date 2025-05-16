@@ -17,11 +17,14 @@
 #include "velox/expression/VectorFunction.h"
 #include "velox/functions/Registerer.h"
 #include "velox/functions/lib/MapConcat.h"
+#include "velox/functions/prestosql/Map.h"
+#include "velox/functions/prestosql/MapFunctions.h"
+#include "velox/functions/prestosql/MapKeysByTopNValues.h"
 #include "velox/functions/prestosql/MapNormalize.h"
-#include "velox/functions/prestosql/MapRemoveNullValues.h"
 #include "velox/functions/prestosql/MapSubset.h"
 #include "velox/functions/prestosql/MapTopN.h"
 #include "velox/functions/prestosql/MapTopNKeys.h"
+#include "velox/functions/prestosql/MapTopNValues.h"
 #include "velox/functions/prestosql/MultimapFromEntries.h"
 
 namespace facebook::velox::functions {
@@ -68,6 +71,14 @@ void registerMapRemoveNullValues(const std::string& prefix) {
       Map<Generic<T1>, Generic<T2>>>({prefix + "map_remove_null_values"});
 }
 
+void registerMapKeyExists(const std::string& prefix) {
+  registerFunction<
+      MapKeyExists,
+      bool,
+      Map<Generic<T1>, Generic<T2>>,
+      Generic<T1>>({prefix + "map_key_exists"});
+}
+
 } // namespace
 
 void registerMapFunctions(const std::string& prefix) {
@@ -75,7 +86,7 @@ void registerMapFunctions(const std::string& prefix) {
   VELOX_REGISTER_VECTOR_FUNCTION(udf_transform_keys, prefix + "transform_keys");
   VELOX_REGISTER_VECTOR_FUNCTION(
       udf_transform_values, prefix + "transform_values");
-  VELOX_REGISTER_VECTOR_FUNCTION(udf_map, prefix + "map");
+  registerMapFunction(prefix + "map", false /*allowDuplicateKeys*/);
   VELOX_REGISTER_VECTOR_FUNCTION(udf_map_entries, prefix + "map_entries");
   VELOX_REGISTER_VECTOR_FUNCTION(
       udf_map_from_entries, prefix + "map_from_entries");
@@ -108,12 +119,26 @@ void registerMapFunctions(const std::string& prefix) {
   registerFunction<
       MapTopNKeysFunction,
       Array<Orderable<T1>>,
-      Map<Orderable<T1>, Orderable<T2>>,
+      Map<Orderable<T1>, Generic<T2>>,
       int64_t>({prefix + "map_top_n_keys"});
+
+  registerFunction<
+      MapKeysByTopNValuesFunction,
+      Array<Orderable<T1>>,
+      Map<Orderable<T1>, Orderable<T2>>,
+      int64_t>({prefix + "map_keys_by_top_n_values"});
+
+  registerFunction<
+      MapTopNValuesFunction,
+      Array<Orderable<T2>>,
+      Map<Orderable<T1>, Orderable<T2>>,
+      int64_t>({prefix + "map_top_n_values"});
 
   registerMapSubset(prefix);
 
   registerMapRemoveNullValues(prefix);
+
+  registerMapKeyExists(prefix);
 
   registerFunction<
       MapNormalizeFunction,

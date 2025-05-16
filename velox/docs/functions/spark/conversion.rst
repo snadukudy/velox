@@ -99,6 +99,24 @@ Valid examples
   SELECT cast(cast(2147483648.90 as DECIMAL(12, 2)) as integer); -- -2147483648
   SELECT cast(cast(2147483648.90 as DECIMAL(12, 2)) as bigint); -- 2147483648
 
+From timestamp
+^^^^^^^^^^^^^
+
+Casting timestamp as integral types returns the number of seconds by converting timestamp as microseconds, dividing by the number of microseconds in a second, and then rounding down to the nearest second since the epoch (1970-01-01 00:00:00 UTC).
+
+Valid examples
+
+::
+
+  SELECT cast(cast('1970-01-01 00:00:00' as timestamp) as bigint); -- 0
+  SELECT cast(cast('1970-01-01 00:00:00' as timestamp) as smallint); -- 0
+  SELECT cast(cast('1970-01-01 00:00:00' as timestamp) as tinyint); -- 0
+  SELECT cast(cast('2000-01-01 12:21:56' as timestamp) as bigint); -- 946684916
+  SELECT cast(cast('2025-02-25 08:00:26.88' as timestamp) as bigint); -- 1740470426
+  SELECT cast(cast('2025-02-25 08:00:26.88' as timestamp) as integer); -- 1740470426
+  SELECT cast(cast('2025-02-25 08:00:26.88' as timestamp) as smallint); -- 30874
+  SELECT cast(cast('2025-02-25 08:00:26.88' as timestamp) as tinyint); -- -102
+
 Cast to Boolean
 ---------------
 
@@ -165,7 +183,7 @@ From strings
 ^^^^^^^^^^^^
 
 All Spark supported patterns are allowed:
-  
+
   * ``[+-](YYYY-MM-DD)``
   * ``[+-]yyyy*``
   * ``[+-]yyyy*-[m]m``
@@ -175,10 +193,10 @@ All Spark supported patterns are allowed:
 
 The asterisk ``*`` in ``yyyy*`` stands for any numbers.
 For the last two patterns, the trailing ``*`` can represent none or any sequence of characters, e.g:
-  
+
   * "1970-01-01 123"
   * "1970-01-01 (BC)"
-  
+
 All leading and trailing UTF8 white-spaces will be trimmed before cast.
 Casting from invalid input values throws.
 
@@ -239,3 +257,56 @@ Valid example
   SELECT cast(cast(180 as smallint) as binary); -- [00 B4]
   SELECT cast(cast(180000 as integer) as binary); -- [00 02 BF 20]
   SELECT cast(cast(180000 as bigint) as binary); -- [00 00 00 00 00 02 BF 20]
+
+Cast to Timestamp
+-----------------
+
+From integral types
+^^^^^^^^^^^^^^^^^^^
+
+Casting integral value to timestamp type is allowed.
+The input value is treated as the number of seconds since the epoch (1970-01-01 00:00:00 UTC).
+Supported types are tinyint, smallint, integer and bigint.
+
+Valid example
+
+::
+
+  SELECT cast(0 as timestamp); -- 1970-01-01 00:00:00
+  SELECT cast(1727181032 as timestamp); -- 2024-09-24 12:30:32
+  SELECT cast(9223372036855 as timestamp); -- 294247-01-10 04:00:54.775807
+  SELECT cast(-9223372036855 as timestamp); -- 290308-12-21 19:59:05.224192
+
+From floating-point types
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Casting from floating-point input to timestamp type is allowed.
+The input value is treated as the number of seconds since the epoch (1970-01-01 00:00:00 UTC) and converted to microseconds by truncating the fractional part.
+
+Valid examples
+
+::
+
+  SELECT cast(0.0 as timestamp); -- 1970-01-01 00:00:00
+  SELECT cast(1727181032.0 as timestamp); -- 2024-09-24 12:30:32
+  SELECT cast(-1727181032.0 as timestamp); -- 1915-04-09 11:29:28
+  SELECT cast(cast(9223372036855.999 as double) as timestamp); -- 294247-01-10 04:00:54.775807
+  SELECT cast(cast(-9223372036856.999 as double) as timestamp); -- -290308-12-21 19:59:05.224192
+  SELECT cast(cast(1.79769e+308 as double) as timestamp); -- 294247-01-10 04:00:54.775807
+  SELECT cast(cast('inf' as double) as timestamp); -- NULL
+  SELECT cast(cast('nan' as double) as timestamp); -- NULL
+
+From boolean
+^^^^^^^^^^^^
+
+Casting from boolean to timestamp is supported.
+
+* ``true`` - cast to **1970-01-01 00:00:00.000001**
+* ``false`` - cast to **1970-01-01 00:00:00** (epoch)
+
+Valid examples
+
+::
+
+  SELECT cast(true as timestamp); -- 1970-01-01 00:00:00.000001
+  SELECT cast(false as timestamp); -- 1970-01-01 00:00:00

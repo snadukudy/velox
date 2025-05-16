@@ -34,14 +34,14 @@ constexpr folly::StringPiece kMetricCacheShrinkTimeMs{"velox.cache_shrink_ms"};
 constexpr folly::StringPiece kMetricMaxSpillLevelExceededCount{
     "velox.spill_max_level_exceeded_count"};
 
-constexpr folly::StringPiece kMetricMemoryReclaimExecTimeMs{
-    "velox.memory_reclaim_exec_ms"};
+constexpr folly::StringPiece kMetricQueryMemoryReclaimTimeMs{
+    "velox.query_memory_reclaim_time_ms"};
 
-constexpr folly::StringPiece kMetricMemoryReclaimedBytes{
-    "velox.memory_reclaim_bytes"};
+constexpr folly::StringPiece kMetricQueryMemoryReclaimedBytes{
+    "velox.query_memory_reclaim_bytes"};
 
-constexpr folly::StringPiece kMetricMemoryReclaimCount{
-    "velox.memory_reclaim_count"};
+constexpr folly::StringPiece kMetricQueryMemoryReclaimCount{
+    "velox.query_memory_reclaim_count"};
 
 constexpr folly::StringPiece kMetricTaskMemoryReclaimCount{
     "velox.task_memory_reclaim_count"};
@@ -54,6 +54,17 @@ constexpr folly::StringPiece kMetricTaskMemoryReclaimExecTimeMs{
 
 constexpr folly::StringPiece kMetricTaskMemoryReclaimWaitTimeoutCount{
     "velox.task_memory_reclaim_wait_timeout_count"};
+
+constexpr folly::StringPiece kMetricTaskSplitsCount{"velox.task_splits_count"};
+
+constexpr folly::StringPiece kMetricOpMemoryReclaimTimeMs{
+    "velox.op_memory_reclaim_time_ms"};
+
+constexpr folly::StringPiece kMetricOpMemoryReclaimedBytes{
+    "velox.op_memory_reclaim_bytes"};
+
+constexpr folly::StringPiece kMetricOpMemoryReclaimCount{
+    "velox.op_memory_reclaim_count"};
 
 constexpr folly::StringPiece kMetricMemoryNonReclaimableCount{
     "velox.memory_non_reclaimable_count"};
@@ -79,8 +90,25 @@ constexpr folly::StringPiece kMetricArbitratorLocalArbitrationCount{
 constexpr folly::StringPiece kMetricArbitratorGlobalArbitrationCount{
     "velox.arbitrator_global_arbitration_count"};
 
-constexpr folly::StringPiece kMetricArbitratorSlowGlobalArbitrationCount{
-    "velox.arbitrator_slow_global_arbitration_count"};
+constexpr folly::StringPiece
+    kMetricArbitratorGlobalArbitrationNumReclaimVictims{
+        "velox.arbitrator_global_arbitration_num_reclaim_victims"};
+
+constexpr folly::StringPiece
+    kMetricArbitratorGlobalArbitrationFailedVictimCount{
+        "velox.arbitrator_global_arbitration_failed_victim_count"};
+
+constexpr folly::StringPiece kMetricArbitratorGlobalArbitrationBytes{
+    "velox.arbitrator_global_arbitration_bytes"};
+
+constexpr folly::StringPiece kMetricArbitratorGlobalArbitrationTimeMs{
+    "velox.arbitrator_global_arbitration_time_ms"};
+
+constexpr folly::StringPiece kMetricArbitratorGlobalArbitrationWaitCount{
+    "velox.arbitrator_global_arbitration_wait_count"};
+
+constexpr folly::StringPiece kMetricArbitratorGlobalArbitrationWaitTimeMs{
+    "velox.arbitrator_global_arbitration_wait_time_ms"};
 
 constexpr folly::StringPiece kMetricArbitratorAbortedCount{
     "velox.arbitrator_aborted_count"};
@@ -88,11 +116,8 @@ constexpr folly::StringPiece kMetricArbitratorAbortedCount{
 constexpr folly::StringPiece kMetricArbitratorFailuresCount{
     "velox.arbitrator_failures_count"};
 
-constexpr folly::StringPiece kMetricArbitratorArbitrationTimeMs{
-    "velox.arbitrator_arbitration_time_ms"};
-
-constexpr folly::StringPiece kMetricArbitratorWaitTimeMs{
-    "velox.arbitrator_wait_time_ms"};
+constexpr folly::StringPiece kMetricArbitratorOpExecTimeMs{
+    "velox.arbitrator_op_exec_time_ms"};
 
 constexpr folly::StringPiece kMetricArbitratorFreeCapacityBytes{
     "velox.arbitrator_free_capacity_bytes"};
@@ -123,6 +148,9 @@ constexpr folly::StringPiece kMetricSpillFillTimeMs{"velox.spill_fill_time_ms"};
 
 constexpr folly::StringPiece kMetricSpillSortTimeMs{"velox.spill_sort_time_ms"};
 
+constexpr folly::StringPiece kMetricSpillExtractVectorTimeMs{
+    "velox.spill_extract_vector_time_ms"};
+
 constexpr folly::StringPiece kMetricSpillSerializationTimeMs{
     "velox.spill_serialization_time_ms"};
 
@@ -144,20 +172,26 @@ constexpr folly::StringPiece kMetricSpillPeakMemoryBytes{
 constexpr folly::StringPiece kMetricFileWriterEarlyFlushedRawBytes{
     "velox.file_writer_early_flushed_raw_bytes"};
 
+constexpr folly::StringPiece kMetricHiveSortWriterFinishTimeMs{
+    "velox.hive_sort_writer_finish_time_ms"};
+
 constexpr folly::StringPiece kMetricArbitratorRequestsCount{
     "velox.arbitrator_requests_count"};
 
-constexpr folly::StringPiece kMetricMappedMemoryBytes{
+constexpr folly::StringPiece kMetricMemoryAllocatorMappedBytes{
     "velox.memory_allocator_mapped_bytes"};
 
-constexpr folly::StringPiece kMetricAllocatedMemoryBytes{
-    "velox.memory_allocator_alloc_bytes"};
+constexpr folly::StringPiece kMetricMemoryAllocatorAllocatedBytes{
+    "velox.memory_allocator_allocated_bytes"};
 
-constexpr folly::StringPiece kMetricMmapExternalMappedBytes{
+constexpr folly::StringPiece kMetricMemoryAllocatorTotalUsedBytes{
+    "velox.memory_allocator_total_used_bytes"};
+
+constexpr folly::StringPiece kMetricMmapAllocatorExternalMappedBytes{
     "velox.mmap_allocator_external_mapped_bytes"};
 
-constexpr folly::StringPiece kMetricMmapDelegatedAllocBytes{
-    "velox.mmap_allocator_delegated_alloc_bytes"};
+constexpr folly::StringPiece kMetricMmapAllocatorDelegatedAllocatedBytes{
+    "velox.mmap_allocator_delegated_allocated_bytes"};
 
 constexpr folly::StringPiece kMetricCacheMaxAgeSecs{"velox.cache_max_age_secs"};
 
@@ -260,8 +294,8 @@ constexpr folly::StringPiece kMetricSsdCacheOpenCheckpointErrors{
 constexpr folly::StringPiece kMetricSsdCacheOpenLogErrors{
     "velox.ssd_cache_open_log_errors"};
 
-constexpr folly::StringPiece kMetricSsdCacheDeleteCheckpointErrors{
-    "velox.ssd_cache_delete_checkpoint_errors"};
+constexpr folly::StringPiece kMetricSsdCacheMetaFileDeleteErrors{
+    "velox.ssd_cache_delete_meta_file_errors"};
 
 constexpr folly::StringPiece kMetricSsdCacheGrowFileErrors{
     "velox.ssd_cache_grow_file_errors"};
@@ -299,6 +333,9 @@ constexpr folly::StringPiece kMetricSsdCacheRegionsEvicted{
 constexpr folly::StringPiece kMetricSsdCacheRecoveredEntries{
     "velox.ssd_cache_recovered_entries"};
 
+constexpr folly::StringPiece kMetricExchangeTransactionCreateDelay{
+    "velox.exchange.transaction_create_delay_ms"};
+
 constexpr folly::StringPiece kMetricExchangeDataTimeMs{
     "velox.exchange_data_time_ms"};
 
@@ -325,4 +362,34 @@ constexpr folly::StringPiece kMetricStorageLocalThrottled{
 
 constexpr folly::StringPiece kMetricStorageGlobalThrottled{
     "velox.storage_global_throttled_count"};
+
+constexpr folly::StringPiece kMetricStorageNetworkThrottled{
+    "velox.storage_network_throttled_count"};
+
+constexpr folly::StringPiece kMetricIndexLookupResultRawBytes{
+    "velox.index_lookup_result_raw_bytes"};
+
+constexpr folly::StringPiece kMetricIndexLookupResultBytes{
+    "velox.index_lookup_result_bytes"};
+
+constexpr folly::StringPiece kMetricIndexLookupTimeMs{
+    "velox.index_lookup_time_ms"};
+
+constexpr folly::StringPiece kMetricIndexLookupWaitTimeMs{
+    "velox.index_lookup_wait_time_ms"};
+
+constexpr folly::StringPiece kMetricIndexLookupBlockedWaitTimeMs{
+    "velox.index_lookup_blocked_wait_time_ms"};
+
+constexpr folly::StringPiece kMetricTableScanBatchProcessTimeMs{
+    "velox.table_scan_batch_process_time_ms"};
+
+constexpr folly::StringPiece kMetricTableScanBatchBytes{
+    "velox.table_scan_batch_bytes"};
+
+constexpr folly::StringPiece kMetricTaskBatchProcessTimeMs{
+    "velox.task_batch_process_time_ms"};
+
+constexpr folly::StringPiece kMetricTaskBarrierProcessTimeMs{
+    "velox.task_barrier_process_time_ms"};
 } // namespace facebook::velox

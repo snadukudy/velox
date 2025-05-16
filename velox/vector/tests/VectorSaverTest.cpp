@@ -19,8 +19,13 @@
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 #include "velox/exec/tests/utils/TempFilePath.h"
+#include "velox/functions/prestosql/types/HyperLogLogRegistration.h"
 #include "velox/functions/prestosql/types/HyperLogLogType.h"
+#include "velox/functions/prestosql/types/JsonRegistration.h"
 #include "velox/functions/prestosql/types/JsonType.h"
+#include "velox/functions/prestosql/types/TDigestRegistration.h"
+#include "velox/functions/prestosql/types/TDigestType.h"
+#include "velox/functions/prestosql/types/TimestampWithTimeZoneRegistration.h"
 #include "velox/functions/prestosql/types/TimestampWithTimeZoneType.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
@@ -30,13 +35,14 @@ namespace facebook::velox::test {
 class VectorSaverTest : public testing::Test, public VectorTestBase {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   VectorSaverTest() {
     registerJsonType();
     registerHyperLogLogType();
     registerTimestampWithTimeZoneType();
+    registerTDigestType();
   }
 
   void SetUp() override {
@@ -265,6 +271,7 @@ TEST_F(VectorSaverTest, types) {
   testTypeRoundTrip(JSON());
   testTypeRoundTrip(HYPERLOGLOG());
   testTypeRoundTrip(TIMESTAMP_WITH_TIME_ZONE());
+  testTypeRoundTrip(TDIGEST(DOUBLE()));
 }
 
 TEST_F(VectorSaverTest, selectivityVector) {
@@ -370,8 +377,9 @@ TEST_F(VectorSaverTest, flatVarchar) {
   testRoundTrip(opts, VARCHAR());
 
   // Make short strings only.
-  opts.stringLength = 6;
-  opts.vectorSize = 1024;
+  opts.containerVariableLength = true;
+  opts.stringLength = 100000;
+  opts.vectorSize = 10000;
   testRoundTrip(opts, VARCHAR());
 }
 
@@ -620,14 +628,6 @@ TEST_F(VectorSaverTest, LazyVector) {
       fuzzer.wrapInLazyVector(
           fuzzer.fuzzDictionary(fuzzer.fuzzDictionary(flatVector))),
       fuzzer);
-}
-
-TEST_F(VectorSaverTest, stdVector) {
-  std::vector<column_index_t> intVector = {1, 2, 3, 4, 5};
-  auto path = exec::test::TempFilePath::create();
-  saveStdVectorToFile<column_index_t>(intVector, path->getPath().c_str());
-  auto copy = restoreStdVectorFromFile<column_index_t>(path->getPath().c_str());
-  ASSERT_EQ(intVector, copy);
 }
 
 namespace {

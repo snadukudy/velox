@@ -22,6 +22,8 @@
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 
+DECLARE_int32(velox_tpch_text_pool_size_mb);
+
 namespace {
 
 using namespace facebook::velox;
@@ -35,24 +37,31 @@ class TpchConnectorTest : public exec::test::OperatorTestBase {
   const std::string kTpchConnectorId = "test-tpch";
 
   void SetUp() override {
+    FLAGS_velox_tpch_text_pool_size_mb = 10;
     OperatorTestBase::SetUp();
+    connector::registerConnectorFactory(
+        std::make_shared<connector::tpch::TpchConnectorFactory>());
     auto tpchConnector =
         connector::getConnectorFactory(
             connector::tpch::TpchConnectorFactory::kTpchConnectorName)
             ->newConnector(
-                kTpchConnectorId, std::make_shared<core::MemConfig>());
+                kTpchConnectorId,
+                std::make_shared<config::ConfigBase>(
+                    std::unordered_map<std::string, std::string>()));
     connector::registerConnector(tpchConnector);
   }
 
   void TearDown() override {
     connector::unregisterConnector(kTpchConnectorId);
+    connector::unregisterConnectorFactory(
+        connector::tpch::TpchConnectorFactory::kTpchConnectorName);
     OperatorTestBase::TearDown();
   }
 
   exec::Split makeTpchSplit(size_t totalParts = 1, size_t partNumber = 0)
       const {
     return exec::Split(std::make_shared<TpchConnectorSplit>(
-        kTpchConnectorId, totalParts, partNumber));
+        kTpchConnectorId, /*cacheable=*/true, totalParts, partNumber));
   }
 
   RowVectorPtr getResults(
@@ -190,7 +199,14 @@ TEST_F(TpchConnectorTest, lineitemTinyRowCount) {
                   .singleAggregation({}, {"count(1)"})
                   .planNode();
 
-  auto output = getResults(plan, {makeTpchSplit()});
+  std::vector<exec::Split> splits;
+  const size_t numParts = 4;
+
+  for (size_t i = 0; i < numParts; ++i) {
+    splits.push_back(makeTpchSplit(numParts, i));
+  }
+
+  auto output = getResults(plan, std::move(splits));
   EXPECT_EQ(60'175, output->childAt(0)->asFlatVector<int64_t>()->valueAt(0));
 }
 

@@ -15,7 +15,7 @@
  */
 
 #include "velox/functions/prestosql/tests/CastBaseTest.h"
-#include "velox/functions/sparksql/Register.h"
+#include "velox/functions/sparksql/registration/Register.h"
 #include "velox/parse/TypeResolver.h"
 
 using namespace facebook::velox;
@@ -27,7 +27,7 @@ class SparkCastExprTest : public functions::test::CastBaseTest {
   static void SetUpTestCase() {
     parse::registerTypeResolver();
     functions::sparksql::registerFunctions("");
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   template <typename T>
@@ -91,6 +91,53 @@ class SparkCastExprTest : public functions::test::CastBaseTest {
              72,
              std::nullopt}));
   }
+
+  template <typename T>
+  void testIntegralToTimestampCast() {
+    testCast(
+        makeNullableFlatVector<T>({
+            0,
+            1,
+            std::numeric_limits<T>::max(),
+            std::numeric_limits<T>::min(),
+            std::nullopt,
+        }),
+        makeNullableFlatVector<Timestamp>(
+            {Timestamp(0, 0),
+             Timestamp(1, 0),
+             Timestamp(std::numeric_limits<T>::max(), 0),
+             Timestamp(std::numeric_limits<T>::min(), 0),
+             std::nullopt}));
+  }
+
+  template <typename T>
+  void testTimestampToIntegralCast() {
+    testCast(
+        makeFlatVector<Timestamp>({
+            Timestamp(0, 0),
+            Timestamp(1, 0),
+            Timestamp(std::numeric_limits<T>::max(), 0),
+            Timestamp(std::numeric_limits<T>::min(), 0),
+        }),
+        makeFlatVector<T>({
+            0,
+            1,
+            std::numeric_limits<T>::max(),
+            std::numeric_limits<T>::min(),
+        }));
+  }
+
+  template <typename T>
+  void testTimestampToIntegralCastOverflow(std::vector<T> expected) {
+    testCast(
+        makeFlatVector<Timestamp>({
+            Timestamp(1740470426, 0),
+            Timestamp(2147483647, 0),
+            Timestamp(9223372036854, 775'807'000),
+            Timestamp(-9223372036855, 224'192'000),
+        }),
+        makeFlatVector<T>(expected));
+  }
 };
 
 TEST_F(SparkCastExprTest, date) {
@@ -107,7 +154,6 @@ TEST_F(SparkCastExprTest, date) {
        "1970-01-2",
        "1970-1-02",
        "+1970-01-02",
-       "-1-1-1",
        " 1970-01-01",
        std::nullopt},
       {0,
@@ -121,7 +167,6 @@ TEST_F(SparkCastExprTest, date) {
        1,
        1,
        1,
-       -719893,
        0,
        std::nullopt},
       VARCHAR(),
@@ -196,16 +241,36 @@ TEST_F(SparkCastExprTest, invalidDate) {
       {"2015-031-8"},
       "Unable to parse date value: \"2015-031-8\"",
       VARCHAR());
+  testInvalidCast<std::string>(
+      "date", {"-1-1-1"}, "Unable to parse date value: \"-1-1-1\"", VARCHAR());
+  testInvalidCast<std::string>(
+      "date",
+      {"-11-1-1"},
+      "Unable to parse date value: \"-11-1-1\"",
+      VARCHAR());
+  testInvalidCast<std::string>(
+      "date",
+      {"-111-1-1"},
+      "Unable to parse date value: \"-111-1-1\"",
+      VARCHAR());
+  testInvalidCast<std::string>(
+      "date",
+      {"- 1111-1-1"},
+      "Unable to parse date value: \"- 1111-1-1\"",
+      VARCHAR());
 }
 
 TEST_F(SparkCastExprTest, stringToTimestamp) {
   std::vector<std::optional<std::string>> input{
       "1970-01-01",
+      "1970-01-01 00:00:00-02:00",
+      "1970-01-01 00:00:00 +02:00",
       "2000-01-01",
       "1970-01-01 00:00:00",
       "2000-01-01 12:21:56",
       std::nullopt,
       "2015-03-18T12:03:17",
+      "2015-03-18T12:03:17Z",
       "2015-03-18 12:03:17",
       "2015-03-18T12:03:17",
       "2015-03-18 12:03:17.123",
@@ -215,10 +280,13 @@ TEST_F(SparkCastExprTest, stringToTimestamp) {
   };
   std::vector<std::optional<Timestamp>> expected{
       Timestamp(0, 0),
+      Timestamp(7200, 0),
+      Timestamp(-7200, 0),
       Timestamp(946684800, 0),
       Timestamp(0, 0),
       Timestamp(946729316, 0),
       std::nullopt,
+      Timestamp(1426680197, 0),
       Timestamp(1426680197, 0),
       Timestamp(1426680197, 0),
       Timestamp(1426680197, 0),
@@ -228,6 +296,172 @@ TEST_F(SparkCastExprTest, stringToTimestamp) {
       Timestamp(1426680197, 456000000),
   };
   testCast<std::string, Timestamp>("timestamp", input, expected);
+
+  setTimezone("Asia/Shanghai");
+  testCast<std::string, Timestamp>(
+      "timestamp",
+      {"1970-01-01 00:00:00",
+       "1970-01-01 08:00:00",
+       "1970-01-01 08:00:59",
+       "1970"},
+      {Timestamp(-8 * 3600, 0),
+       Timestamp(0, 0),
+       Timestamp(59, 0),
+       Timestamp(-8 * 3600, 0)});
+}
+
+TEST_F(SparkCastExprTest, intToTimestamp) {
+  // Cast bigint as timestamp.
+  testCast(
+      makeNullableFlatVector<int64_t>({
+          0,
+          1727181032,
+          -1727181032,
+          9223372036855,
+          -9223372036856,
+          std::numeric_limits<int64_t>::max(),
+          std::numeric_limits<int64_t>::min(),
+      }),
+      makeNullableFlatVector<Timestamp>({
+          Timestamp(0, 0),
+          Timestamp(1727181032, 0),
+          Timestamp(-1727181032, 0),
+          Timestamp(9223372036854, 775'807'000),
+          Timestamp(-9223372036855, 224'192'000),
+          Timestamp(9223372036854, 775'807'000),
+          Timestamp(-9223372036855, 224'192'000),
+      }));
+
+  // Cast tinyint/smallint/integer as timestamp.
+  testIntegralToTimestampCast<int8_t>();
+  testIntegralToTimestampCast<int16_t>();
+  testIntegralToTimestampCast<int32_t>();
+}
+
+TEST_F(SparkCastExprTest, timestampToInt) {
+  // Cast timestamp as bigint.
+  testCast(
+      makeFlatVector<Timestamp>({
+          Timestamp(0, 0),
+          Timestamp(1, 0),
+          Timestamp(10, 0),
+          Timestamp(-1, 0),
+          Timestamp(-10, 0),
+          Timestamp(-1, 500000),
+          Timestamp(-2, 999999),
+          Timestamp(-10, 999999),
+          Timestamp(1, 999999),
+          Timestamp(-1, 1),
+          Timestamp(1234567, 500000),
+          Timestamp(-9876543, 1234),
+          Timestamp(1727181032, 0),
+          Timestamp(-1727181032, 0),
+          Timestamp(9223372036854, 775'807'000),
+          Timestamp(-9223372036855, 224'192'000),
+      }),
+      makeFlatVector<int64_t>({
+          0,
+          1,
+          10,
+          -1,
+          -10,
+          -1,
+          -2,
+          -10,
+          1,
+          -1,
+          1234567,
+          -9876543,
+          1727181032,
+          -1727181032,
+          9223372036854,
+          -9223372036855,
+      }));
+  testInvalidCast<Timestamp>(
+      "bigint",
+      {Timestamp(9223372036856, 0)},
+      "Could not convert Timestamp(9223372036856, 0) to microseconds");
+
+  // Cast timestamp as tinyint/smallint/integer.
+  testTimestampToIntegralCast<int8_t>();
+  testTimestampToIntegralCast<int16_t>();
+  testTimestampToIntegralCast<int32_t>();
+
+  // Cast overflowed timestamp as tinyint/smallint/integer.
+  testTimestampToIntegralCastOverflow<int8_t>({
+      -102,
+      -1,
+      -10,
+      9,
+  });
+  testTimestampToIntegralCastOverflow<int16_t>({
+      30874,
+      -1,
+      23286,
+      -23287,
+  });
+  testTimestampToIntegralCastOverflow<int32_t>({
+      1740470426,
+      2147483647,
+      2077252342,
+      -2077252343,
+  });
+}
+
+TEST_F(SparkCastExprTest, doubleToTimestamp) {
+  testCast(
+      makeFlatVector<double>({
+          0.0,
+          1727181032.0,
+          -1727181032.0,
+          9223372036855.999,
+          -9223372036856.999,
+          1.79769e+308,
+          std::numeric_limits<double>::max(),
+          -std::numeric_limits<double>::max(),
+          std::numeric_limits<double>::min(),
+          kInf,
+          kNan,
+          -kInf,
+      }),
+      makeNullableFlatVector<Timestamp>({
+          Timestamp(0, 0),
+          Timestamp(1727181032, 0),
+          Timestamp(-1727181032, 0),
+          Timestamp(9223372036854, 775'807'000),
+          Timestamp(-9223372036855, 224'192'000),
+          Timestamp(9223372036854, 775'807'000),
+          Timestamp(9223372036854, 775'807'000),
+          Timestamp(-9223372036855, 224'192'000),
+          Timestamp(0, 0),
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+      }));
+}
+
+TEST_F(SparkCastExprTest, floatToTimestamp) {
+  testCast(
+      makeFlatVector<float>({
+          0.0,
+          1727181032.0,
+          -1727181032.0,
+          std::numeric_limits<float>::max(),
+          std::numeric_limits<float>::min(),
+          kInf,
+          kNan,
+          -kInf,
+      }),
+      makeNullableFlatVector<Timestamp>({
+          Timestamp(0, 0),
+          Timestamp(1727181056, 0),
+          Timestamp(-1727181056, 0),
+          Timestamp(9223372036854, 775'807'000),
+          Timestamp(0, 0),
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+      }));
 }
 
 TEST_F(SparkCastExprTest, primitiveInvalidCornerCases) {
@@ -519,6 +753,62 @@ TEST_F(SparkCastExprTest, timestampToString) {
           "-0010-02-01 10:00:00",
           std::nullopt,
       });
+
+  std::vector<std::optional<Timestamp>> input = {
+      Timestamp(-946684800, 0),
+      Timestamp(-7266, 0),
+      Timestamp(0, 0),
+      Timestamp(61, 10),
+      Timestamp(3600, 0),
+      Timestamp(946684800, 0),
+
+      Timestamp(946729316, 0),
+      Timestamp(946729316, 123),
+      Timestamp(946729316, 100000000),
+      Timestamp(946729316, 129900000),
+      Timestamp(946729316, 123456789),
+      Timestamp(7266, 0),
+      std::nullopt,
+  };
+
+  setTimezone("America/Los_Angeles");
+  testCast<Timestamp, std::string>(
+      "string",
+      input,
+      {
+          "1940-01-01 16:00:00",
+          "1969-12-31 13:58:54",
+          "1969-12-31 16:00:00",
+          "1969-12-31 16:01:01",
+          "1969-12-31 17:00:00",
+          "1999-12-31 16:00:00",
+          "2000-01-01 04:21:56",
+          "2000-01-01 04:21:56",
+          "2000-01-01 04:21:56.1",
+          "2000-01-01 04:21:56.1299",
+          "2000-01-01 04:21:56.123456",
+          "1969-12-31 18:01:06",
+          std::nullopt,
+      });
+  setTimezone("Asia/Shanghai");
+  testCast<Timestamp, std::string>(
+      "string",
+      input,
+      {
+          "1940-01-02 08:00:00",
+          "1970-01-01 05:58:54",
+          "1970-01-01 08:00:00",
+          "1970-01-01 08:01:01",
+          "1970-01-01 09:00:00",
+          "2000-01-01 08:00:00",
+          "2000-01-01 20:21:56",
+          "2000-01-01 20:21:56",
+          "2000-01-01 20:21:56.1",
+          "2000-01-01 20:21:56.1299",
+          "2000-01-01 20:21:56.123456",
+          "1970-01-01 10:01:06",
+          std::nullopt,
+      });
 }
 
 TEST_F(SparkCastExprTest, fromString) {
@@ -631,6 +921,15 @@ TEST_F(SparkCastExprTest, bigintToBinary) {
        std::string("\0\0\0\0\0\x02\xBF\x20", 8),
        std::string("\x7F\xFF\xFF\xFF\xFF\xFF\xFF\xFF", 8),
        std::string("\x80\x00\x00\x00\x00\x00\x00\x00", 8)});
+}
+
+TEST_F(SparkCastExprTest, boolToTimestamp) {
+  testCast(
+      makeFlatVector<bool>({true, false}),
+      makeFlatVector<Timestamp>({
+          Timestamp(0, 1000),
+          Timestamp(0, 0),
+      }));
 }
 
 } // namespace

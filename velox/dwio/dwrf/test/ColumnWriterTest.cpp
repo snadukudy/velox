@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <optional>
 #include <vector>
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/common/IntDecoder.h"
 #include "velox/dwio/common/TypeWithId.h"
@@ -135,6 +136,11 @@ class TestStripeStreams : public StripeStreamsBase {
     DWIO_RAISE("encoding not found");
   }
 
+  const proto::orc::ColumnEncoding& getEncodingOrc(
+      const EncodingKey& ek) const override {
+    DWIO_RAISE("encoding not found");
+  }
+
   uint32_t visitStreamsOfNode(
       uint32_t node,
       std::function<void(const StreamInformation&)> visitor) const override {
@@ -153,7 +159,15 @@ class TestStripeStreams : public StripeStreamsBase {
     return selector_;
   }
 
-  const RowReaderOptions& getRowReaderOptions() const override {
+  const tz::TimeZone* sessionTimezone() const override {
+    return context_.sessionTimezone();
+  }
+
+  bool adjustTimestampToTimezone() const override {
+    return context_.adjustTimestampToTimezone();
+  }
+
+  const RowReaderOptions& rowReaderOptions() const override {
     return options_;
   }
 
@@ -194,9 +208,21 @@ constexpr uint32_t ITERATIONS = 100'000;
 template <typename T>
 VectorPtr populateBatch(
     std::vector<std::optional<T>> const& data,
-    MemoryPool* pool) {
+    MemoryPool* pool,
+    const TypePtr& type = CppToType<T>::create()) {
   BufferPtr values = AlignedBuffer::allocate<T>(data.size(), pool);
   auto valuesPtr = values->asMutableRange<T>();
+
+  const size_t nulloptCount =
+      std::count(data.begin(), data.end(), std::nullopt);
+  if (nulloptCount == 0) {
+    size_t index = 0;
+    for (auto val : data) {
+      valuesPtr[index++] = val.value();
+    }
+    return std::make_shared<FlatVector<T>>(
+        pool, type, nullptr, data.size(), values, std::vector<BufferPtr>{});
+  }
 
   BufferPtr nulls = allocateNulls(data.size(), pool);
   auto* nullsPtr = nulls->asMutable<uint64_t>();
@@ -214,12 +240,7 @@ VectorPtr populateBatch(
   }
 
   auto batch = std::make_shared<FlatVector<T>>(
-      pool,
-      CppToType<T>::create(),
-      nulls,
-      data.size(),
-      values,
-      std::vector<BufferPtr>{});
+      pool, type, nulls, data.size(), values, std::vector<BufferPtr>{});
   batch->setNullCount(nullCount);
   return batch;
 }
@@ -269,8 +290,14 @@ void verifyBatch(
     const uint32_t seed) {
   auto size = data.size();
   ASSERT_EQ(out->size(), size) << "Batch size mismatch with seed " << seed;
-  ASSERT_EQ(nullCount, out->getNullCount())
-      << "nullCount mismatch with seed " << seed;
+  if (nullCount == std::nullopt) {
+    const auto outNullCount = out->getNullCount();
+    ASSERT_TRUE(outNullCount == std::nullopt || outNullCount == 0)
+        << "nullCount mismatch with seed " << seed;
+  } else {
+    ASSERT_EQ(nullCount, out->getNullCount())
+        << "nullCount mismatch with seed " << seed;
+  }
 
   auto outFv = std::dynamic_pointer_cast<FlatVector<T>>(out);
   size_t index = 0;
@@ -305,7 +332,8 @@ template <typename T>
 void testDataTypeWriter(
     const TypePtr& type,
     std::vector<std::optional<T>>& data,
-    const uint32_t sequence = 0) {
+    const uint32_t sequence = 0,
+    DwrfFormat format = DwrfFormat::kDwrf) {
   // Generate a seed and randomly shuffle the data
   uint32_t seed = Random::rand32();
   std::shuffle(data.begin(), data.end(), std::default_random_engine(seed));
@@ -318,9 +346,10 @@ void testDataTypeWriter(
   auto dataTypeWithId = TypeWithId::create(type, 1);
 
   // write
-  auto writer = BaseColumnWriter::create(context, *dataTypeWithId, sequence);
+  auto writer = BaseColumnWriter::create(
+      context, *dataTypeWithId, sequence, nullptr, format);
   auto size = data.size();
-  auto batch = populateBatch(data, pool.get());
+  auto batch = populateBatch(data, pool.get(), type);
   const size_t stripeCount = 2;
   const size_t strideCount = 3;
 
@@ -358,9 +387,9 @@ void testDataTypeWriter(
     }
     // Reader API requires the caller to read the Stripe for number of
     // values and iterate only until that number.
-    // It does not support hasNext/next protocol.
+    // It does notd support hasNext/next protocol.
     // Use a bigger number like 50, as some values may be bit packed.
-    EXPECT_THROW({ reader->next(50, out); }, exception::LoggedException);
+    VELOX_ASSERT_THROW(reader->next(50, out), "");
 
     context.nextStripe();
     writer->reset();
@@ -370,7 +399,7 @@ void testDataTypeWriter(
 class ColumnWriterTest : public Test {
  public:
   static void SetUpTestCase() {
-    MemoryManager::testingSetInstance({});
+    MemoryManager::testingSetInstance(MemoryManager::Options{});
   }
 
  protected:
@@ -434,6 +463,43 @@ TEST_F(ColumnWriterTest, TestNullBooleanWriter) {
     data.emplace_back();
   }
   testDataTypeWriter(BOOLEAN(), data);
+}
+
+TEST_F(ColumnWriterTest, testDecimalWriter) {
+  const auto format = DwrfFormat::kOrc;
+  auto genShortDecimals = [&](bool hasNull) {
+    std::vector<std::optional<int64_t>> shortDecimals;
+    for (auto i = 0; i < ITERATIONS; ++i) {
+      if (!hasNull || i % 15) {
+        shortDecimals.emplace_back(i);
+      } else {
+        shortDecimals.emplace_back(std::nullopt);
+      }
+    }
+    return shortDecimals;
+  };
+
+  auto shortValues = genShortDecimals(false);
+  testDataTypeWriter(DECIMAL(10, 2), shortValues, /*sequence=*/0, format);
+  shortValues = genShortDecimals(true);
+  testDataTypeWriter(DECIMAL(10, 2), shortValues, /*sequence=*/0, format);
+
+  auto genLongDecimals = [&](bool hasNull) {
+    std::vector<std::optional<int128_t>> longDecimals;
+    for (auto i = 0; i < ITERATIONS; ++i) {
+      if (!hasNull || i % 15) {
+        longDecimals.emplace_back(HugeInt::build(123 * i, 456 * i + 789));
+      } else {
+        longDecimals.emplace_back(std::nullopt);
+      }
+    }
+    return longDecimals;
+  };
+
+  auto longValues = genLongDecimals(false);
+  testDataTypeWriter(DECIMAL(38, 4), longValues, /*sequence=*/0, format);
+  longValues = genLongDecimals(true);
+  testDataTypeWriter(DECIMAL(38, 4), longValues, /*sequence=*/0, format);
 }
 
 TEST_F(ColumnWriterTest, TestTimestampEpochWriter) {
@@ -996,7 +1062,7 @@ void testMapWriter(
       // values and iterate only until that number.
       // It does not support hasNext/next protocol.
       // Use a bigger number like 50, as some values may be bit packed.
-      EXPECT_THROW({ reader->next(50, out); }, exception::LoggedException);
+      VELOX_ASSERT_THROW(reader->next(50, out), "");
     };
 
     ASSERT_NO_FATAL_FAILURE(validate());
@@ -1128,7 +1194,7 @@ void testMapWriterRow(
       // values and iterate only until that number.
       // It does not support hasNext/next protocol.
       // Use a bigger number like 50, as some values may be bit packed.
-      EXPECT_THROW({ reader->next(50, out); }, exception::LoggedException);
+      VELOX_ASSERT_THROW(reader->next(50, out), "");
     };
 
     ASSERT_NO_FATAL_FAILURE(validate());
@@ -1258,12 +1324,9 @@ TEST_F(ColumnWriterTest, TestMapWriterDuplicatedInt64Key) {
   auto batch = b::create(
       *pool, {typename b::row{typename b::pair{5, 3}, typename b::pair{5, 4}}});
 
-  EXPECT_THAT(
-      ([&]() { testMapWriter<T, T>(*pool, batch, /* useFlatMap */ true); }),
-      Throws<
-          facebook::velox::dwio::common::exception::LoggedException>(Property(
-          &facebook::velox::dwio::common::exception::LoggedException::message,
-          HasSubstr("Duplicated key in map: 5"))));
+  VELOX_ASSERT_THROW(
+      (testMapWriter<T, T>(*pool, batch, /* useFlatMap */ true)),
+      "Duplicated key in map: 5");
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterInt32Key) {
@@ -1311,14 +1374,9 @@ TEST_F(ColumnWriterTest, TestMapWriterDuplicatedStringKey) {
       *pool_,
       {b::row{b::pair{"2", "5"}, b::pair{"2", "8"}}}); // Duplicated key: 2
 
-  EXPECT_THAT(
-      ([&]() {
-        testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ true);
-      }),
-      Throws<
-          facebook::velox::dwio::common::exception::LoggedException>(Property(
-          &facebook::velox::dwio::common::exception::LoggedException::message,
-          HasSubstr("Duplicated key in map: 2"))));
+  VELOX_ASSERT_THROW(
+      (testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ true)),
+      "Duplicated key in map: 2");
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterDifferentNumericKeyValue) {
@@ -1371,14 +1429,15 @@ TEST_F(ColumnWriterTest, TestMapWriterMixedBatchTypeHandling) {
   // Test type cast assertion in the direct encoding case.
   // TODO(T91654228): Check and throw for non-homogeneous batch types
   // when dictionary encoding is enabled.
-  EXPECT_THROW(
+  VELOX_ASSERT_THROW(
       (testMapWriter<keyType, valueType>(
           *pool_,
           batches,
           /* useFlatMap */ true,
+
           true,
           false)),
-      exception::LoggedException);
+      "");
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterBinaryKey) {
@@ -1580,12 +1639,10 @@ TEST_F(ColumnWriterTest, TestMapWriterUnalignedKeyValueCount) {
       sizes,
       keys,
       values);
-  ASSERT_THROW(
-      (testMapWriter<int64_t, int64_t>(*pool_, batch, false)),
-      exception::LoggedException);
-  ASSERT_THROW(
-      (testMapWriter<int64_t, int64_t>(*pool_, batch, true)),
-      exception::LoggedException);
+  VELOX_ASSERT_THROW(
+      (testMapWriter<int64_t, int64_t>(*pool_, batch, false)), "");
+  VELOX_ASSERT_THROW(
+      (testMapWriter<int64_t, int64_t>(*pool_, batch, true)), "");
 }
 
 TEST_F(ColumnWriterTest, TestStructKeysConfigSerializationDeserialization) {
@@ -1872,7 +1929,6 @@ int64_t generateRangeWithCustomLimits(
   // Generate the range such that we have similar amounts of values generated
   // for each exponent.
   double center = size % 2 ? -0.5 : interval / 2 - 0.5;
-  double value = center + (i - size / 2) * interval;
   // Return a guard-railed value with the numeric limits.
   // NOTE: There can be a more compact way to write this if we cast i and size
   // to signed types, but it's not worth the effort enforcing the assumptions.

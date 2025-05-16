@@ -15,14 +15,16 @@
  */
 #pragma once
 
+#include <boost/numeric/conversion/cast.hpp>
 #include <chrono>
 #include <optional>
-
 #include "velox/common/base/Doubles.h"
 #include "velox/external/date/date.h"
+#include "velox/functions/lib/DateTimeFormatter.h"
 #include "velox/functions/prestosql/types/TimestampWithTimeZoneType.h"
 #include "velox/type/Timestamp.h"
 #include "velox/type/TimestampConversion.h"
+#include "velox/type/tz/TimeZoneMap.h"
 
 namespace facebook::velox::functions {
 namespace {
@@ -65,19 +67,30 @@ FOLLY_ALWAYS_INLINE Timestamp fromUnixtime(double unixtime) {
   return Timestamp(seconds, milliseconds * kNanosecondsInMillisecond);
 }
 
-namespace {
-enum class DateTimeUnit {
-  kMillisecond,
-  kSecond,
-  kMinute,
-  kHour,
-  kDay,
-  kWeek,
-  kMonth,
-  kQuarter,
-  kYear
-};
-} // namespace
+FOLLY_ALWAYS_INLINE boost::int64_t fromUnixtime(
+    double unixtime,
+    int16_t timeZoneId) {
+  if (FOLLY_UNLIKELY(std::isnan(unixtime))) {
+    return pack(0, timeZoneId);
+  }
+
+  static const int64_t kMin = std::numeric_limits<int64_t>::min();
+
+  if (FOLLY_UNLIKELY(unixtime >= kMinDoubleAboveInt64Max)) {
+    return pack(std::numeric_limits<int64_t>::max(), timeZoneId);
+  }
+
+  if (FOLLY_UNLIKELY(unixtime <= kMin)) {
+    return pack(std::numeric_limits<int64_t>::min(), timeZoneId);
+  }
+
+  if (FOLLY_UNLIKELY(std::isinf(unixtime))) {
+    return unixtime < 0 ? pack(std::numeric_limits<int64_t>::min(), timeZoneId)
+                        : pack(std::numeric_limits<int64_t>::max(), timeZoneId);
+  }
+
+  return pack(std::llround(unixtime * kMillisecondsInSecond), timeZoneId);
+}
 
 // Year, quarter or month are not uniformly incremented. Months have different
 // total days, and leap years have more days than the rest. If the new year,
@@ -199,13 +212,65 @@ FOLLY_ALWAYS_INLINE Timestamp addToTimestamp(
           timestamp.getNanos() % kNanosecondsInMillisecond);
 }
 
+// If time zone is provided, use it for the arithmetic operation (convert to it,
+// apply operation, then convert back to UTC).
+FOLLY_ALWAYS_INLINE Timestamp addToTimestamp(
+    const Timestamp& timestamp,
+    const DateTimeUnit unit,
+    const int32_t value,
+    const tz::TimeZone* timeZone) {
+  if (timeZone == nullptr) {
+    return addToTimestamp(timestamp, unit, value);
+  } else {
+    Timestamp zonedTimestamp = timestamp;
+    zonedTimestamp.toTimezone(*timeZone);
+    auto resultTimestamp = addToTimestamp(zonedTimestamp, unit, value);
+    resultTimestamp.toGMT(*timeZone);
+    return resultTimestamp;
+  }
+}
+
 FOLLY_ALWAYS_INLINE int64_t addToTimestampWithTimezone(
     int64_t timestampWithTimezone,
     const DateTimeUnit unit,
     const int32_t value) {
-  auto timestamp = unpackTimestampUtc(timestampWithTimezone);
-  auto finalTimeStamp = addToTimestamp(timestamp, unit, (int32_t)value);
-  return pack(finalTimeStamp, unpackZoneKeyId(timestampWithTimezone));
+  {
+    int64_t finalSysMs;
+    if (unit < DateTimeUnit::kDay) {
+      auto originalTimestamp = unpackTimestampUtc(timestampWithTimezone);
+      finalSysMs =
+          addToTimestamp(originalTimestamp, unit, (int32_t)value).toMillis();
+    } else {
+      // Use local time to handle crossing daylight savings time boundaries.
+      // E.g. the "day" when the clock moves back an hour is 25 hours long, and
+      // the day it moves forward is 23 hours long. Daylight savings time
+      // doesn't affect time units less than a day, and will produce incorrect
+      // results if we use local time.
+      const tz::TimeZone* timeZone =
+          tz::locateZone(unpackZoneKeyId(timestampWithTimezone));
+      auto originalTimestamp =
+          Timestamp::fromMillis(timeZone
+                                    ->to_local(std::chrono::milliseconds(
+                                        unpackMillisUtc(timestampWithTimezone)))
+                                    .count());
+      auto updatedTimeStamp =
+          addToTimestamp(originalTimestamp, unit, (int32_t)value);
+      updatedTimeStamp = Timestamp(
+          timeZone
+              ->correct_nonexistent_time(
+                  std::chrono::seconds(updatedTimeStamp.getSeconds()))
+              .count(),
+          updatedTimeStamp.getNanos());
+      finalSysMs =
+          timeZone
+              ->to_sys(
+                  std::chrono::milliseconds(updatedTimeStamp.toMillis()),
+                  tz::TimeZone::TChoose::kEarliest)
+              .count();
+    }
+
+    return pack(finalSysMs, unpackZoneKeyId(timestampWithTimezone));
+  }
 }
 
 FOLLY_ALWAYS_INLINE int64_t diffTimestamp(
@@ -282,10 +347,25 @@ FOLLY_ALWAYS_INLINE int64_t diffTimestamp(
       std::chrono::duration_cast<std::chrono::milliseconds>(
           fromTimepoint - fromDaysTimepoint)
           .count();
-  const uint64_t toTimeInstantOfDay =
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          toTimepoint - toDaysTimepoint)
-          .count();
+
+  uint64_t toTimeInstantOfDay = 0;
+  uint64_t toTimePointMillis = toTimepoint.time_since_epoch().count();
+  uint64_t toDaysTimepointMillis =
+      std::chrono::
+          time_point<std::chrono::system_clock, std::chrono::milliseconds>(
+              toDaysTimepoint)
+              .time_since_epoch()
+              .count();
+  bool overflow = __builtin_sub_overflow(
+      toTimePointMillis, toDaysTimepointMillis, &toTimeInstantOfDay);
+  VELOX_USER_CHECK_EQ(
+      overflow,
+      false,
+      "{} - {} Causes arithmetic overflow: {} - {}",
+      fromTimestamp.toString(),
+      toTimestamp.toString(),
+      toTimePointMillis,
+      toDaysTimepointMillis);
   const uint8_t fromDay = static_cast<unsigned>(fromCalDate.day()),
                 fromMonth = static_cast<unsigned>(fromCalDate.month());
   const uint8_t toDay = static_cast<unsigned>(toCalDate.day()),
@@ -296,7 +376,8 @@ FOLLY_ALWAYS_INLINE int64_t diffTimestamp(
       static_cast<unsigned>(toCalLastYearMonthDay.day());
 
   if (unit == DateTimeUnit::kMonth || unit == DateTimeUnit::kQuarter) {
-    int64_t diff = (int(toCalDate.year()) - int(fromCalDate.year())) * 12 +
+    int64_t diff =
+        (int64_t(toCalDate.year()) - int64_t(fromCalDate.year())) * 12 +
         int(toMonth) - int(fromMonth);
 
     if ((toDay != toLastYearMonthDay && fromDay > toDay) ||
@@ -324,6 +405,45 @@ FOLLY_ALWAYS_INLINE int64_t diffTimestamp(
   VELOX_UNREACHABLE("Unsupported datetime unit");
 }
 
+FOLLY_ALWAYS_INLINE int64_t diffTimestampWithTimeZone(
+    const DateTimeUnit unit,
+    const int64_t fromTimestampWithTimeZone,
+    const int64_t toTimestampWithTimeZone) {
+  auto fromTimeZoneId = unpackZoneKeyId(fromTimestampWithTimeZone);
+  auto toTimeZoneId = unpackZoneKeyId(toTimestampWithTimeZone);
+  VELOX_CHECK_EQ(
+      fromTimeZoneId,
+      toTimeZoneId,
+      "diffTimestampWithTimeZone must receive timestamps in the same time zone.");
+
+  Timestamp fromTimestamp;
+  Timestamp toTimestamp;
+
+  if (unit < DateTimeUnit::kDay) {
+    fromTimestamp = unpackTimestampUtc(fromTimestampWithTimeZone);
+    toTimestamp = unpackTimestampUtc(toTimestampWithTimeZone);
+  } else {
+    // Use local time to handle crossing daylight savings time boundaries.
+    // E.g. the "day" when the clock moves back an hour is 25 hours long, and
+    // the day it moves forward is 23 hours long. Daylight savings time
+    // doesn't affect time units less than a day, and will produce incorrect
+    // results if we use local time.
+    const tz::TimeZone* timeZone = tz::locateZone(fromTimeZoneId);
+    fromTimestamp = Timestamp::fromMillis(
+        timeZone
+            ->to_local(std::chrono::milliseconds(
+                unpackMillisUtc(fromTimestampWithTimeZone)))
+            .count());
+    toTimestamp =
+        Timestamp::fromMillis(timeZone
+                                  ->to_local(std::chrono::milliseconds(
+                                      unpackMillisUtc(toTimestampWithTimeZone)))
+                                  .count());
+  }
+
+  return diffTimestamp(unit, fromTimestamp, toTimestamp);
+}
+
 FOLLY_ALWAYS_INLINE
 int64_t diffDate(
     const DateTimeUnit unit,
@@ -338,4 +458,35 @@ int64_t diffDate(
       Timestamp((int64_t)fromDate * util::kSecsPerDay, 0),
       Timestamp((int64_t)toDate * util::kSecsPerDay, 0));
 }
+
+FOLLY_ALWAYS_INLINE int64_t
+valueOfTimeUnitToMillis(const double value, std::string_view unit) {
+  double convertedValue = value;
+  if (unit == "ns") {
+    convertedValue = convertedValue * std::milli::den / std::nano::den;
+  } else if (unit == "us") {
+    convertedValue = convertedValue * std::milli::den / std::micro::den;
+  } else if (unit == "ms") {
+  } else if (unit == "s") {
+    convertedValue = convertedValue * std::milli::den;
+  } else if (unit == "m") {
+    convertedValue = convertedValue * 60 * std::milli::den;
+  } else if (unit == "h") {
+    convertedValue = convertedValue * 3600 * std::milli::den;
+  } else if (unit == "d") {
+    convertedValue = convertedValue * 86400 * std::milli::den;
+  } else {
+    VELOX_USER_FAIL("Unknown time unit: {}", unit);
+  }
+  try {
+    return boost::numeric_cast<int64_t>(std::round(convertedValue));
+  } catch (const boost::bad_numeric_cast&) {
+    VELOX_USER_FAIL(
+        "Value in {} unit is too large to be represented in ms unit as an int64_t",
+        unit,
+        value);
+  }
+  VELOX_UNREACHABLE();
+}
+
 } // namespace facebook::velox::functions

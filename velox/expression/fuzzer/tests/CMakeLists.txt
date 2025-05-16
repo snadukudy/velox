@@ -12,21 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_library(velox_expression_fuzzer_test_utility ArgGeneratorTestUtils.cpp)
-target_link_libraries(velox_expression_fuzzer_test_utility
-                      velox_expression_functions velox_function_registry gtest)
+add_library(velox_expression_fuzzer_test_utility ArgTypesGeneratorTestUtils.cpp)
+target_link_libraries(
+  velox_expression_fuzzer_test_utility velox_expression_functions
+  velox_function_registry GTest::gtest)
 
 add_executable(
   velox_expression_fuzzer_unit_test
-  ArgumentTypeFuzzerTest.cpp DecimalArgGeneratorTest.cpp
+  ArgumentTypeFuzzerTest.cpp DecimalArgTypesGeneratorTest.cpp
   ExpressionFuzzerUnitTest.cpp)
 
 target_link_libraries(
   velox_expression_fuzzer_unit_test
   velox_expression_fuzzer
   velox_functions_prestosql
+  velox_presto_types
   velox_core
   velox_expression
   velox_expression_fuzzer_test_utility
-  gtest
-  gtest_main)
+  GTest::gtest
+  GTest::gtest_main)

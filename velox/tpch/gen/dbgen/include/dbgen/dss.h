@@ -1,4 +1,19 @@
 /*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
  * Copyright owned by the Transaction Processing Performance Council.
  *
  * A copy of the license is included under extension/tpch/dbgen/LICENSE
@@ -103,6 +118,8 @@
 #define RANDOM(tgt, lower, upper, seed) dss_random(&tgt, lower, upper, seed)
 #define RANDOM64(tgt, lower, upper, seed) dss_random64(&tgt, lower, upper, seed)
 
+namespace facebook::velox::tpch::dbgen {
+
 typedef struct {
   long weight;
   char* text;
@@ -118,7 +135,7 @@ typedef struct {
  * some handy access functions
  */
 #define DIST_SIZE(d) d->count
-#define DIST_MEMBER(d, i) ((set_member*)((d)->list + i))->text
+#define DIST_MEMBER(d, i) (reinterpret_cast<set_member*>((d)->list + i))->text
 #define DIST_PERMUTE(d, i) (d->permute[i])
 
 typedef struct {
@@ -147,7 +164,6 @@ struct DBGenContext;
 
 /* bm_utils.c */
 const char* tpch_env_config PROTO((const char* var, const char* dflt));
-long yes_no PROTO((char* prompt));
 void tpch_a_rnd PROTO((int min, int max, seed_t* seed, char* dest));
 int tx_rnd PROTO((long min, long max, long column, char* tgt));
 long julian PROTO((long date));
@@ -419,9 +435,21 @@ int dbg_print(int dt, FILE* tgt, void* data, int len, int eol);
 #define PR_STRT(fp) /* any line prep for a record goes here */
 #define PR_END(fp) fprintf(fp, "\n") /* finish the record here */
 #ifdef MDY_DATE
-#define PR_DATE(tgt, yr, mn, dy) sprintf(tgt, "%02d-%02d-19%02d", mn, dy, yr)
+#define PR_DATE(tgt, yr, mn, dy)                                \
+  do {                                                          \
+    auto res = sprintf(tgt, "19%02ld-%02ld-%02ld", yr, mn, dy); \
+    if (res < 0) {                                              \
+      tgt[0] = '\0';                                            \
+    }                                                           \
+  } while (0)
 #else
-#define PR_DATE(tgt, yr, mn, dy) sprintf(tgt, "19%02ld-%02ld-%02ld", yr, mn, dy)
+#define PR_DATE(tgt, yr, mn, dy)                                \
+  do {                                                          \
+    auto res = sprintf(tgt, "19%02ld-%02ld-%02ld", yr, mn, dy); \
+    if (res < 0) {                                              \
+      tgt[0] = '\0';                                            \
+    }                                                           \
+  } while (0)
 #endif /* DATE_FORMAT */
 
 /*
@@ -563,5 +591,7 @@ struct DBGenContext {
 
   long scale_factor = 1;
 };
+
+} // namespace facebook::velox::tpch::dbgen
 
 #endif /* DSS_H */

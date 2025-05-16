@@ -20,13 +20,13 @@
 #include "velox/common/memory/MallocAllocator.h"
 #include "velox/common/memory/MmapAllocator.h"
 #include "velox/common/memory/MmapArena.h"
+#include "velox/common/memory/SharedArbitrator.h"
 #include "velox/common/testutil/TestValue.h"
 
 #include <fmt/format.h>
 #include <folly/Random.h>
 #include <folly/Range.h>
 #include <gflags/gflags.h>
-#include <glog/logging.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
@@ -68,12 +68,14 @@ class MemoryAllocatorTest : public testing::TestWithParam<int> {
     enableReservation_ = GetParam() == 2;
     maxMallocBytes_ = 3072;
     if (useMmap_) {
-      MemoryManagerOptions options;
+      MemoryManager::Options options;
       options.useMmapAllocator = true;
       options.allocatorCapacity = kCapacityBytes;
       options.arbitratorCapacity = kCapacityBytes;
-      options.arbitratorReservedCapacity = 128 << 20;
-      options.memoryPoolReservedCapacity = 1 << 20;
+      using ExtraConfig = SharedArbitrator::ExtraConfig;
+      options.extraArbitratorConfigs = {
+          {std::string(ExtraConfig::kReservedCapacity), "128MB"},
+          {std::string(ExtraConfig::kMemoryPoolReservedCapacity), "1MB"}};
       options.smallAllocationReservePct = 4;
       options.maxMallocBytes = maxMallocBytes_;
       memoryManager_ = std::make_unique<MemoryManager>(options);
@@ -84,11 +86,13 @@ class MemoryAllocatorTest : public testing::TestWithParam<int> {
                   AllocationTraits::kPageSize,
               64 * memoryManager_->allocator()->sizeClasses().back()));
     } else {
-      MemoryManagerOptions options;
+      MemoryManager::Options options;
       options.allocatorCapacity = kCapacityBytes;
       options.arbitratorCapacity = kCapacityBytes;
-      options.arbitratorReservedCapacity = 128 << 20;
-      options.memoryPoolReservedCapacity = 1 << 20;
+      using ExtraConfig = SharedArbitrator::ExtraConfig;
+      options.extraArbitratorConfigs = {
+          {std::string(ExtraConfig::kReservedCapacity), "128MB"},
+          {std::string(ExtraConfig::kMemoryPoolReservedCapacity), "1MB"}};
       if (!enableReservation_) {
         options.allocationSizeThresholdWithReservation = 0;
       }
@@ -633,7 +637,6 @@ TEST_P(MemoryAllocatorTest, allocationClass2) {
 
 TEST_P(MemoryAllocatorTest, stats) {
   const std::vector<MachinePageCount>& sizes = instance_->sizeClasses();
-  MachinePageCount capacity = kCapacityPages;
   for (auto i = 0; i < sizes.size(); ++i) {
     std::unique_ptr<Allocation> allocation = std::make_unique<Allocation>();
     auto size = sizes[i];
@@ -959,7 +962,6 @@ TEST_P(MemoryAllocatorTest, allocContiguous) {
   for (const auto& testData : testSettings) {
     SCOPED_TRACE(fmt::format("{} useMmap{}", testData.debugString(), useMmap_));
     setupAllocator();
-    const MachinePageCount nonContiguousPages = 100;
     Allocation allocation;
     if (testData.nonContiguousPages != 0) {
       instance_->allocateNonContiguous(testData.nonContiguousPages, allocation);
@@ -1061,7 +1063,6 @@ TEST_P(MemoryAllocatorTest, allocContiguousFail) {
     SCOPED_TRACE(
         fmt::format("{} useMmap {}", testData.debugString(), useMmap_));
     setupAllocator();
-    const MachinePageCount nonContiguousPages = 100;
     Allocation allocation;
     if (testData.nonContiguousPages != 0) {
       instance_->allocateNonContiguous(testData.nonContiguousPages, allocation);
@@ -1372,7 +1373,6 @@ TEST_P(MemoryAllocatorTest, StlMemoryAllocator) {
     // Allocation from classes and ContiguousAllocation outside size
     // classes.
     constexpr int32_t kNumDoubles = 256 * 1024;
-    size_t capacity = 0;
     for (auto i = 0; i < kNumDoubles; i++) {
       data.push_back(i);
     }
@@ -1949,13 +1949,15 @@ class MmapConfigTest : public testing::Test {
  protected:
   void setupAllocator() {
     constexpr int64_t kCapacityBytes = 900LL << 20; // 900MB.
-    MemoryManagerOptions options;
+    MemoryManager::Options options;
     options.useMmapAllocator = true;
     options.allocatorCapacity = kCapacityBytes;
     options.largestSizeClassPages = 4096;
     options.arbitratorCapacity = kCapacityBytes;
-    options.arbitratorReservedCapacity = 128 << 20;
-    options.memoryPoolReservedCapacity = 1 << 20;
+    using ExtraConfig = SharedArbitrator::ExtraConfig;
+    options.extraArbitratorConfigs = {
+        {std::string(ExtraConfig::kReservedCapacity), "128MB"},
+        {std::string(ExtraConfig::kMemoryPoolReservedCapacity), "1MB"}};
     options.smallAllocationReservePct = 4;
     options.maxMallocBytes = 3 * 1024;
     memoryManager_ = std::make_unique<MemoryManager>(options);

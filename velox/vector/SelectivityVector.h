@@ -28,8 +28,7 @@
 #include "velox/common/base/Range.h"
 #include "velox/vector/TypeAliases.h"
 
-namespace facebook {
-namespace velox {
+namespace facebook::velox {
 
 // A selectivityVector is used to logically filter / select data in place.
 // The goal here is to be able to pass this vector between filter stages on
@@ -294,7 +293,9 @@ class SelectivityVector {
     if (begin_ == -1) {
       begin_ = 0;
       end_ = 0;
+      VELOX_SUPPRESS_STRINGOP_OVERFLOW_WARNING
       allSelected_ = false;
+      VELOX_UNSUPPRESS_STRINGOP_OVERFLOW_WARNING
       return;
     }
     end_ = bits::findLastBit(bits_.data(), begin_, size_) + 1;
@@ -467,5 +468,5 @@ void translateToInnerRows(
     const vector_size_t* indices,
     const uint64_t* nulls,
     SelectivityVector& innerRows);
-} // namespace velox
-} // namespace facebook
+
+} // namespace facebook::velox

@@ -20,6 +20,7 @@ namespace facebook::velox::exec::test {
 
 void MinMaxByResultVerifier::initialize(
     const std::vector<RowVectorPtr>& input,
+    const std::vector<core::ExprPtr>& projections,
     const std::vector<std::string>& groupingKeys,
     const core::AggregationNode::Aggregate& aggregate,
     const std::string& aggregateName) {
@@ -95,7 +96,9 @@ void MinMaxByResultVerifier::initialize(
   // GROUP BY
   //     b
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
-  auto plan = PlanBuilder(planNodeIdGenerator, input[0]->pool()).values(input);
+  auto plan = PlanBuilder(planNodeIdGenerator, input[0]->pool())
+                  .values(input)
+                  .projectExpressions(projections);
   // Filter out masked rows first so that groups with all rows filtered out
   // won't take a row_number during the filtering later.
   if (aggregate.mask != nullptr) {
@@ -369,10 +372,10 @@ int32_t MinMaxByResultVerifier::getElementIndexInBucketWithMemo(
 std::string MinMaxByResultVerifier::extractYColumnName(
     const core::AggregationNode::Aggregate& aggregate) {
   const auto& args = aggregate.call->inputs();
-  VELOX_CHECK_GE(args.size(), 2)
+  VELOX_CHECK_GE(args.size(), 2);
 
   auto inputField = core::TypedExprs::asFieldAccess(args[1]);
-  VELOX_CHECK_NOT_NULL(inputField)
+  VELOX_CHECK_NOT_NULL(inputField);
 
   return inputField->name();
 }
@@ -380,11 +383,11 @@ std::string MinMaxByResultVerifier::extractYColumnName(
 std::string MinMaxByResultVerifier::makeArrayAggCall(
     const core::AggregationNode::Aggregate& aggregate) {
   const auto& args = aggregate.call->inputs();
-  VELOX_CHECK_GE(args.size(), 1)
+  VELOX_CHECK_GE(args.size(), 1);
 
   auto distinct = aggregate.distinct ? "distinct" : "";
   auto inputField = core::TypedExprs::asFieldAccess(args[0]);
-  VELOX_CHECK_NOT_NULL(inputField)
+  VELOX_CHECK_NOT_NULL(inputField);
 
   // Use $internal$array_agg to ensure we don't ignore input nulls since they
   // may affect the result of min_by/max_by.

@@ -33,7 +33,7 @@ using ::duckdb::string_t;
 using ::duckdb::timestamp_t;
 
 variant decimalVariant(const Value& val) {
-  VELOX_DCHECK(val.type().id() == LogicalTypeId::DECIMAL)
+  VELOX_DCHECK(val.type().id() == LogicalTypeId::DECIMAL);
   switch (val.type().InternalType()) {
     case ::duckdb::PhysicalType::INT128: {
       auto unscaledValue = val.GetValueUnsafe<::duckdb::hugeint_t>();
@@ -141,7 +141,7 @@ TypePtr toVeloxType(LogicalType type, bool fileColumnNamesReadAsLowerCase) {
     case LogicalTypeId::TIMESTAMP:
       return TIMESTAMP();
     case LogicalTypeId::TIMESTAMP_TZ: {
-      if (auto customType = getCustomType("TIMESTAMP WITH TIME ZONE")) {
+      if (auto customType = getCustomType("TIMESTAMP WITH TIME ZONE", {})) {
         return customType;
       }
       [[fallthrough]];
@@ -182,14 +182,14 @@ TypePtr toVeloxType(LogicalType type, bool fileColumnNamesReadAsLowerCase) {
       return ROW(std::move(names), std::move(types));
     }
     case LogicalTypeId::UUID: {
-      if (auto customType = getCustomType("UUID")) {
+      if (auto customType = getCustomType("UUID", {})) {
         return customType;
       }
       [[fallthrough]];
     }
     case LogicalTypeId::USER: {
       const auto name = ::duckdb::UserType::GetTypeName(type);
-      if (auto customType = getCustomType(name)) {
+      if (auto customType = getCustomType(name, {})) {
         return customType;
       }
       [[fallthrough]];

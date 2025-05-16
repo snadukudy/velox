@@ -18,6 +18,7 @@
 #include "velox/exec/RowContainer.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/lib/aggregates/tests/utils/AggregationTestBase.h"
+#include "velox/functions/prestosql/types/TimestampWithTimeZoneType.h"
 
 using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
@@ -26,6 +27,11 @@ using namespace facebook::velox::functions::aggregate::test;
 namespace facebook::velox::aggregate::test {
 
 namespace {
+
+constexpr int64_t kLongMax = std::numeric_limits<int64_t>::max();
+constexpr int64_t kLongMin = std::numeric_limits<int64_t>::min();
+constexpr int128_t kHugeMax = std::numeric_limits<int128_t>::max();
+constexpr int128_t kHugeMin = std::numeric_limits<int128_t>::min();
 
 class HistogramTest : public AggregationTestBase {
  protected:
@@ -207,6 +213,162 @@ TEST_F(HistogramTest, groupByString) {
   testGlobalHistogramWithDuck(data);
 }
 
+TEST_F(HistogramTest, groupByTimestampWithTimezones) {
+  auto vector = makeFlatVector<int64_t>(
+      {pack(0, 0),
+       pack(1, 0),
+       pack(2, 0),
+       pack(0, 1),
+       pack(1, 1),
+       pack(1, 2),
+       pack(2, 2),
+       pack(3, 3),
+       pack(1, 1),
+       pack(3, 0)},
+      TIMESTAMP_WITH_TIME_ZONE());
+
+  auto keys = makeFlatVector<int16_t>(10, [](auto row) { return row % 2; });
+
+  auto expected = makeRowVector(
+      {makeFlatVector<int16_t>({0, 1}),
+       makeMapVector<int64_t, int64_t>(
+           {{{pack(0, 0), 1}, {pack(1, 1), 2}, {pack(2, 0), 2}},
+            {{pack(0, 1), 1}, {pack(1, 0), 2}, {pack(3, 3), 2}}},
+           MAP(TIMESTAMP_WITH_TIME_ZONE(), BIGINT()))});
+
+  testHistogram("histogram(c1)", {"c0"}, keys, vector, expected);
+}
+
+TEST_F(HistogramTest, groupByLongDecimal) {
+  auto type = DECIMAL(30, 2);
+
+  auto vector = makeFlatVector<int128_t>({1000, 1001, 1002, 1003, 1000}, type);
+  auto keys = makeFlatVector<int16_t>(5, [](auto row) { return row % 2; });
+  auto expected = makeRowVector(
+      {makeFlatVector<int16_t>({0, 1}),
+       makeMapVector<int128_t, int64_t>(
+           {{{{1000}, 2}, {{1002}, 1}}, {{{1001}, 1}, {{1003}, 1}}},
+           MAP(type, BIGINT()))});
+
+  testHistogram("histogram(c1)", {"c0"}, keys, vector, expected);
+
+  // with commonly used precision & scale
+  auto type1 = DECIMAL(38, 0);
+  auto vector1 = makeFlatVector<int128_t>({1000, 1001, 1002, 1003, 1000}, type);
+  auto keys1 = makeFlatVector<int16_t>(5, [](auto row) { return row % 2; });
+  auto expected1 = makeRowVector(
+      {makeFlatVector<int16_t>({0, 1}),
+       makeMapVector<int128_t, int64_t>(
+           {{{{1000}, 2}, {{1002}, 1}}, {{{1001}, 1}, {{1003}, 1}}},
+           MAP(type, BIGINT()))});
+
+  testHistogram("histogram(c1)", {"c0"}, keys1, vector1, expected1);
+}
+
+TEST_F(HistogramTest, groupByShortDecimal) {
+  auto type = DECIMAL(5, 2);
+
+  auto vector = makeFlatVector<int64_t>({1000, 1001, 1002, 1003, 1000}, type);
+  auto keys = makeFlatVector<int16_t>(5, [](auto row) { return row % 2; });
+  auto expected = makeRowVector(
+      {makeFlatVector<int16_t>({0, 1}),
+       makeMapVector<int64_t, int64_t>(
+           {{{{1000}, 2}, {{1002}, 1}}, {{{1001}, 1}, {{1003}, 1}}},
+           MAP(type, BIGINT()))});
+
+  testHistogram("histogram(c1)", {"c0"}, keys, vector, expected);
+}
+
+TEST_F(HistogramTest, globalLongDecimal) {
+  auto type = DECIMAL(30, 2);
+
+  auto vector = makeFlatVector<int128_t>(
+      {10023, kHugeMax, 20035, 10023, kHugeMin, 40033, kHugeMin}, type);
+  auto expected = makeRowVector({makeMapVector<int128_t, int64_t>(
+      {{{{kHugeMin}, 2},
+        {{10023}, 2},
+        {{20035}, 1},
+        {{40033}, 1},
+        {{kHugeMax}, 1}}},
+      MAP(type, BIGINT()))});
+
+  testHistogram("histogram(c1)", {}, vector, vector, expected);
+
+  // with nullable vectors
+  auto vectorWithNulls = makeNullableFlatVector<int128_t>(
+      {10023,
+       kHugeMax,
+       std::nullopt,
+       std::nullopt,
+       20035,
+       10023,
+       kHugeMin,
+       40033,
+       std::nullopt,
+       kHugeMin},
+      type);
+  auto expectedResultWithNullInputs =
+      makeRowVector({makeMapVector<int128_t, int64_t>(
+          {{{{kHugeMin}, 2},
+            {{10023}, 2},
+            {{20035}, 1},
+            {{40033}, 1},
+            {{kHugeMax}, 1}}},
+          MAP(type, BIGINT()))});
+
+  testHistogram(
+      "histogram(c1)",
+      {},
+      vectorWithNulls,
+      vectorWithNulls,
+      expectedResultWithNullInputs);
+}
+
+TEST_F(HistogramTest, gllobalShortDecimal) {
+  auto type = DECIMAL(5, 2);
+
+  auto vector = makeFlatVector<int64_t>(
+      {10023, kLongMax, 20035, 10023, kLongMin, 40033, kLongMin}, type);
+  auto expected = makeRowVector({makeMapVector<int64_t, int64_t>(
+      {{{{kLongMin}, 2},
+        {{10023}, 2},
+        {{20035}, 1},
+        {{40033}, 1},
+        {{kLongMax}, 1}}},
+      MAP(type, BIGINT()))});
+
+  testHistogram("histogram(c1)", {}, vector, vector, expected);
+
+  // with nullable vectors
+  auto vectorWithNulls = makeNullableFlatVector<int64_t>(
+      {10023,
+       kLongMax,
+       std::nullopt,
+       std::nullopt,
+       20035,
+       10023,
+       kLongMin,
+       40033,
+       std::nullopt,
+       kLongMin},
+      type);
+  auto expectedResultWithNullInputs =
+      makeRowVector({makeMapVector<int64_t, int64_t>(
+          {{{{kLongMin}, 2},
+            {{10023}, 2},
+            {{20035}, 1},
+            {{40033}, 1},
+            {{kLongMax}, 1}}},
+          MAP(type, BIGINT()))});
+
+  testHistogram(
+      "histogram(c1)",
+      {},
+      vectorWithNulls,
+      vectorWithNulls,
+      expectedResultWithNullInputs);
+}
+
 TEST_F(HistogramTest, globalInteger) {
   vector_size_t num = 29;
   auto vector = makeFlatVector<int32_t>(
@@ -315,6 +477,25 @@ TEST_F(HistogramTest, globalNaNs) {
   auto expected = makeRowVector({makeMapVectorFromJson<double, int64_t>({
       "{1: 1, 2: 1, 3: 2, NaN: 4}",
   })});
+
+  testHistogram("histogram(c1)", {}, vector, vector, expected);
+}
+
+TEST_F(HistogramTest, globalTimestampWithTimezones) {
+  auto vector = makeFlatVector<int64_t>(
+      {pack(0, 0),
+       pack(1, 0),
+       pack(2, 0),
+       pack(0, 1),
+       pack(1, 1),
+       pack(1, 2),
+       pack(2, 2),
+       pack(3, 3)},
+      TIMESTAMP_WITH_TIME_ZONE());
+
+  auto expected = makeRowVector({makeMapVector<int64_t, int64_t>(
+      {{{pack(0, 0), 2}, {pack(1, 0), 3}, {pack(2, 0), 2}, {pack(3, 3), 1}}},
+      MAP(TIMESTAMP_WITH_TIME_ZONE(), BIGINT()))});
 
   testHistogram("histogram(c1)", {}, vector, vector, expected);
 }

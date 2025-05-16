@@ -21,11 +21,11 @@ set(velox_benchmark_deps
     velox_parse_expression
     velox_serialization
     Folly::folly
-    ${FOLLY_BENCHMARK}
+    Folly::follybenchmark
     ${DOUBLE_CONVERSION}
     gflags::gflags
     glog::glog)
 
 add_executable(velox_memory_alloc_benchmark MemoryAllocationBenchmark.cpp)
-target_link_libraries(velox_memory_alloc_benchmark ${velox_benchmark_deps}
-                      velox_memory pthread)
+target_link_libraries(
+  velox_memory_alloc_benchmark ${velox_benchmark_deps} velox_memory pthread)

@@ -91,6 +91,8 @@ class SimpleFunctionRegistry {
     }
   }
 
+  void removeFunction(const std::string& name);
+
   std::vector<std::string> getFunctionNames() const {
     std::vector<std::string> result;
     registeredFunctions_.withRLock([&](const auto& map) {
@@ -130,6 +132,10 @@ class SimpleFunctionRegistry {
 
     std::string helpMessage(const std::string& name) const {
       return functionEntry_.getMetadata().helpMessage(name);
+    }
+
+    std::string toDebugString() const {
+      return functionEntry_.getMetadata().toDebugString();
     }
 
     VectorFunctionMetadata metadata() const {

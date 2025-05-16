@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/functions/prestosql/aggregates/SumAggregate.h"
 #include "velox/functions/lib/aggregates/SumAggregateBase.h"
 #include "velox/functions/prestosql/aggregates/AggregateNames.h"
 
@@ -48,7 +49,12 @@ exec::AggregateRegistrationResult registerSum(
           .build(),
   };
 
-  for (const auto& inputType : {"tinyint", "smallint", "integer", "bigint"}) {
+  for (const auto& inputType :
+       {"tinyint",
+        "smallint",
+        "integer",
+        "bigint",
+        INTERVAL_DAY_TIME()->name()}) {
     signatures.push_back(exec::AggregateFunctionSignatureBuilder()
                              .returnType("bigint")
                              .intermediateType("bigint")
@@ -102,7 +108,6 @@ exec::AggregateRegistrationResult registerSum(
             // type is either int128_t or
             // UnscaledLongDecimalWithOverflowState.
             return std::make_unique<DecimalSumAggregate<int128_t>>(resultType);
-
           default:
             VELOX_UNREACHABLE(
                 "Unknown input type for {} aggregation {}",
@@ -110,7 +115,7 @@ exec::AggregateRegistrationResult registerSum(
                 inputType->kindName());
         }
       },
-      {false /*orderSensitive*/},
+      {false /*orderSensitive*/, false /*companionFunction*/},
       withCompanionFunctions,
       overwrite);
 }

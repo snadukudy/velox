@@ -11,17 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-add_library(
+velox_add_library(
   velox_vector
   BaseVector.cpp
   ComplexVector.cpp
   ConstantVector.cpp
   DecodedVector.cpp
+  EncodedVectorCopy.cpp
   FlatVector.cpp
   LazyVector.cpp
   SelectivityVector.cpp
   SequenceVector.cpp
   SimpleVector.cpp
+  StringVectorBuffer.cpp
   VariantToVector.cpp
   VectorEncoding.cpp
   VectorMap.cpp
@@ -30,8 +32,14 @@ add_library(
   VectorSaver.cpp
   VectorStream.cpp)
 
-target_link_libraries(velox_vector velox_encode velox_memory velox_time
-                      velox_type velox_buffer)
+velox_link_libraries(
+  velox_vector
+  velox_encode
+  velox_memory
+  velox_row_fast
+  velox_time
+  velox_type
+  velox_buffer)
 
 add_subdirectory(arrow)
 add_subdirectory(fuzzer)

@@ -712,7 +712,6 @@ bool NegatedBytesValues::testingEquals(const Filter& other) const {
 
 folly::dynamic MultiRange::serialize() const {
   auto obj = Filter::serializeBase("MultiRange");
-  obj["nanAllowed"] = nanAllowed_;
   folly::dynamic arr = folly::dynamic::array;
   for (const auto& f : filters_) {
     arr.push_back(f->serialize());
@@ -723,7 +722,6 @@ folly::dynamic MultiRange::serialize() const {
 
 FilterPtr MultiRange::create(const folly::dynamic& obj) {
   auto nullAllowed = deserializeNullAllowed(obj);
-  auto nanAllowed = obj["nanAllowed"].asBool();
   folly::dynamic arr = obj["filters"];
   auto tmpFilters = ISerializable::deserialize<std::vector<Filter>>(arr);
 
@@ -733,14 +731,13 @@ FilterPtr MultiRange::create(const folly::dynamic& obj) {
     filters.emplace_back(f->clone());
   }
 
-  return std::make_unique<MultiRange>(
-      std::move(filters), nullAllowed, nanAllowed);
+  return std::make_unique<MultiRange>(std::move(filters), nullAllowed);
 }
 
 bool MultiRange::testingEquals(const Filter& other) const {
   auto otherMultiRange = dynamic_cast<const MultiRange*>(&other);
   auto res = otherMultiRange != nullptr && Filter::testingBaseEquals(other) &&
-      nanAllowed_ == otherMultiRange->nanAllowed_ &&
+
       filters_.size() == otherMultiRange->filters_.size();
 
   if (!res) {
@@ -823,7 +820,7 @@ BigintValuesUsingHashTable::BigintValuesUsingHashTable(
   // Size the hash table to be 2+x the entry count, e.g. 10 entries
   // gets 1 << log2 of 50 == 32. The filter is expected to fail often so we
   // wish to increase the chance of hitting empty on first probe.
-  auto size = 1u << (uint32_t)std::log2(values.size() * 5);
+  auto size = 1u << static_cast<uint32_t>(std::log2(values.size() * 5));
   hashTable_.resize(size + kPaddingElements);
   sizeMask_ = size - 1;
   std::fill(hashTable_.begin(), hashTable_.end(), kEmptyMarker);
@@ -994,8 +991,8 @@ FilterPtr HugeintValuesUsingHashTable::create(const folly::dynamic& obj) {
 }
 
 HugeintValuesUsingHashTable::HugeintValuesUsingHashTable(
-    const int128_t min,
-    const int128_t max,
+    const int128_t& min,
+    const int128_t& max,
     const std::vector<int128_t>& values,
     const bool nullAllowed)
     : Filter(true, nullAllowed, FilterKind::kHugeintValuesUsingHashTable),
@@ -1008,7 +1005,7 @@ HugeintValuesUsingHashTable::HugeintValuesUsingHashTable(
   }
 }
 
-bool HugeintValuesUsingHashTable::testInt128(int128_t value) const {
+bool HugeintValuesUsingHashTable::testInt128(const int128_t& value) const {
   return values_.contains(value);
 }
 
@@ -1155,7 +1152,7 @@ std::unique_ptr<Filter> createBigintValuesFilter(
   bool overflow = __builtin_sub_overflow(max, min, &range);
   if (LIKELY(!overflow)) {
     // all accepted/rejected values form one contiguous block
-    if ((uint64_t)range + 1 == values.size()) {
+    if (static_cast<uint64_t>(range) + 1 == values.size()) {
       if (negated) {
         return std::make_unique<NegatedBigintRange>(min, max, nullAllowed);
       }
@@ -1357,7 +1354,7 @@ std::unique_ptr<Filter> NegatedBytesRange::toMultiRange() const {
   if (accepted.size() == 1) {
     return accepted[0]->clone(nullAllowed_);
   }
-  return std::make_unique<MultiRange>(std::move(accepted), nullAllowed_, false);
+  return std::make_unique<MultiRange>(std::move(accepted), nullAllowed_);
 }
 
 bool NegatedBytesValues::testBytesRange(
@@ -1439,17 +1436,13 @@ std::unique_ptr<Filter> MultiRange::clone(
 
   if (nullAllowed) {
     return std::make_unique<MultiRange>(
-        std::move(filters), nullAllowed.value(), nanAllowed_);
+        std::move(filters), nullAllowed.value());
   } else {
-    return std::make_unique<MultiRange>(
-        std::move(filters), nullAllowed_, nanAllowed_);
+    return std::make_unique<MultiRange>(std::move(filters), nullAllowed_);
   }
 }
 
 bool MultiRange::testDouble(double value) const {
-  if (std::isnan(value)) {
-    return nanAllowed_;
-  }
   for (const auto& filter : filters_) {
     if (filter->testDouble(value)) {
       return true;
@@ -1459,9 +1452,6 @@ bool MultiRange::testDouble(double value) const {
 }
 
 bool MultiRange::testFloat(float value) const {
-  if (std::isnan(value)) {
-    return nanAllowed_;
-  }
   for (const auto& filter : filters_) {
     if (filter->testFloat(value)) {
       return true;
@@ -1479,7 +1469,7 @@ bool MultiRange::testBytes(const char* value, int32_t length) const {
   return false;
 }
 
-bool MultiRange::testTimestamp(Timestamp timestamp) const {
+bool MultiRange::testTimestamp(const Timestamp& timestamp) const {
   for (const auto& filter : filters_) {
     if (filter->testTimestamp(timestamp)) {
       return true;
@@ -1554,7 +1544,6 @@ std::unique_ptr<Filter> MultiRange::mergeWith(const Filter* other) const {
     case FilterKind::kBytesRange:
     case FilterKind::kMultiRange: {
       bool bothNullAllowed = nullAllowed_ && other->testNull();
-      bool bothNanAllowed = nanAllowed_;
       std::vector<const Filter*> otherFilters;
 
       if (other->kind() == FilterKind::kMultiRange) {
@@ -1562,7 +1551,6 @@ std::unique_ptr<Filter> MultiRange::mergeWith(const Filter* other) const {
         for (auto const& filterOther : multiRangeOther->filters()) {
           otherFilters.emplace_back(filterOther.get());
         }
-        bothNanAllowed = bothNanAllowed && multiRangeOther->nanAllowed();
       } else {
         otherFilters.emplace_back(other);
       }
@@ -1614,8 +1602,7 @@ std::unique_ptr<Filter> MultiRange::mergeWith(const Filter* other) const {
       } else if (merged.size() == 1) {
         return merged.front()->clone(bothNullAllowed);
       } else {
-        return std::make_unique<MultiRange>(
-            std::move(merged), bothNullAllowed, bothNanAllowed);
+        return std::make_unique<MultiRange>(std::move(merged), bothNullAllowed);
       }
     }
     default:
@@ -2637,8 +2624,7 @@ std::unique_ptr<Filter> NegatedBytesValues::mergeWith(
           bytesRangeOther->upperUnbounded(),
           hiExclusive,
           false));
-      return std::make_unique<MultiRange>(
-          std::move(ranges), bothNullAllowed, false);
+      return std::make_unique<MultiRange>(std::move(ranges), bothNullAllowed);
     }
     default:
       VELOX_UNREACHABLE();

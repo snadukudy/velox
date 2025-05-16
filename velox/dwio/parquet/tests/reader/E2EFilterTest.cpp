@@ -22,6 +22,7 @@
 
 #include <folly/init/Init.h>
 
+using namespace facebook;
 using namespace facebook::velox;
 using namespace facebook::velox::common;
 using namespace facebook::velox::dwio::common;
@@ -29,7 +30,8 @@ using namespace facebook::velox::parquet;
 
 using dwio::common::MemorySink;
 
-class E2EFilterTest : public E2EFilterTestBase, public test::VectorTestBase {
+class E2EFilterTest : public E2EFilterTestBase,
+                      public velox::test::VectorTestBase {
  protected:
   void SetUp() override {
     E2EFilterTestBase::SetUp();
@@ -159,7 +161,7 @@ TEST_F(E2EFilterTest, compression) {
     }
 
     options_.dataPageSize = 4 * 1024;
-    options_.compression = compression;
+    options_.compressionKind = compression;
 
     testWithTypes(
         "tinyint_val:tinyint,"
@@ -256,6 +258,58 @@ TEST_F(E2EFilterTest, integerDictionary) {
       20);
 }
 
+TEST_F(E2EFilterTest, timestampInt64Direct) {
+  options_.enableDictionary = false;
+  options_.dataPageSize = 4 * 1024;
+
+  testWithTypes(
+      "timestamp_val_0:timestamp,"
+      "timestamp_val_1:timestamp",
+      [&]() {},
+      true,
+      {"timestamp_val_0", "timestamp_val_1"},
+      20);
+}
+
+TEST_F(E2EFilterTest, timestampInt64Dictionary) {
+  options_.dataPageSize = 4 * 1024;
+
+  testWithTypes(
+      "timestamp_val_0:timestamp,"
+      "timestamp_val_1:timestamp",
+      [&]() {},
+      true,
+      {"timestamp_val_0", "timestamp_val_1"},
+      20);
+}
+
+TEST_F(E2EFilterTest, timestampInt96Direct) {
+  options_.enableDictionary = false;
+  options_.dataPageSize = 4 * 1024;
+  options_.writeInt96AsTimestamp = true;
+
+  testWithTypes(
+      "timestamp_val_0:timestamp,"
+      "timestamp_val_1:timestamp",
+      [&]() {},
+      true,
+      {"timestamp_val_0", "timestamp_val_1"},
+      20);
+}
+
+TEST_F(E2EFilterTest, timestampInt96Dictionary) {
+  options_.dataPageSize = 4 * 1024;
+  options_.writeInt96AsTimestamp = true;
+
+  testWithTypes(
+      "timestamp_val_0:timestamp,"
+      "timestamp_val_1:timestamp",
+      [&]() {},
+      true,
+      {"timestamp_val_0", "timestamp_val_1"},
+      20);
+}
+
 TEST_F(E2EFilterTest, floatAndDoubleDirect) {
   options_.enableDictionary = false;
   options_.dataPageSize = 4 * 1024;
@@ -303,9 +357,11 @@ TEST_F(E2EFilterTest, floatAndDouble) {
 }
 
 TEST_F(E2EFilterTest, shortDecimalDictionary) {
+  // decimal(8, 5) maps to 4 bytes FLBA in Parquet.
   // decimal(10, 5) maps to 5 bytes FLBA in Parquet.
   // decimal(17, 5) maps to 8 bytes FLBA in Parquet.
   for (const auto& type : {
+           "shortdecimal_val:decimal(8, 5)",
            "shortdecimal_val:decimal(10, 5)",
            "shortdecimal_val:decimal(17, 5)",
        }) {
@@ -332,9 +388,11 @@ TEST_F(E2EFilterTest, shortDecimalDirect) {
   options_.enableDictionary = false;
   options_.dataPageSize = 4 * 1024;
 
+  // decimal(8, 5) maps to 4 bytes FLBA in Parquet.
   // decimal(10, 5) maps to 5 bytes FLBA in Parquet.
   // decimal(17, 5) maps to 8 bytes FLBA in Parquet.
   for (const auto& type : {
+           "shortdecimal_val:decimal(8, 5)",
            "shortdecimal_val:decimal(10, 5)",
            "shortdecimal_val:decimal(17, 5)",
        }) {
@@ -387,7 +445,7 @@ TEST_F(E2EFilterTest, longDecimalDictionary) {
               true);
         },
         true,
-        {},
+        {"longdecimal_val"},
         20);
   }
 }
@@ -416,7 +474,7 @@ TEST_F(E2EFilterTest, longDecimalDirect) {
               true);
         },
         true,
-        {},
+        {"longdecimal_val"},
         20);
   }
 
@@ -429,7 +487,7 @@ TEST_F(E2EFilterTest, longDecimalDirect) {
             {-479, HugeInt::build(1546093991, 4054979645)});
       },
       false,
-      {},
+      {"longdecimal_val"},
       20);
 }
 
@@ -458,6 +516,23 @@ TEST_F(E2EFilterTest, stringDictionary) {
         makeStringDistribution("string_val", 100, true, false);
         makeStringDistribution("string_val_2", 170, false, true);
         makeStringDistribution("string_const", 1, true, false);
+      },
+      true,
+      {"string_val", "string_val_2"},
+      20);
+}
+
+TEST_F(E2EFilterTest, stringDeltaByteArray) {
+  options_.enableDictionary = false;
+  options_.encoding =
+      facebook::velox::parquet::arrow::Encoding::DELTA_BYTE_ARRAY;
+
+  testWithTypes(
+      "string_val:string,"
+      "string_val_2:string",
+      [&]() {
+        makeStringUnique("string_val");
+        makeStringUnique("string_val_2");
       },
       true,
       {"string_val", "string_val_2"},
@@ -698,6 +773,20 @@ TEST_F(E2EFilterTest, configurableWriteSchema) {
                ROW({"ee", "ff"}, {BIGINT(), BIGINT()})),
            BIGINT()});
   test(type, newType);
+}
+
+TEST_F(E2EFilterTest, booleanRle) {
+  options_.enableDictionary = false;
+  options_.encoding = facebook::velox::parquet::arrow::Encoding::RLE;
+  options_.useParquetDataPageV2 = true;
+
+  testWithTypes(
+      "boolean_val:boolean,"
+      "boolean_null:boolean",
+      [&]() { makeAllNulls("boolean_null"); },
+      false,
+      {"boolean_val"},
+      20);
 }
 
 // Define main so that gflags get processed.

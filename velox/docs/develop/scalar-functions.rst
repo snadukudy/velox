@@ -151,7 +151,7 @@ Null-Free Fast Path
 A "callNullFree" function may be implemented in place of or along side "call"
 and/or "callNullable" functions. When only the "callNullFree" function is
 implemented, evaluation of the function will be skipped and null will
-automatically be produced if any of the input arguments are null (like deafult
+automatically be produced if any of the input arguments are null (like default
 null behavior) or if any of the input arguments are of a complex type and
 contain null anywhere in their value, e.g. an array that has a null element.
 If "callNullFree" is implemented alongside "call" and/or "callNullable", an
@@ -332,7 +332,7 @@ properties and using it when processing inputs.
   struct HourFunction {
     VELOX_DEFINE_FUNCTION_TYPES(TExec);
 
-    const date::time_zone* timeZone_ = nullptr;
+    const tz::TimeZone* timeZone_ = nullptr;
 
     FOLLY_ALWAYS_INLINE void initialize(
         const std::vector<TypePtr>& inputTypes,
@@ -362,7 +362,7 @@ individual rows.
   struct DateTruncFunction {
     VELOX_DEFINE_FUNCTION_TYPES(TExec);
 
-    const date::time_zone* timeZone_ = nullptr;
+    const tz::TimeZone* timeZone_ = nullptr;
     std::optional<DateTimeUnit> unit_;
 
     FOLLY_ALWAYS_INLINE void initialize(
@@ -410,7 +410,7 @@ function defined above can be registered using the following function call:
 
 .. code-block:: c++
 
-  registerFunction<CeilFunction, double, double>({"ceil", "ceiling");
+  registerFunction<CeilFunction, double, double>({"ceil", "ceiling"});
 
 Here, we register the CeilFunction function that takes a double and returns a
 double. If we want to allow the ceil function to be called on float inputs,
@@ -418,7 +418,7 @@ we need to call registerFunction again:
 
 .. code-block:: c++
 
-  registerFunction<CeilFunction, float, float>({"ceil", "ceiling");
+  registerFunction<CeilFunction, float, float>({"ceil", "ceiling"});
 
 We need to call registerFunction for each signature we want to support.
 
@@ -513,7 +513,7 @@ NullableVariadicView, and NullFreeVariadicView, supports the following:
 
 - VariadicView<T>::Iterator end() : iterator indicating end of iteration.
 
-- bool mayHaveNulls() : a check on the nullity of the arugments (note this takes time proportional to the number of arguments). When it returns false, there are definitely no nulls, a true does not guarantee null existence.
+- bool mayHaveNulls() : a check on the nullity of the arguments (note this takes time proportional to the number of arguments). When it returns false, there are definitely no nulls, a true does not guarantee null existence.
 
 - VariadicView<T>::SkipNullsContainer SkipNulls() : return an iterable container that provides direct access to each argument with a non-null value.
 
@@ -543,7 +543,10 @@ Vector Functions
 
 Simple functions process a single row and produce a single value as a result.
 Vector functions process a batch or rows and produce a vector of results.
-Some of the defining features of these functions are:
+When implementing a function, simple function is preferred unless the implementation
+of vector function provides a significant performance gain which can be demonstrated
+with a benchmark.
+Some of the defining features of vector functions are:
 
 - take vectors as inputs and produce vectors as a result;
 - have access to vector encodings and metadata;
@@ -959,15 +962,14 @@ argument in order.
 
 The concat function takes an arbitrary number of varchar inputs and returns a
 varchar. FunctionSignatureBuilder allows specifying that the last augment may
-appear zero or more times by calling variableArity() method.
+appear zero or more times by calling variableArity("varchar") method.
 
 .. code-block:: c++
 
     // varchar... -> varchar
     exec::FunctionSignatureBuilder()
         .returnType("varchar")
-        .argumentType("varchar")
-        .variableArity()
+        .variableArity("varchar")
         .build()
 
 The map_keys function takes any map and returns an array of map keys.

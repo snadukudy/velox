@@ -114,11 +114,31 @@ class RemoteFunction : public exec::VectorFunction {
     }
 
     auto outputRowVector = IOBufToRowVector(
-        remoteResponse.get_result().get_payload(),
+        remoteResponse.result().value().payload().value(),
         ROW({outputType}),
         *context.pool(),
         serde_.get());
     result = outputRowVector->childAt(0);
+
+    if (auto errorPayload = remoteResponse.result().value().errorPayload()) {
+      auto errorsRowVector = IOBufToRowVector(
+          *errorPayload, ROW({VARCHAR()}), *context.pool(), serde_.get());
+      auto errorsVector =
+          errorsRowVector->childAt(0)->asFlatVector<StringView>();
+      VELOX_CHECK(errorsVector, "Should be convertible to flat vector");
+
+      SelectivityVector selectedRows(errorsRowVector->size());
+      selectedRows.applyToSelected([&](vector_size_t i) {
+        if (errorsVector->isNullAt(i)) {
+          return;
+        }
+        try {
+          throw std::runtime_error(errorsVector->valueAt(i));
+        } catch (const std::exception&) {
+          context.setError(i, std::current_exception());
+        }
+      });
+    }
   }
 
   const std::string functionName_;

@@ -37,7 +37,7 @@ void printBuffer(std::ostream& out, const char* buffer, uint64_t length) {
 }
 
 uint64_t PositionProvider::next() {
-  uint64_t result = *position_;
+  const uint64_t result = *position_;
   ++position_;
   return result;
 }
@@ -176,7 +176,7 @@ std::string SeekableArrayInputStream::getName() const {
       "SeekableArrayInputStream ", position_, " of ", length_);
 }
 
-size_t SeekableArrayInputStream::positionSize() {
+size_t SeekableArrayInputStream::positionSize() const {
   // not compressed, so only need 1 position (uncompressed position)
   return 1;
 }
@@ -197,7 +197,6 @@ SeekableFileInputStream::SeekableFileInputStream(
       start_(offset),
       length_(byteCount),
       blockSize_(computeBlock(blockSize, length_)),
-      pool_(&pool),
       buffer_{pool} {
   position_ = 0;
   pushback_ = 0;
@@ -257,7 +256,7 @@ std::string SeekableFileInputStream::getName() const {
       input_->getName(), " from ", start_, " for ", length_);
 }
 
-size_t SeekableFileInputStream::positionSize() {
+size_t SeekableFileInputStream::positionSize() const {
   // not compressed, so only need 1 position (uncompressed position)
   return 1;
 }

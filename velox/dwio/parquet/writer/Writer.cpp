@@ -18,7 +18,10 @@
 #include <arrow/c/bridge.h>
 #include <arrow/io/interfaces.h>
 #include <arrow/table.h>
+#include "velox/common/base/Pointers.h"
+#include "velox/common/config/Config.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/core/QueryConfig.h"
 #include "velox/dwio/parquet/writer/arrow/Properties.h"
 #include "velox/dwio/parquet/writer/arrow/Writer.h"
 #include "velox/exec/MemoryReclaimer.h"
@@ -128,22 +131,39 @@ std::shared_ptr<WriterProperties> getArrowParquetWriterOptions(
     const std::unique_ptr<DefaultFlushPolicy>& flushPolicy) {
   auto builder = WriterProperties::Builder();
   WriterProperties::Builder* properties = &builder;
-  if (!options.enableDictionary) {
+  if (options.enableDictionary.value_or(
+          facebook::velox::parquet::arrow::DEFAULT_IS_DICTIONARY_ENABLED)) {
+    properties = properties->enable_dictionary();
+    properties = properties->dictionary_pagesize_limit(
+        options.dictionaryPageSizeLimit.value_or(
+            facebook::velox::parquet::arrow::
+                DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT));
+  } else {
     properties = properties->disable_dictionary();
   }
-  properties =
-      properties->compression(getArrowParquetCompression(options.compression));
+  properties = properties->compression(getArrowParquetCompression(
+      options.compressionKind.value_or(common::CompressionKind_NONE)));
   for (const auto& columnCompressionValues : options.columnCompressionsMap) {
     properties->compression(
         columnCompressionValues.first,
         getArrowParquetCompression(columnCompressionValues.second));
   }
   properties = properties->encoding(options.encoding);
-  properties = properties->data_pagesize(options.dataPageSize);
+  properties = properties->data_pagesize(options.dataPageSize.value_or(
+      facebook::velox::parquet::arrow::kDefaultDataPageSize));
+  properties = properties->write_batch_size(options.batchSize.value_or(
+      facebook::velox::parquet::arrow::DEFAULT_WRITE_BATCH_SIZE));
   properties = properties->max_row_group_length(
       static_cast<int64_t>(flushPolicy->rowsInRowGroup()));
   properties = properties->codec_options(options.codecOptions);
   properties = properties->enable_store_decimal_as_integer();
+  if (options.useParquetDataPageV2.value_or(false)) {
+    properties =
+        properties->data_page_version(arrow::ParquetDataPageVersion::V2);
+  } else {
+    properties =
+        properties->data_page_version(arrow::ParquetDataPageVersion::V1);
+  }
   return properties->build();
 }
 
@@ -154,7 +174,7 @@ void validateSchemaRecursive(const RowTypePtr& schema) {
 
   folly::F14FastSet<std::string> uniqueNames;
   for (const auto& name : fieldNames) {
-    VELOX_USER_CHECK(!name.empty(), "Field name must not be empty.")
+    VELOX_USER_CHECK(!name.empty(), "Field name must not be empty.");
     auto result = uniqueNames.insert(name);
     VELOX_USER_CHECK(
         result.second,
@@ -213,6 +233,79 @@ std::shared_ptr<::arrow::Field> updateFieldNameRecursive(
   }
 }
 
+std::optional<TimestampPrecision> getTimestampUnit(
+    const config::ConfigBase& config,
+    const char* configKey) {
+  if (const auto unit = config.get<uint8_t>(configKey)) {
+    VELOX_CHECK(
+        unit == 3 /*milli*/ || unit == 6 /*micro*/ || unit == 9 /*nano*/,
+        "Invalid timestamp unit: {}",
+        unit.value());
+    return std::optional(static_cast<TimestampPrecision>(unit.value()));
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> getTimestampTimeZone(
+    const config::ConfigBase& config,
+    const char* configKey) {
+  if (const auto timezone = config.get<std::string>(configKey)) {
+    return timezone.value();
+  }
+  return std::nullopt;
+}
+
+std::optional<bool> isParquetEnableDictionary(
+    const config::ConfigBase& config,
+    const char* configKey) {
+  try {
+    if (const auto enableDictionary = config.get<bool>(configKey)) {
+      return enableDictionary.value();
+    }
+  } catch (const folly::ConversionError& e) {
+    VELOX_USER_FAIL(
+        "Invalid parquet writer enable dictionary option: {}", e.what());
+  }
+  return std::nullopt;
+}
+
+std::optional<bool> getParquetDataPageVersion(
+    const config::ConfigBase& config,
+    const char* configKey) {
+  if (const auto version = config.get<std::string>(configKey)) {
+    if (version == "V1") {
+      return false;
+    } else if (version == "V2") {
+      return true;
+    } else {
+      VELOX_FAIL("Unsupported parquet datapage version {}", version.value());
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<int64_t> getParquetPageSize(
+    const config::ConfigBase& config,
+    const char* configKey) {
+  if (const auto pageSize = config.get<std::string>(configKey)) {
+    return config::toCapacity(pageSize.value(), config::CapacityUnit::BYTE);
+  }
+  return std::nullopt;
+}
+
+std::optional<int64_t> getParquetBatchSize(
+    const config::ConfigBase& config,
+    const char* configKey) {
+  try {
+    if (const auto batchSize = config.get<int64_t>(configKey)) {
+      return batchSize.value();
+    }
+  } catch (const folly::ConversionError& e) {
+    VELOX_USER_FAIL("Invalid parquet writer batch size: {}", e.what());
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 Writer::Writer(
@@ -231,15 +324,20 @@ Writer::Writer(
   validateSchemaRecursive(schema_);
 
   if (options.flushPolicyFactory) {
-    flushPolicy_ = options.flushPolicyFactory();
+    castUniquePointer(options.flushPolicyFactory(), flushPolicy_);
   } else {
     flushPolicy_ = std::make_unique<DefaultFlushPolicy>();
   }
   options_.timestampUnit =
-      static_cast<TimestampUnit>(options.parquetWriteTimestampUnit);
+      static_cast<TimestampUnit>(options.parquetWriteTimestampUnit.value_or(
+          TimestampPrecision::kNanoseconds));
+  options_.timestampTimeZone = options.parquetWriteTimestampTimeZone;
+  common::testutil::TestValue::adjust(
+      "facebook::velox::parquet::Writer::Writer", &options_);
   arrowContext_->properties =
       getArrowParquetWriterOptions(options, flushPolicy_);
   setMemoryReclaimers();
+  writeInt96AsTimestamp_ = options.writeInt96AsTimestamp;
 }
 
 Writer::Writer(
@@ -257,7 +355,11 @@ Writer::Writer(
 void Writer::flush() {
   if (arrowContext_->stagingRows > 0) {
     if (!arrowContext_->writer) {
-      auto arrowProperties = ArrowWriterProperties::Builder().build();
+      ArrowWriterProperties::Builder builder;
+      if (writeInt96AsTimestamp_) {
+        builder.enable_deprecated_int96_timestamps();
+      }
+      auto arrowProperties = builder.build();
       PARQUET_ASSIGN_OR_THROW(
           arrowContext_->writer,
           FileWriter::Open(
@@ -383,20 +485,6 @@ void Writer::abort() {
   arrowContext_.reset();
 }
 
-parquet::WriterOptions getParquetOptions(
-    const dwio::common::WriterOptions& options) {
-  parquet::WriterOptions parquetOptions;
-  parquetOptions.memoryPool = options.memoryPool;
-  if (options.compressionKind.has_value()) {
-    parquetOptions.compression = options.compressionKind.value();
-  }
-  if (options.parquetWriteTimestampUnit.has_value()) {
-    parquetOptions.parquetWriteTimestampUnit =
-        options.parquetWriteTimestampUnit.value();
-  }
-  return parquetOptions;
-}
-
 void Writer::setMemoryReclaimers() {
   VELOX_CHECK(
       !pool_->isLeaf(),
@@ -417,9 +505,79 @@ void Writer::setMemoryReclaimers() {
 std::unique_ptr<dwio::common::Writer> ParquetWriterFactory::createWriter(
     std::unique_ptr<dwio::common::FileSink> sink,
     const std::shared_ptr<dwio::common::WriterOptions>& options) {
-  auto parquetOptions = getParquetOptions(*options);
+  auto parquetOptions =
+      std::dynamic_pointer_cast<parquet::WriterOptions>(options);
+  VELOX_CHECK_NOT_NULL(
+      parquetOptions,
+      "Parquet writer factory expected a Parquet WriterOptions object.");
   return std::make_unique<Writer>(
-      std::move(sink), parquetOptions, asRowType(options->schema));
+      std::move(sink), *parquetOptions, asRowType(options->schema));
+}
+
+std::unique_ptr<dwio::common::WriterOptions>
+ParquetWriterFactory::createWriterOptions() {
+  return std::make_unique<parquet::WriterOptions>();
+}
+
+void WriterOptions::processConfigs(
+    const config::ConfigBase& connectorConfig,
+    const config::ConfigBase& session) {
+  auto parquetWriterOptions = dynamic_cast<WriterOptions*>(this);
+  VELOX_CHECK_NOT_NULL(
+      parquetWriterOptions, "Expected a Parquet WriterOptions object.");
+
+  if (!parquetWriteTimestampUnit) {
+    parquetWriteTimestampUnit =
+        getTimestampUnit(session, kParquetSessionWriteTimestampUnit).has_value()
+        ? getTimestampUnit(session, kParquetSessionWriteTimestampUnit)
+        : getTimestampUnit(connectorConfig, kParquetSessionWriteTimestampUnit);
+  }
+  if (!parquetWriteTimestampTimeZone) {
+    parquetWriteTimestampTimeZone = parquetWriterOptions->sessionTimezoneName;
+  }
+
+  if (!enableDictionary) {
+    enableDictionary =
+        isParquetEnableDictionary(session, kParquetSessionEnableDictionary)
+            .has_value()
+        ? isParquetEnableDictionary(session, kParquetSessionEnableDictionary)
+        : isParquetEnableDictionary(
+              connectorConfig, kParquetHiveConnectorEnableDictionary);
+  }
+
+  if (!dictionaryPageSizeLimit) {
+    dictionaryPageSizeLimit =
+        getParquetPageSize(session, kParquetSessionDictionaryPageSizeLimit)
+            .has_value()
+        ? getParquetPageSize(session, kParquetSessionDictionaryPageSizeLimit)
+        : getParquetPageSize(
+              connectorConfig, kParquetHiveConnectorDictionaryPageSizeLimit);
+  }
+
+  if (!useParquetDataPageV2) {
+    useParquetDataPageV2 =
+        getParquetDataPageVersion(session, kParquetSessionDataPageVersion)
+            .has_value()
+        ? getParquetDataPageVersion(session, kParquetSessionDataPageVersion)
+        : getParquetDataPageVersion(
+              connectorConfig, kParquetHiveConnectorDataPageVersion);
+  }
+
+  if (!dataPageSize) {
+    dataPageSize =
+        getParquetPageSize(session, kParquetSessionWritePageSize).has_value()
+        ? getParquetPageSize(session, kParquetSessionWritePageSize)
+        : getParquetPageSize(
+              connectorConfig, kParquetHiveConnectorWritePageSize);
+  }
+
+  if (!batchSize) {
+    batchSize =
+        getParquetBatchSize(session, kParquetSessionWriteBatchSize).has_value()
+        ? getParquetBatchSize(session, kParquetSessionWriteBatchSize)
+        : getParquetBatchSize(
+              connectorConfig, kParquetHiveConnectorWriteBatchSize);
+  }
 }
 
 } // namespace facebook::velox::parquet

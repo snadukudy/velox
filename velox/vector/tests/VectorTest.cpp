@@ -23,6 +23,7 @@
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/memory/ByteStream.h"
+#include "velox/common/testutil/OptionalEmpty.h"
 #include "velox/serializers/PrestoSerializer.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/ComplexVector.h"
@@ -78,7 +79,11 @@ class TestingLoader : public VectorLoader {
         }
       } else {
         T value = values->valueAt(row);
-        hook->addValue(i, &value);
+        if constexpr (std::is_same_v<T, Timestamp>) {
+          VELOX_FAIL();
+        } else {
+          hook->addValueTyped(i, value);
+        }
       }
     }
   }
@@ -103,10 +108,10 @@ struct NonPOD {
 
 int NonPOD::alive = 0;
 
-class VectorTest : public testing::Test, public test::VectorTestBase {
+class VectorTest : public testing::Test, public velox::test::VectorTestBase {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   void SetUp() override {
@@ -160,7 +165,6 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
     BufferPtr nulls;
     if (withNulls) {
       nulls = allocateNulls(numRows, pool());
-      int32_t childCounter = 0;
       auto rawNulls = nulls->asMutable<uint64_t>();
       for (int32_t i = 0; i < numRows; ++i) {
         bits::setNull(rawNulls, i, i % 8 == 0);
@@ -754,7 +758,7 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
     }
   }
 
-  ByteInputStream prepareInput(std::string& string) {
+  std::unique_ptr<ByteInputStream> prepareInput(std::string& string) {
     // Put 'string' in 'input' in many pieces.
     const int32_t size = string.size();
     std::vector<ByteRange> ranges;
@@ -767,7 +771,7 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
       ranges.back().position = 0;
     }
 
-    return ByteInputStream(std::move(ranges));
+    return std::make_unique<BufferInputStream>(std::move(ranges));
   }
 
   void checkSizes(
@@ -814,10 +818,10 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
     auto sourceRow = makeRowVector({"c"}, {source});
     auto sourceRowType = asRowType(sourceRow->type());
 
-    VectorStreamGroup even(pool());
+    VectorStreamGroup even(pool(), nullptr);
     even.createStreamTree(sourceRowType, source->size() / 4);
 
-    VectorStreamGroup odd(pool());
+    VectorStreamGroup odd(pool(), nullptr);
     odd.createStreamTree(sourceRowType, source->size() / 3);
 
     std::vector<IndexRange> evenIndices;
@@ -843,9 +847,9 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
     }
 
     VectorStreamGroup::estimateSerializedSize(
-        source.get(), evenIndices, evenSizePointers.data());
+        source.get(), evenIndices, nullptr, evenSizePointers.data());
     VectorStreamGroup::estimateSerializedSize(
-        source.get(), oddIndices, oddSizePointers.data());
+        source.get(), oddIndices, nullptr, oddSizePointers.data());
     even.append(
         sourceRow, folly::Range(evenIndices.data(), evenIndices.size() / 2));
     even.append(
@@ -874,7 +878,8 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
     auto evenInput = prepareInput(evenString);
 
     RowVectorPtr resultRow;
-    VectorStreamGroup::read(&evenInput, pool(), sourceRowType, &resultRow);
+    VectorStreamGroup::read(
+        evenInput.get(), pool(), sourceRowType, nullptr, &resultRow, nullptr);
     VectorPtr result = resultRow->childAt(0);
     switch (source->encoding()) {
       case VectorEncoding::Simple::FLAT:
@@ -903,7 +908,8 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
     auto oddString = oddStream.str();
     auto oddInput = prepareInput(oddString);
 
-    VectorStreamGroup::read(&oddInput, pool(), sourceRowType, &resultRow);
+    VectorStreamGroup::read(
+        oddInput.get(), pool(), sourceRowType, nullptr, &resultRow, nullptr);
     result = resultRow->childAt(0);
     for (int32_t i = 0; i < oddIndices.size(); ++i) {
       EXPECT_TRUE(result->equalValueAt(source.get(), i, oddIndices[i].begin))
@@ -1545,7 +1551,7 @@ TEST_F(VectorTest, wrapInConstantWithCopy) {
       std::dynamic_pointer_cast<ConstantVector<ComplexType>>(
           BaseVector::wrapInConstant(size, 22, constBaseVector, true));
   EXPECT_NE(constArrayVector->valueVector(), nullptr);
-  EXPECT_TRUE(constArrayVector->valueVector().unique());
+  EXPECT_EQ(constArrayVector->valueVector().use_count(), 1);
   for (auto i = 0; i < size; i++) {
     ASSERT_FALSE(constArrayVector->isNullAt(i));
     ASSERT_TRUE(constArrayVector->equalValueAt(arrayVector.get(), i, 3));
@@ -1557,7 +1563,7 @@ TEST_F(VectorTest, wrapInConstantWithCopy) {
   constArrayVector = std::dynamic_pointer_cast<ConstantVector<ComplexType>>(
       BaseVector::wrapInConstant(size, 22, constBaseVector, true));
   EXPECT_NE(constArrayVector->valueVector(), nullptr);
-  EXPECT_TRUE(constArrayVector->valueVector().unique());
+  EXPECT_EQ(constArrayVector->valueVector().use_count(), 1);
   for (auto i = 0; i < size; i++) {
     ASSERT_TRUE(constArrayVector->isNullAt(i));
   }
@@ -1567,7 +1573,7 @@ TEST_F(VectorTest, rowResize) {
   auto testRowResize = [&](const VectorPtr& vector, bool setNotNull) {
     auto rowVector = vector->as<RowVector>();
     for (auto& child : rowVector->children()) {
-      VELOX_CHECK(child.unique());
+      VELOX_CHECK_EQ(child.use_count(), 1);
     }
     auto oldSize = rowVector->size();
     auto newSize = oldSize * 2;
@@ -1645,7 +1651,28 @@ TEST_F(VectorTest, rowResize) {
       10,
       [&](vector_size_t i) { return i % 5; },
       [](vector_size_t i) { return i % 7 == 0; })});
-  EXPECT_THROW(rowWithLazyChild->resize(20), VeloxException);
+  VELOX_ASSERT_THROW(
+      rowWithLazyChild->resize(20), "Resize on a lazy vector is not allowed");
+}
+
+TEST_F(VectorTest, rowPrepareForReuse) {
+  const int oldSize = 10;
+  for (const int newSize : {10, 20, 5, 0}) {
+    SCOPED_TRACE(fmt::format("oldSize {}, newSize {}", oldSize, newSize));
+    auto rowVector = makeRowVector(
+        {makeFlatVector<int32_t>(10), makeFlatVector<int64_t>(10)});
+    ASSERT_EQ(rowVector->size(), 10);
+    for (const auto& child : rowVector->children()) {
+      ASSERT_EQ(child->size(), rowVector->size());
+    }
+    velox::VectorPtr baseVector = rowVector;
+    BaseVector::prepareForReuse(baseVector, newSize);
+    rowVector = std::static_pointer_cast<velox::RowVector>(baseVector);
+    ASSERT_EQ(rowVector->size(), newSize);
+    for (const auto& child : rowVector->children()) {
+      ASSERT_EQ(child->size(), newSize);
+    }
+  }
 }
 
 TEST_F(VectorTest, wrapConstantInDictionary) {
@@ -2016,12 +2043,12 @@ class TestingHook : public ValueHook {
     return false;
   }
 
-  void addValue(vector_size_t row, const void* value) override {
+  void addValue(vector_size_t row, int64_t value) override {
     if (values_->isNullAt(rows_[row])) {
       ++errors_;
     } else {
       auto original = values_->valueAt(rows_[row]);
-      if (original != *reinterpret_cast<const int64_t*>(value)) {
+      if (original != value) {
         ++errors_;
       }
     }
@@ -2878,7 +2905,7 @@ TEST_F(VectorTest, resizeArrayAndMapResetOffsets) {
 
   // Test array.
   {
-    auto offsets = makeIndices({1, 1, 1, 1});
+    auto offsets = makeIndices({0, 1, 2, 3});
     auto sizes = makeIndices({1, 1, 1, 1});
 
     auto* rawSizes = sizes->as<vector_size_t>();
@@ -2903,7 +2930,7 @@ TEST_F(VectorTest, resizeArrayAndMapResetOffsets) {
 
   // Test map.
   {
-    auto offsets = makeIndices({1, 1, 1, 1});
+    auto offsets = makeIndices({0, 1, 2, 3});
     auto sizes = makeIndices({1, 1, 1, 1});
 
     auto* rawSizes = sizes->as<vector_size_t>();
@@ -3093,6 +3120,24 @@ TEST_F(VectorTest, rowCopyRanges) {
   test::assertEqualVectors(expected, rowVectorDest);
 }
 
+TEST_F(VectorTest, rowCopyRangesWithGap) {
+  // Hold an extra reference to c0 so it becomes immutable.
+  auto targetC0 = makeFlatVector<int64_t>({1, 2, 3});
+  auto target = makeRowVector({targetC0});
+  auto source = makeRowVector({makeFlatVector<int64_t>({4, 5})});
+  BaseVector::CopyRange ranges[2];
+  ranges[0].targetIndex = 0;
+  ranges[0].sourceIndex = 1;
+  ranges[0].count = 1;
+  ranges[1].targetIndex = 2;
+  ranges[1].sourceIndex = 0;
+  ranges[1].count = 1;
+  target->copyRanges(
+      source.get(), folly::Range(std::begin(ranges), std::end(ranges)));
+  auto expected = makeRowVector({makeFlatVector<int64_t>({5, 2, 4})});
+  test::assertEqualVectors(expected, target);
+}
+
 TEST_F(VectorTest, containsNullAtIntegers) {
   VectorPtr data = makeFlatVector<int32_t>({1, 2, 3});
   for (auto i = 0; i < data->size(); ++i) {
@@ -3152,7 +3197,7 @@ TEST_F(VectorTest, containsNullAtArrays) {
   auto data = makeNullableArrayVector<int32_t>({
       {{1, 2}},
       {{1, 2, std::nullopt, 3}},
-      {{}},
+      common::testutil::optionalEmpty,
       std::nullopt,
       {{1, 2, 3, 4}},
   });
@@ -3169,7 +3214,7 @@ TEST_F(VectorTest, containsNullAtMaps) {
       {{{1, 10}, {2, 20}}},
       {{{3, 30}}},
       {{{1, 10}, {2, 20}, {3, std::nullopt}, {4, 40}}},
-      {{}},
+      common::testutil::optionalEmpty,
       std::nullopt,
       {{{1, 10}, {2, 20}, {3, 30}, {4, 40}}},
   });
@@ -3205,7 +3250,7 @@ TEST_F(VectorTest, containsNullAtStructs) {
           makeNullableArrayVector<int64_t>({
               {{1, 2}},
               {{1, 2, std::nullopt, 3}},
-              {{}},
+              common::testutil::optionalEmpty,
               {{1, 2, 3}},
               std::nullopt,
               {{1, 2, 3, 4, 5}},
@@ -3683,7 +3728,7 @@ TEST_F(VectorTest, getLargeStringBuffer) {
 TEST_F(VectorTest, mapUpdate) {
   auto base = makeNullableMapVector<int64_t, int64_t>({
       {{{1, 1}, {2, 1}}},
-      {{}},
+      common::testutil::optionalEmpty,
       {{{3, 1}}},
       std::nullopt,
       {{{4, 1}}},
@@ -3691,7 +3736,7 @@ TEST_F(VectorTest, mapUpdate) {
   auto update = makeNullableMapVector<int64_t, int64_t>({
       {{{2, 2}, {3, 2}}},
       {{{4, 2}}},
-      {{}},
+      common::testutil::optionalEmpty,
       {{{5, 2}}},
       std::nullopt,
   });
@@ -3758,7 +3803,7 @@ TEST_F(VectorTest, mapUpdateNullMapValue) {
 TEST_F(VectorTest, mapUpdateMultipleUpdates) {
   auto base = makeNullableMapVector<int64_t, int64_t>({
       {{{1, 1}, {2, 1}}},
-      {{}},
+      common::testutil::optionalEmpty,
       {{{3, 1}}},
       std::nullopt,
       {{{4, 1}}},
@@ -3767,16 +3812,16 @@ TEST_F(VectorTest, mapUpdateMultipleUpdates) {
       makeNullableMapVector<int64_t, int64_t>({
           {{{2, 2}, {3, 2}}},
           {{{4, 2}}},
-          {{}},
+          common::testutil::optionalEmpty,
           {{{5, 2}}},
           std::nullopt,
       }),
       makeNullableMapVector<int64_t, int64_t>({
           {{{3, 3}, {4, 3}}},
           std::nullopt,
-          {{}},
-          {{}},
-          {{}},
+          common::testutil::optionalEmpty,
+          common::testutil::optionalEmpty,
+          common::testutil::optionalEmpty,
       }),
   };
   auto expected = makeNullableMapVector<int64_t, int64_t>({
@@ -3793,16 +3838,309 @@ TEST_F(VectorTest, mapUpdateMultipleUpdates) {
   }
 }
 
+TEST_F(VectorTest, mapUpdateConstant) {
+  auto base = makeNullableMapVector<int64_t, int64_t>({
+      {{{1, 1}, {2, 1}}},
+      common::testutil::optionalEmpty,
+      {{{3, 1}}},
+      std::nullopt,
+      {{{4, 1}}},
+  });
+  auto update = BaseVector::wrapInConstant(
+      base->size(), 0, makeMapVector<int64_t, int64_t>({{{2, 2}}}));
+  DecodedVector decoded(*update);
+  auto actual = base->update(folly::Range(&decoded, 1));
+  auto expected = makeNullableMapVector<int64_t, int64_t>({
+      {{{2, 2}, {1, 1}}},
+      {{{2, 2}}},
+      {{{2, 2}, {3, 1}}},
+      std::nullopt,
+      {{{2, 2}, {4, 1}}},
+  });
+  test::assertEqualVectors(expected, actual);
+}
+
+TEST_F(VectorTest, mapUpdateDictionary) {
+  auto base = makeNullableMapVector<int64_t, int64_t>({
+      {{{1, 1}, {2, 1}}},
+      common::testutil::optionalEmpty,
+      {{{3, 1}}},
+      std::nullopt,
+      {{{4, 1}}},
+  });
+  auto update = wrapInDictionary(
+      makeIndices({0, 0, 1, 1, 0}),
+      makeMapVector<int64_t, int64_t>({{{2, 2}}, {}}));
+  DecodedVector decoded(*update);
+  auto actual = base->update(folly::Range(&decoded, 1));
+  auto expected = makeNullableMapVector<int64_t, int64_t>({
+      {{{2, 2}, {1, 1}}},
+      {{{2, 2}}},
+      {{{3, 1}}},
+      std::nullopt,
+      {{{2, 2}, {4, 1}}},
+  });
+  test::assertEqualVectors(expected, actual);
+}
+
+TEST_F(VectorTest, pushDictionaryToRowVectorLeaves) {
+  auto iota = makeFlatVector<int64_t>(10, folly::identity);
+  auto output = RowVector::pushDictionaryToRowVectorLeaves(iota);
+  ASSERT_EQ(output, iota);
+
+  auto input = wrapInDictionary(makeIndicesInReverse(10), iota);
+  output = RowVector::pushDictionaryToRowVectorLeaves(input);
+  ASSERT_EQ(output, input);
+
+  {
+    SCOPED_TRACE("General");
+    input = wrapInDictionary(
+        makeIndicesInReverse(10),
+        makeRowVector({
+            // c0
+            iota,
+            // c1
+            makeRowVector({iota}),
+            // c2
+            BaseVector::wrapInDictionary(
+                makeNulls(10, nullEvery(3)),
+                makeIndicesInReverse(10),
+                10,
+                iota),
+            // c3
+            iota,
+        }));
+    output = RowVector::pushDictionaryToRowVectorLeaves(input);
+    test::assertEqualVectors(input, output);
+    ASSERT_EQ(output->encoding(), VectorEncoding::Simple::ROW);
+    auto* outputRow = output->asUnchecked<RowVector>();
+    auto& c0 = outputRow->childAt(0);
+    ASSERT_EQ(c0->encoding(), VectorEncoding::Simple::DICTIONARY);
+    ASSERT_EQ(c0->wrapInfo().get(), input->wrapInfo().get());
+    auto& c1 = outputRow->childAt(1);
+    ASSERT_EQ(c1->encoding(), VectorEncoding::Simple::ROW);
+    auto* c1Row = c1->asUnchecked<RowVector>();
+    auto& c1c0 = c1Row->childAt(0);
+    ASSERT_EQ(c1c0->encoding(), VectorEncoding::Simple::DICTIONARY);
+    ASSERT_EQ(c1c0->wrapInfo().get(), c0->wrapInfo().get());
+    auto& c2 = outputRow->childAt(2);
+    ASSERT_EQ(c2->encoding(), VectorEncoding::Simple::DICTIONARY);
+    auto& c3 = outputRow->childAt(3);
+    ASSERT_EQ(c3->encoding(), VectorEncoding::Simple::DICTIONARY);
+    ASSERT_EQ(c3->wrapInfo().get(), c0->wrapInfo().get());
+  }
+  {
+    SCOPED_TRACE("Nested ROW");
+    input = wrapInDictionary(
+        makeIndicesInReverse(10),
+        makeRowVector({
+            wrapInDictionary(
+                makeIndicesInReverse(10),
+                makeRowVector({
+                    iota,
+                    wrapInDictionary(makeIndicesInReverse(10), iota),
+                    iota,
+                })),
+        }));
+    output = RowVector::pushDictionaryToRowVectorLeaves(input);
+    test::assertEqualVectors(input, output);
+    auto* c0 =
+        output->asChecked<RowVector>()->childAt(0)->asChecked<RowVector>();
+    auto& c0c0 = c0->childAt(0);
+    ASSERT_EQ(c0c0->encoding(), VectorEncoding::Simple::DICTIONARY);
+    auto& c0c1 = c0->childAt(1);
+    ASSERT_EQ(c0c1->encoding(), VectorEncoding::Simple::DICTIONARY);
+    auto& c0c2 = c0->childAt(2);
+    ASSERT_EQ(c0c2->encoding(), VectorEncoding::Simple::DICTIONARY);
+    ASSERT_EQ(c0c0->wrapInfo().get(), c0c2->wrapInfo().get());
+  }
+  {
+    SCOPED_TRACE("Nulls over ROW");
+    input = wrapInDictionary(
+        makeIndicesInReverse(10),
+        makeRowVector({
+            BaseVector::wrapInDictionary(
+                makeNulls(10, nullEvery(7)),
+                makeIndicesInReverse(10),
+                10,
+                makeRowVector({iota, iota})),
+        }));
+    output = RowVector::pushDictionaryToRowVectorLeaves(input);
+    test::assertEqualVectors(input, output);
+    auto* c0 =
+        output->asChecked<RowVector>()->childAt(0)->asChecked<RowVector>();
+    auto& c0c0 = c0->childAt(0);
+    ASSERT_EQ(c0c0->encoding(), VectorEncoding::Simple::DICTIONARY);
+    auto& c0c1 = c0->childAt(1);
+    ASSERT_EQ(c0c1->encoding(), VectorEncoding::Simple::DICTIONARY);
+  }
+  {
+    SCOPED_TRACE("Constant");
+    input = makeRowVector({
+        // c0: Constant primitive.
+        makeConstant<int64_t>(42, 10),
+        // c1: Constant ROW
+        BaseVector::wrapInConstant(
+            10,
+            0,
+            makeRowVector(
+                {makeFlatVector<int64_t>(1, [](auto) { return 43; })})),
+        // c2: Dictionary over constant
+        wrapInDictionary(
+            makeIndicesInReverse(10),
+            makeRowVector({
+                BaseVector::wrapInConstant(
+                    10,
+                    0,
+                    makeRowVector(
+                        {makeFlatVector<int64_t>(1, [](auto) { return 44; })})),
+            })),
+        // c3: Constant over dictionary
+        BaseVector::wrapInConstant(
+            10,
+            5,
+            makeRowVector({
+                wrapInDictionary(
+                    makeIndicesInReverse(10), makeRowVector({iota})),
+            })),
+    });
+    output = RowVector::pushDictionaryToRowVectorLeaves(input);
+    test::assertEqualVectors(input, output);
+    auto* outputRow = output->asChecked<RowVector>();
+    auto& c0 = outputRow->childAt(0);
+    ASSERT_EQ(c0->encoding(), VectorEncoding::Simple::CONSTANT);
+    auto* c1 = outputRow->childAt(1)->asChecked<RowVector>();
+    ASSERT_EQ(c1->childAt(0)->encoding(), VectorEncoding::Simple::DICTIONARY);
+    auto* c2 = outputRow->childAt(2)->asChecked<RowVector>();
+    auto* c2c0 = c2->childAt(0)->asChecked<RowVector>();
+    ASSERT_EQ(c2c0->childAt(0)->encoding(), VectorEncoding::Simple::DICTIONARY);
+    auto* c3 = outputRow->childAt(3)->asChecked<RowVector>();
+    auto* c3c0 = c3->childAt(0)->asChecked<RowVector>();
+    ASSERT_EQ(c3c0->childAt(0)->encoding(), VectorEncoding::Simple::DICTIONARY);
+  }
+}
+
 TEST_F(VectorTest, arrayCopyTargetNullOffsets) {
   auto target = BaseVector::create(ARRAY(BIGINT()), 11, pool());
   auto offsetsRef = target->asUnchecked<ArrayVector>()->offsets();
   ASSERT_TRUE(offsetsRef);
   BaseVector::prepareForReuse(target, target->size());
-  ASSERT_FALSE(target->asUnchecked<ArrayVector>()->offsets());
+  ASSERT_TRUE(target->asUnchecked<ArrayVector>()->offsets());
   auto source = makeArrayVector<int64_t>(
       11, [](auto) { return 1; }, [](auto i, auto) { return i; });
   target->copy(source.get(), 0, 0, source->size());
   test::assertEqualVectors(source, target);
+}
+
+TEST_F(VectorTest, testOverSizedArray) {
+  // Verify that flattening an array/map cannot result in a values vector
+  // greater than vector_size_t
+  auto flat = makeFlatVector<int32_t>(1000, [](auto /*row*/) { return 1; });
+  std::vector<vector_size_t> offsets(1, 0);
+  auto array = makeArrayVector(offsets, flat);
+  auto constArray = BaseVector::wrapInConstant(21474830, 0, array);
+  EXPECT_THROW(BaseVector::flattenVector(constArray), VeloxUserError);
+}
+
+TEST_F(VectorTest, testFlatteningOfRedundantDictionary) {
+  // Verify that BaseVector::wrapInDictionary() API flattens the output if
+  // 'flattenIfRedundant' is set to true and the wrapped vector has a size less
+  // than 1/8 the size of the base.
+  auto vectorSize = 100;
+  auto flat =
+      makeFlatVector<int32_t>(vectorSize, [](auto /*row*/) { return 1; });
+  {
+    auto dictionarySize = vectorSize / 10;
+    auto indices = makeIndices(dictionarySize, [](auto i) { return i; });
+    auto wrapped =
+        BaseVector::wrapInDictionary(nullptr, indices, dictionarySize, flat);
+    EXPECT_EQ(wrapped->encoding(), VectorEncoding::Simple::DICTIONARY);
+
+    wrapped = BaseVector::wrapInDictionary(
+        nullptr, indices, dictionarySize, flat, true /*flattenIfRedundant*/);
+    EXPECT_EQ(wrapped->encoding(), VectorEncoding::Simple::FLAT);
+  }
+
+  {
+    auto dictionarySize = vectorSize / 3;
+    auto indices = makeIndices(dictionarySize, [](auto i) { return i; });
+    auto wrapped =
+        BaseVector::wrapInDictionary(nullptr, indices, dictionarySize, flat);
+    EXPECT_EQ(wrapped->encoding(), VectorEncoding::Simple::DICTIONARY);
+
+    wrapped = BaseVector::wrapInDictionary(
+        nullptr, indices, dictionarySize, flat, true /*flattenIfRedundant*/);
+    EXPECT_EQ(wrapped->encoding(), VectorEncoding::Simple::DICTIONARY);
+  }
+}
+
+TEST_F(
+    VectorTest,
+    verifyOuterDictionaryLayersInitalizedWhenLoggingLazyLoadedVector) {
+  // Tester function verifies proper behavior when outer dictionary layers of a
+  // lazy vector are not properly initalized and user calls toString. Expected
+  // behavior should be a runtime error noting user to properly load vector
+  // prior to invoking toString.
+  auto doubleVector = makeFlatVector<double>({1.0, 2.0, 3.0});
+  auto doubleInDictionary = BaseVector::wrapInDictionary(
+      nullptr, makeIndices({0, 1, 2}), 3, doubleVector);
+  auto doubleInNestedDictionary = BaseVector::wrapInDictionary(
+      nullptr, makeIndices({0, 1, 2}), 3, doubleInDictionary);
+  auto doubleInLazyDictionary =
+      VectorFuzzer::wrapInLazyVector(doubleInNestedDictionary);
+
+  auto rowVector = makeRowVector({doubleVector, doubleInLazyDictionary});
+
+  // Log vector; in doing so, we should trigger our VELOX_CHECK error as
+  // dictionary is not properly initialized.
+  for (vector_size_t i = 0; i < rowVector->size(); ++i) {
+    EXPECT_THROW(rowVector->toString(i), VeloxRuntimeError);
+  }
+}
+
+TEST_F(VectorTest, hasOverlappingRanges) {
+  auto test = [this](
+                  vector_size_t length,
+                  const std::vector<bool>& nulls,
+                  const std::vector<vector_size_t>& offsets,
+                  const std::vector<vector_size_t>& sizes,
+                  bool overlap) {
+    auto makeArray = [&] {
+      return std::make_shared<ArrayVector>(
+          pool(),
+          ARRAY(BIGINT()),
+          makeNulls(nulls),
+          length,
+          makeIndices(length, [&](auto i) { return offsets[i]; }),
+          makeIndices(length, [&](auto i) { return sizes[i]; }),
+          makeNullConstant(
+              TypeKind::BIGINT, std::numeric_limits<vector_size_t>::max()));
+    };
+    if (!overlap) {
+      ASSERT_FALSE(makeArray()->hasOverlappingRanges());
+    } else {
+      ASSERT_TRUE(makeArray()->hasOverlappingRanges());
+    }
+  };
+  test(3, {false, false, false}, {0, 1, 2}, {1, 1, 1}, false);
+  test(3, {false, true, false}, {0, 0, 2}, {1, 1, 1}, false);
+  test(3, {false, false, false}, {0, 0, 2}, {1, 0, 1}, false);
+  test(3, {false, false, false}, {0, 0, 2}, {1, 1, 1}, true);
+  test(3, {false, false, false}, {2, 1, 0}, {1, 1, 1}, false);
+  test(3, {false, false, false}, {2, 1, 0}, {1, 2, 1}, true);
+  test(2, {false, false}, {0, 1}, {3, 1}, true);
+  test(2, {false, false}, {1, 0}, {1, 3}, true);
+}
+
+TEST_F(VectorTest, estimateFlatSize) {
+  auto arrayVector = makeArrayVector<int64_t>(
+      10, [](auto) { return 1; }, [](auto i, auto) { return i; });
+  auto originalSize = arrayVector->estimateFlatSize();
+  arrayVector->prepareForReuse();
+  auto flatSize = arrayVector->estimateFlatSize();
+  EXPECT_NE(originalSize, flatSize);
+  // Test that the second call to prepareForReuse will not cause crash
+  arrayVector->prepareForReuse();
 }
 
 } // namespace

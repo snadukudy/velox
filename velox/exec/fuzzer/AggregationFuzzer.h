@@ -27,6 +27,9 @@ namespace facebook::velox::exec::test {
 /// @param seed Random seed - Pass the same seed for reproducibility.
 /// @param orderDependentFunctions Map of functions that depend on order of
 /// input.
+/// @param orderableGroupKeys Whether group keys must be orderable or be just
+/// comparable.
+/// @param functionDataSpec Mapping of function and their input data spec.
 /// @param planPath Path to persisted plan information. If this is
 /// supplied, fuzzer will only verify the plans.
 /// @param referenceQueryRunner Reference query runner for results
@@ -34,12 +37,16 @@ namespace facebook::velox::exec::test {
 void aggregateFuzzer(
     AggregateFunctionSignatureMap signatureMap,
     size_t seed,
+    const std::unordered_set<std::string>& functionsRequireSortedInput,
     const std::unordered_map<std::string, std::shared_ptr<ResultVerifier>>&
         orderDependentFunctions,
     const std::unordered_map<std::string, std::shared_ptr<InputGenerator>>&
         customInputGenerators,
+    const std::unordered_map<std::string, DataSpec>& functionDataSpec,
     VectorFuzzer::Options::TimestampPrecision timestampPrecision,
     const std::unordered_map<std::string, std::string>& queryConfigs,
+    const std::unordered_map<std::string, std::string>& hiveConfigs,
+    bool orderableGroupKeys,
     const std::optional<std::string>& planPath,
     std::unique_ptr<ReferenceQueryRunner> referenceQueryRunner);
 

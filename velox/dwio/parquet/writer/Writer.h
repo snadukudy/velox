@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/common/compression/Compression.h"
+#include "velox/common/config/Config.h"
 #include "velox/dwio/common/DataBuffer.h"
 #include "velox/dwio/common/FileSink.h"
 #include "velox/dwio/common/FlushPolicy.h"
@@ -86,25 +87,64 @@ class LambdaFlushPolicy : public DefaultFlushPolicy {
   std::function<bool()> lambda_;
 };
 
-struct WriterOptions {
-  bool enableDictionary = true;
-  int64_t dataPageSize = 1'024 * 1'024;
-  int64_t dictionaryPageSizeLimit = 1'024 * 1'024;
+struct WriterOptions : public dwio::common::WriterOptions {
   // Growth ratio passed to ArrowDataBufferSink. The default value is a
   // heuristic borrowed from
   // folly/FBVector(https://github.com/facebook/folly/blob/main/folly/docs/FBVector.md#memory-handling).
   double bufferGrowRatio = 1.5;
-  common::CompressionKind compression = common::CompressionKind_NONE;
+
   arrow::Encoding::type encoding = arrow::Encoding::PLAIN;
-  velox::memory::MemoryPool* memoryPool;
-  // The default factory allows the writer to construct the default flush
-  // policy with the configs in its ctor.
-  std::function<std::unique_ptr<DefaultFlushPolicy>()> flushPolicyFactory;
+
   std::shared_ptr<CodecOptions> codecOptions;
   std::unordered_map<std::string, common::CompressionKind>
       columnCompressionsMap;
-  uint8_t parquetWriteTimestampUnit =
-      static_cast<uint8_t>(TimestampUnit::kNano);
+
+  /// Timestamp unit for Parquet write through Arrow bridge.
+  /// Default if not specified: TimestampPrecision::kNanoseconds (9).
+  std::optional<TimestampPrecision> parquetWriteTimestampUnit;
+  /// Timestamp time zone for Parquet write through Arrow bridge.
+  std::optional<std::string> parquetWriteTimestampTimeZone;
+  bool writeInt96AsTimestamp = false;
+
+  std::optional<int64_t> batchSize;
+  std::optional<int64_t> dataPageSize;
+  std::optional<int64_t> dictionaryPageSizeLimit;
+  std::optional<bool> enableDictionary;
+  std::optional<bool> useParquetDataPageV2;
+
+  // Parsing session and hive configs.
+
+  // This isn't a typo; session and hive connector config names are different
+  // ('_' vs '-').
+  static constexpr const char* kParquetSessionWriteTimestampUnit =
+      "hive.parquet.writer.timestamp_unit";
+  static constexpr const char* kParquetHiveConnectorWriteTimestampUnit =
+      "hive.parquet.writer.timestamp-unit";
+  static constexpr const char* kParquetSessionEnableDictionary =
+      "hive.parquet.writer.enable_dictionary";
+  static constexpr const char* kParquetHiveConnectorEnableDictionary =
+      "hive.parquet.writer.enable-dictionary";
+  static constexpr const char* kParquetSessionDictionaryPageSizeLimit =
+      "hive.parquet.writer.dictionary_page_size_limit";
+  static constexpr const char* kParquetHiveConnectorDictionaryPageSizeLimit =
+      "hive.parquet.writer.dictionary-page-size-limit";
+  static constexpr const char* kParquetSessionDataPageVersion =
+      "hive.parquet.writer.datapage_version";
+  static constexpr const char* kParquetHiveConnectorDataPageVersion =
+      "hive.parquet.writer.datapage-version";
+  static constexpr const char* kParquetSessionWritePageSize =
+      "hive.parquet.writer.page_size";
+  static constexpr const char* kParquetHiveConnectorWritePageSize =
+      "hive.parquet.writer.page-size";
+  static constexpr const char* kParquetSessionWriteBatchSize =
+      "hive.parquet.writer.batch_size";
+  static constexpr const char* kParquetHiveConnectorWriteBatchSize =
+      "hive.parquet.writer.batch-size";
+
+  // Process hive connector and session configs.
+  void processConfigs(
+      const config::ConfigBase& connectorConfig,
+      const config::ConfigBase& session) override;
 };
 
 // Writes Velox vectors into  a DataSink using Arrow Parquet writer.
@@ -138,6 +178,10 @@ class Writer : public dwio::common::Writer {
   // Forces a row group boundary before the data added by next write().
   void newRowGroup(int32_t numRows);
 
+  bool finish() override {
+    return true;
+  }
+
   // Closes 'this', After close, data can no longer be added and the completed
   // Parquet file is flushed into 'sink' provided at construction. 'sink' stays
   // live until destruction of 'this'.
@@ -163,6 +207,9 @@ class Writer : public dwio::common::Writer {
   const RowTypePtr schema_;
 
   ArrowOptions options_{.flattenDictionary = true, .flattenConstant = true};
+
+  // Whether to write Int96 timestamps in Arrow Parquet write.
+  bool writeInt96AsTimestamp_;
 };
 
 class ParquetWriterFactory : public dwio::common::WriterFactory {
@@ -172,6 +219,8 @@ class ParquetWriterFactory : public dwio::common::WriterFactory {
   std::unique_ptr<dwio::common::Writer> createWriter(
       std::unique_ptr<dwio::common::FileSink> sink,
       const std::shared_ptr<dwio::common::WriterOptions>& options) override;
+
+  std::unique_ptr<dwio::common::WriterOptions> createWriterOptions() override;
 };
 
 } // namespace facebook::velox::parquet

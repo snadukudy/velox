@@ -46,6 +46,10 @@ uint64_t IoStatistics::totalScanTime() const {
   return totalScanTime_.load(std::memory_order_relaxed);
 }
 
+uint64_t IoStatistics::writeIOTimeUs() const {
+  return writeIOTimeUs_.load(std::memory_order_relaxed);
+}
+
 uint64_t IoStatistics::incRawBytesRead(int64_t v) {
   return rawBytesRead_.fetch_add(v, std::memory_order_relaxed);
 }
@@ -68,6 +72,10 @@ uint64_t IoStatistics::incRawOverreadBytes(int64_t v) {
 
 uint64_t IoStatistics::incTotalScanTime(int64_t v) {
   return totalScanTime_.fetch_add(v, std::memory_order_relaxed);
+}
+
+uint64_t IoStatistics::incWriteIOTimeUs(int64_t v) {
+  return writeIOTimeUs_.fetch_add(v, std::memory_order_relaxed);
 }
 
 void IoStatistics::incOperationCounters(
@@ -111,9 +119,12 @@ void IoStatistics::merge(const IoStatistics& other) {
   ramHit_.merge(other.ramHit_);
   ssdRead_.merge(other.ssdRead_);
   queryThreadIoLatency_.merge(other.queryThreadIoLatency_);
-  std::lock_guard<std::mutex> l(operationStatsMutex_);
-  for (auto& item : other.operationStats_) {
-    operationStats_[item.first].merge(item.second);
+  {
+    const auto& otherOperationStats = other.operationStats();
+    std::lock_guard<std::mutex> l(operationStatsMutex_);
+    for (auto& item : otherOperationStats) {
+      operationStats_[item.first].merge(item.second);
+    }
   }
 }
 

@@ -50,21 +50,20 @@ std::optional<Timestamp> makeTimeStampFromDecodedArgs(
   }
 
   // Year, month, day will be checked in utils::daysSinceEpochFromDate.
-  int64_t daysSinceEpoch;
-  auto status = util::daysSinceEpochFromDate(
+  Expected<int64_t> daysSinceEpoch = util::daysSinceEpochFromDate(
       yearVector->valueAt<int32_t>(row),
       monthVector->valueAt<int32_t>(row),
-      dayVector->valueAt<int32_t>(row),
-      daysSinceEpoch);
-  if (!status.ok()) {
-    VELOX_DCHECK(status.isUserError());
+      dayVector->valueAt<int32_t>(row));
+  if (daysSinceEpoch.hasError()) {
+    VELOX_DCHECK(daysSinceEpoch.error().isUserError());
     return std::nullopt;
   }
 
   // Micros has at most 8 digits (2 for seconds + 6 for microseconds),
   // thus it's safe to cast micros from int64_t to int32_t.
-  auto localMicros = util::fromTime(hour, minute, 0, (int32_t)micros);
-  return util::fromDatetime(daysSinceEpoch, localMicros);
+  auto localMicros =
+      util::fromTime(hour, minute, 0, static_cast<int32_t>(micros));
+  return util::fromDatetime(daysSinceEpoch.value(), localMicros);
 }
 
 void setTimestampOrNull(
@@ -72,10 +71,10 @@ void setTimestampOrNull(
     std::optional<Timestamp> timestamp,
     DecodedVector* timeZoneVector,
     FlatVector<Timestamp>* result) {
-  const auto timeZone = timeZoneVector->valueAt<StringView>(row);
-  const auto tzID = util::getTimeZoneID(std::string_view(timeZone));
+  const auto timeZoneName = timeZoneVector->valueAt<StringView>(row);
+  const auto* timeZone = tz::locateZone(std::string_view(timeZoneName));
   if (timestamp.has_value()) {
-    (*timestamp).toGMT(tzID);
+    timestamp->toGMT(*timeZone);
     result->set(row, *timestamp);
   } else {
     result->setNull(row, true);
@@ -85,10 +84,10 @@ void setTimestampOrNull(
 void setTimestampOrNull(
     int32_t row,
     std::optional<Timestamp> timestamp,
-    int64_t tzID,
+    const tz::TimeZone* timeZone,
     FlatVector<Timestamp>* result) {
   if (timestamp.has_value()) {
-    (*timestamp).toGMT(tzID);
+    timestamp->toGMT(*timeZone);
     result->set(row, *timestamp);
   } else {
     result->setNull(row, true);
@@ -97,7 +96,8 @@ void setTimestampOrNull(
 
 class MakeTimestampFunction : public exec::VectorFunction {
  public:
-  MakeTimestampFunction(int64_t sessionTzID) : sessionTzID_(sessionTzID) {}
+  MakeTimestampFunction(const tz::TimeZone* sessionTimeZone)
+      : sessionTimeZone_(sessionTimeZone) {}
 
   void apply(
       const SelectivityVector& rows,
@@ -122,9 +122,9 @@ class MakeTimestampFunction : public exec::VectorFunction {
       if (args[6]->isConstantEncoding()) {
         auto tz =
             args[6]->asUnchecked<ConstantVector<StringView>>()->valueAt(0);
-        int64_t constantTzID;
+        const tz::TimeZone* constantTimeZone = nullptr;
         try {
-          constantTzID = util::getTimeZoneID(std::string_view(tz));
+          constantTimeZone = tz::locateZone(std::string_view(tz));
         } catch (const VeloxException&) {
           context.setErrors(rows, std::current_exception());
           return;
@@ -132,7 +132,8 @@ class MakeTimestampFunction : public exec::VectorFunction {
         rows.applyToSelected([&](vector_size_t row) {
           auto timestamp = makeTimeStampFromDecodedArgs(
               row, year, month, day, hour, minute, micros);
-          setTimestampOrNull(row, timestamp, constantTzID, resultFlatVector);
+          setTimestampOrNull(
+              row, timestamp, constantTimeZone, resultFlatVector);
         });
       } else {
         auto* timeZone = decodedArgs.at(6);
@@ -147,7 +148,7 @@ class MakeTimestampFunction : public exec::VectorFunction {
       rows.applyToSelected([&](vector_size_t row) {
         auto timestamp = makeTimeStampFromDecodedArgs(
             row, year, month, day, hour, minute, micros);
-        setTimestampOrNull(row, timestamp, sessionTzID_, resultFlatVector);
+        setTimestampOrNull(row, timestamp, sessionTimeZone_, resultFlatVector);
       });
     }
   }
@@ -155,7 +156,8 @@ class MakeTimestampFunction : public exec::VectorFunction {
   static std::vector<std::shared_ptr<exec::FunctionSignature>> signatures() {
     return {
         exec::FunctionSignatureBuilder()
-            .integerVariable("precision")
+            // precision <= 18.
+            .integerVariable("precision", "min(precision, 18)")
             .returnType("timestamp")
             .argumentType("integer")
             .argumentType("integer")
@@ -165,7 +167,8 @@ class MakeTimestampFunction : public exec::VectorFunction {
             .argumentType("decimal(precision, 6)")
             .build(),
         exec::FunctionSignatureBuilder()
-            .integerVariable("precision")
+            // precision <= 18.
+            .integerVariable("precision", "min(precision, 18)")
             .returnType("timestamp")
             .argumentType("integer")
             .argumentType("integer")
@@ -179,7 +182,7 @@ class MakeTimestampFunction : public exec::VectorFunction {
   }
 
  private:
-  const int64_t sessionTzID_;
+  const tz::TimeZone* sessionTimeZone_;
 };
 
 std::shared_ptr<exec::VectorFunction> createMakeTimestampFunction(
@@ -189,8 +192,8 @@ std::shared_ptr<exec::VectorFunction> createMakeTimestampFunction(
   const auto sessionTzName = config.sessionTimezone();
   VELOX_USER_CHECK(
       !sessionTzName.empty(),
-      "make_timestamp requires session time zone to be set.")
-  const auto sessionTzID = util::getTimeZoneID(sessionTzName);
+      "make_timestamp requires session time zone to be set.");
+  const auto* sessionTimeZone = tz::locateZone(sessionTzName);
 
   const auto& secondsType = inputArgs[5].type;
   VELOX_USER_CHECK(
@@ -204,7 +207,7 @@ std::shared_ptr<exec::VectorFunction> createMakeTimestampFunction(
       "Seconds fraction must have 6 digits for microseconds but got {}",
       secondsScale);
 
-  return std::make_shared<MakeTimestampFunction>(sessionTzID);
+  return std::make_shared<MakeTimestampFunction>(sessionTimeZone);
 }
 } // namespace
 

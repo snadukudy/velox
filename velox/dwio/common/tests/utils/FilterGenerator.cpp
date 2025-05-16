@@ -46,7 +46,7 @@ VectorPtr getChildBySubfield(
     const RowTypePtr& rootType) {
   const Type* type = rootType ? rootType.get() : rowVector->type().get();
   auto& path = subfield.path();
-  VELOX_CHECK(!path.empty())
+  VELOX_CHECK(!path.empty());
   auto* rowType = &type->asRow();
   auto* field = dynamic_cast<const Subfield::NestedField*>(path[0].get());
   VELOX_CHECK(field);
@@ -348,14 +348,11 @@ void FilterGenerator::collectFilterableSubFields(
     auto kind = rowType->childAt(i)->kind();
     switch (kind) {
       // ignore these types for filtering
-      case TypeKind::ARRAY:
-      case TypeKind::MAP:
       case TypeKind::UNKNOWN:
       case TypeKind::FUNCTION:
       case TypeKind::OPAQUE:
       case TypeKind::VARBINARY:
       case TypeKind::TIMESTAMP:
-      case TypeKind::ROW:
       case TypeKind::INVALID:
         continue;
 

@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include "velox/common/testutil/OptionalEmpty.h"
 #include "velox/row/CompactRow.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
@@ -28,7 +29,7 @@ namespace {
 class CompactRowTest : public ::testing::Test, public VectorTestBase {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   /// TODO Replace with VectorFuzzer::fuzzInputRow once
@@ -49,35 +50,82 @@ class CompactRowTest : public ::testing::Test, public VectorTestBase {
 
     auto rowType = asRowType(data->type());
     auto numRows = data->size();
+    std::vector<size_t> rowSize(numRows);
+    std::vector<size_t> offsets(numRows);
 
     CompactRow row(data);
 
     size_t totalSize = 0;
     if (auto fixedRowSize = CompactRow::fixedRowSize(rowType)) {
       totalSize = fixedRowSize.value() * numRows;
+      for (auto i = 0; i < numRows; ++i) {
+        rowSize[i] = fixedRowSize.value();
+        offsets[i] = fixedRowSize.value() * i;
+      }
     } else {
       for (auto i = 0; i < numRows; ++i) {
-        totalSize += row.rowSize(i);
+        rowSize[i] = row.rowSize(i);
+        offsets[i] = totalSize;
+        totalSize += rowSize[i];
       }
     }
 
-    std::vector<std::string_view> serialized;
+    std::vector<vector_size_t> rows(numRows);
+    std::iota(rows.begin(), rows.end(), 0);
+    std::vector<vector_size_t> serializedRowSizes(numRows);
+    std::vector<vector_size_t*> serializedRowSizesPtr(numRows);
+    for (auto i = 0; i < numRows; ++i) {
+      serializedRowSizesPtr[i] = &serializedRowSizes[i];
+    }
+    row.serializedRowSizes(
+        folly::Range(rows.data(), numRows), serializedRowSizesPtr.data());
+    for (auto i = 0; i < numRows; ++i) {
+      // The serialized row includes the size of the row.
+      ASSERT_EQ(serializedRowSizes[i], row.rowSize(i) + sizeof(uint32_t));
+    }
 
     BufferPtr buffer = AlignedBuffer::allocate<char>(totalSize, pool(), 0);
     auto* rawBuffer = buffer->asMutable<char>();
-    size_t offset = 0;
-    for (auto i = 0; i < numRows; ++i) {
-      auto size = row.serialize(i, rawBuffer + offset);
-      serialized.push_back(std::string_view(rawBuffer + offset, size));
-      offset += size;
+    {
+      // Test serialize row-by-row.
+      size_t offset = 0;
+      std::vector<std::string_view> serialized;
+      for (auto i = 0; i < numRows; ++i) {
+        auto size = row.serialize(i, rawBuffer + offset);
+        serialized.push_back(std::string_view(rawBuffer + offset, size));
+        offset += size;
 
-      VELOX_CHECK_EQ(size, row.rowSize(i), "Row {}: {}", i, data->toString(i));
+        VELOX_CHECK_EQ(
+            size, row.rowSize(i), "Row {}: {}", i, data->toString(i));
+      }
+
+      VELOX_CHECK_EQ(offset, totalSize);
+
+      auto copy = CompactRow::deserialize(serialized, rowType, pool());
+      assertEqualVectors(data, copy);
     }
+    {
+      // Test serialize by range.
+      memset(rawBuffer, 0, totalSize);
 
-    VELOX_CHECK_EQ(offset, totalSize);
+      std::vector<std::string_view> serialized;
+      vector_size_t offset = 0;
+      vector_size_t rangeSize = 1;
+      // Serialize with different range size.
+      while (offset < numRows) {
+        auto size = std::min<vector_size_t>(rangeSize, numRows - offset);
+        row.serialize(offset, size, offsets.data() + offset, rawBuffer);
+        offset += size;
+        rangeSize = checkedMultiply<vector_size_t>(rangeSize, 2);
+      }
 
-    auto copy = CompactRow::deserialize(serialized, rowType, pool());
-    assertEqualVectors(data, copy);
+      for (auto i = 0; i < numRows; ++i) {
+        serialized.push_back(
+            std::string_view(rawBuffer + offsets[i], rowSize[i]));
+      }
+      auto copy = CompactRow::deserialize(serialized, rowType, pool());
+      assertEqualVectors(data, copy);
+    }
   }
 };
 
@@ -143,7 +191,7 @@ TEST_F(CompactRowTest, rowSizeArrayOfBigint) {
       makeNullableArrayVector<int64_t>({
           {{1, 2, std::nullopt, 3}},
           {{4, 5}},
-          {{}},
+          common::testutil::optionalEmpty,
           std::nullopt,
           {{6}},
       }),
@@ -202,7 +250,7 @@ TEST_F(CompactRowTest, rowSizeArrayOfStrings) {
   data = makeRowVector({
       makeNullableArrayVector<std::string>({
           {{"a", "Abc", std::nullopt}},
-          {{}},
+          common::testutil::optionalEmpty,
           std::nullopt,
           {{"a", std::nullopt, "Longer string", "abc"}},
       }),
@@ -357,7 +405,7 @@ TEST_F(CompactRowTest, arrayOfBigint) {
           {{std::nullopt, 6}},
           {{std::nullopt}},
           std::nullopt,
-          {{}},
+          common::testutil::optionalEmpty,
       }),
   });
 
@@ -383,7 +431,7 @@ TEST_F(CompactRowTest, arrayOfTimestamp) {
           {{std::nullopt, ts(6)}},
           {{std::nullopt}},
           std::nullopt,
-          {{}},
+          common::testutil::optionalEmpty,
       }),
   });
 
@@ -392,7 +440,7 @@ TEST_F(CompactRowTest, arrayOfTimestamp) {
 
 TEST_F(CompactRowTest, arrayOfString) {
   auto data = makeRowVector({
-      makeArrayVector<std::string>({
+      makeArrayVector<std::string>(std::vector<std::vector<std::string>>{
           {"a", "abc", "Longer test string"},
           {"b", "Abc 12345 ...test", "foo"},
           {},
@@ -410,7 +458,7 @@ TEST_F(CompactRowTest, arrayOfString) {
             "Abc 12345 ...test",
             std::nullopt,
             "foo"}},
-          {{}},
+          common::testutil::optionalEmpty,
           {{std::nullopt}},
           std::nullopt,
       }),

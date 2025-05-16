@@ -20,13 +20,13 @@
 
 namespace facebook::velox::exec {
 
-void ExchangeClient::addRemoteTaskId(const std::string& taskId) {
+void ExchangeClient::addRemoteTaskId(const std::string& remoteTaskId) {
   std::vector<RequestSpec> requestSpecs;
   std::shared_ptr<ExchangeSource> toClose;
   {
     std::lock_guard<std::mutex> l(queue_->mutex());
 
-    bool duplicate = !remoteTaskIds_.insert(taskId).second;
+    bool duplicate = !remoteTaskIds_.insert(remoteTaskId).second;
     if (duplicate) {
       // Do not add sources twice. Presto protocol may add duplicate sources
       // and the task updates have no guarantees of arriving in order.
@@ -35,15 +35,16 @@ void ExchangeClient::addRemoteTaskId(const std::string& taskId) {
 
     std::shared_ptr<ExchangeSource> source;
     try {
-      source = ExchangeSource::create(taskId, destination_, queue_, pool_);
+      source =
+          ExchangeSource::create(remoteTaskId, destination_, queue_, pool_);
     } catch (const VeloxException&) {
       throw;
     } catch (const std::exception& e) {
-      // Task ID can be very long. Truncate to 128 characters.
+      // 'remoteTaskId' can be very long. Truncate to 128 characters.
       VELOX_FAIL(
           "Failed to create ExchangeSource: {}. Task ID: {}.",
           e.what(),
-          taskId.substr(0, 128));
+          remoteTaskId.substr(0, 128));
     }
 
     if (closed_) {
@@ -70,6 +71,8 @@ void ExchangeClient::noMoreRemoteTasks() {
 
 void ExchangeClient::close() {
   std::vector<std::shared_ptr<ExchangeSource>> sources;
+  std::queue<ProducingSource> producingSources;
+  std::queue<std::shared_ptr<ExchangeSource>> emptySources;
   {
     std::lock_guard<std::mutex> l(queue_->mutex());
     if (closed_) {
@@ -77,6 +80,8 @@ void ExchangeClient::close() {
     }
     closed_ = true;
     sources = std::move(sources_);
+    producingSources = std::move(producingSources_);
+    emptySources = std::move(emptySources_);
   }
 
   // Outside of mutex.
@@ -87,9 +92,9 @@ void ExchangeClient::close() {
 }
 
 folly::F14FastMap<std::string, RuntimeMetric> ExchangeClient::stats() const {
+  folly::F14FastMap<std::string, RuntimeMetric> stats;
   std::lock_guard<std::mutex> l(queue_->mutex());
 
-  folly::F14FastMap<std::string, RuntimeMetric> stats;
   for (const auto& source : sources_) {
     if (source->supportsMetrics()) {
       for (const auto& [name, value] : source->metrics()) {
@@ -114,10 +119,14 @@ folly::F14FastMap<std::string, RuntimeMetric> ExchangeClient::stats() const {
   return stats;
 }
 
-std::vector<std::unique_ptr<SerializedPage>>
-ExchangeClient::next(uint32_t maxBytes, bool* atEnd, ContinueFuture* future) {
+std::vector<std::unique_ptr<SerializedPage>> ExchangeClient::next(
+    int consumerId,
+    uint32_t maxBytes,
+    bool* atEnd,
+    ContinueFuture* future) {
   std::vector<RequestSpec> requestSpecs;
   std::vector<std::unique_ptr<SerializedPage>> pages;
+  ContinuePromise stalePromise = ContinuePromise::makeEmpty();
   {
     std::lock_guard<std::mutex> l(queue_->mutex());
     if (closed_) {
@@ -126,7 +135,8 @@ ExchangeClient::next(uint32_t maxBytes, bool* atEnd, ContinueFuture* future) {
     }
 
     *atEnd = false;
-    pages = queue_->dequeueLocked(maxBytes, atEnd, future);
+    pages = queue_->dequeueLocked(
+        consumerId, maxBytes, atEnd, future, &stalePromise);
     if (*atEnd) {
       return pages;
     }
@@ -139,6 +149,9 @@ ExchangeClient::next(uint32_t maxBytes, bool* atEnd, ContinueFuture* future) {
   }
 
   // Outside of lock
+  if (stalePromise.valid()) {
+    stalePromise.setValue();
+  }
   request(std::move(requestSpecs));
   return pages;
 }
@@ -148,65 +161,65 @@ void ExchangeClient::request(std::vector<RequestSpec>&& requestSpecs) {
   for (auto& spec : requestSpecs) {
     auto future = folly::SemiFuture<ExchangeSource::Response>::makeEmpty();
     if (spec.maxBytes == 0) {
-      future = spec.source->requestDataSizes(kRequestDataSizesMaxWait);
+      future = spec.source->requestDataSizes(kRequestDataSizesMaxWaitSec_);
     } else {
       future = spec.source->request(spec.maxBytes, kRequestDataMaxWait);
     }
     VELOX_CHECK(future.valid());
     std::move(future)
         .via(executor_)
-        .thenValue([self,
-                    spec = std::move(spec),
-                    sendTimeMs = getCurrentTimeMs()](auto&& response) {
-          const auto requestTimeMs = getCurrentTimeMs() - sendTimeMs;
-          if (spec.maxBytes == 0) {
-            RECORD_HISTOGRAM_METRIC_VALUE(
-                kMetricExchangeDataSizeTimeMs, requestTimeMs);
-            RECORD_METRIC_VALUE(kMetricExchangeDataSizeCount);
-          } else {
-            RECORD_HISTOGRAM_METRIC_VALUE(
-                kMetricExchangeDataTimeMs, requestTimeMs);
-            RECORD_METRIC_VALUE(kMetricExchangeDataBytes, response.bytes);
-            RECORD_HISTOGRAM_METRIC_VALUE(
-                kMetricExchangeDataSize, response.bytes);
-            RECORD_METRIC_VALUE(kMetricExchangeDataCount);
-          }
-
-          bool pauseCurrentSource = false;
-          std::vector<RequestSpec> requestSpecs;
-          std::shared_ptr<ExchangeSource> currentSource = spec.source;
-          {
-            std::lock_guard<std::mutex> l(self->queue_->mutex());
-            if (self->closed_) {
-              return;
-            }
-            if (!response.atEnd) {
-              if (!response.remainingBytes.empty()) {
-                for (auto bytes : response.remainingBytes) {
-                  VELOX_CHECK_GT(bytes, 0);
-                }
-                self->producingSources_.push(
-                    {std::move(spec.source),
-                     std::move(response.remainingBytes)});
+        .thenValue(
+            [self, spec = std::move(spec), sendTimeMs = getCurrentTimeMs()](
+                ExchangeSource::Response&& response) {
+              const auto requestTimeMs = getCurrentTimeMs() - sendTimeMs;
+              if (spec.maxBytes == 0) {
+                RECORD_HISTOGRAM_METRIC_VALUE(
+                    kMetricExchangeDataSizeTimeMs, requestTimeMs);
+                RECORD_METRIC_VALUE(kMetricExchangeDataSizeCount);
               } else {
-                self->emptySources_.push(std::move(spec.source));
+                RECORD_HISTOGRAM_METRIC_VALUE(
+                    kMetricExchangeDataTimeMs, requestTimeMs);
+                RECORD_METRIC_VALUE(kMetricExchangeDataBytes, response.bytes);
+                RECORD_HISTOGRAM_METRIC_VALUE(
+                    kMetricExchangeDataSize, response.bytes);
+                RECORD_METRIC_VALUE(kMetricExchangeDataCount);
               }
-            }
-            self->totalPendingBytes_ -= spec.maxBytes;
-            requestSpecs = self->pickSourcesToRequestLocked();
-            pauseCurrentSource =
-                std::find_if(
-                    requestSpecs.begin(),
-                    requestSpecs.end(),
-                    [&currentSource](const RequestSpec& spec) -> bool {
-                      return spec.source.get() == currentSource.get();
-                    }) == requestSpecs.end();
-          }
-          if (pauseCurrentSource) {
-            currentSource->pause();
-          }
-          self->request(std::move(requestSpecs));
-        })
+
+              bool pauseCurrentSource = false;
+              std::vector<RequestSpec> requestSpecs;
+              std::shared_ptr<ExchangeSource> currentSource = spec.source;
+              {
+                std::lock_guard<std::mutex> l(self->queue_->mutex());
+                if (self->closed_) {
+                  return;
+                }
+                if (!response.atEnd) {
+                  if (!response.remainingBytes.empty()) {
+                    for (auto bytes : response.remainingBytes) {
+                      VELOX_CHECK_GT(bytes, 0);
+                    }
+                    self->producingSources_.push(
+                        {std::move(spec.source),
+                         std::move(response.remainingBytes)});
+                  } else {
+                    self->emptySources_.push(std::move(spec.source));
+                  }
+                }
+                self->totalPendingBytes_ -= spec.maxBytes;
+                requestSpecs = self->pickSourcesToRequestLocked();
+                pauseCurrentSource =
+                    std::find_if(
+                        requestSpecs.begin(),
+                        requestSpecs.end(),
+                        [&currentSource](const RequestSpec& spec) -> bool {
+                          return spec.source.get() == currentSource.get();
+                        }) == requestSpecs.end();
+              }
+              if (pauseCurrentSource) {
+                currentSource->pause();
+              }
+              self->request(std::move(requestSpecs));
+            })
         .thenError(
             folly::tag_t<std::exception>{}, [self](const std::exception& e) {
               self->queue_->setError(e.what());
@@ -247,10 +260,17 @@ ExchangeClient::pickSourcesToRequestLocked() {
     producingSources_.pop();
     totalPendingBytes_ += requestBytes;
   }
-  if (queue_->totalBytes() == 0 && totalPendingBytes_ == 0 &&
+
+  if ((queue_->totalBytes() + totalPendingBytes_ < minOutputBatchBytes_) &&
       !producingSources_.empty()) {
-    // We have full capacity but still cannot initiate one single data transfer.
-    // Let the transfer happen in this case to avoid getting stuck.
+    // Two cases which we request an out-of-band data transfer:
+    // 1. We have full capacity but still cannot initiate one single data
+    //    transfer. Let the transfer happen in this case to avoid getting stuck.
+    //
+    // 2. We have some data in the queue that is not big enough for
+    //    consumers and it is big enough to not allow ExchangeClient to
+    //    initiate request for more data. Let transfer happen in this case
+    //    to avoid this deadlock situation.
     auto& source = producingSources_.front().source;
     auto requestBytes = producingSources_.front().remainingBytes.at(0);
     LOG(INFO) << "Requesting large single page " << requestBytes

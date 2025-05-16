@@ -63,6 +63,15 @@ class CppFormatter(str):
 
 
 class CMakeFormatter(str):
+    def __init__(self, commit) -> None:
+        super().__init__()
+        try:
+            import yaml
+        except ModuleNotFoundError:
+            # We need pyyaml so cmake-format can read '.cmake-format.yml'
+            # otherwise it will run with default
+            raise SystemExit("Please install 'pyyaml' for the CMake formatter.")
+
     def diff(self, commit):
         return get_diff(
             self, util.run(f"cmake-format --first-comment-is-literal True {self}")[1]
@@ -90,6 +99,12 @@ format_file_types = OrderedDict(
         "*.h": attrdict({"formatter": CppFormatter}),
         "*.inc": attrdict({"formatter": CppFormatter}),
         "*.prolog": attrdict({"formatter": CppFormatter}),
+        "*.hpp": attrdict({"formatter": CppFormatter}),
+        "*.cu": attrdict({"formatter": CppFormatter}),
+        "*.cuh": attrdict({"formatter": CppFormatter}),
+        "*.clcpp": attrdict({"formatter": CppFormatter}),
+        "*.mm": attrdict({"formatter": CppFormatter}),
+        "*.metal": attrdict({"formatter": CppFormatter}),
         "*.py": attrdict({"formatter": PythonFormatter}),
     }
 )
@@ -205,6 +220,7 @@ def get_files(commit, path):
         and "build/deps" not in file
         and "cmake-build-debug" not in file
         and "NOTICE.txt" != file
+        and "velox/docs/affiliations_map.txt" != file
     ]
 
 

@@ -29,11 +29,14 @@
 #include "velox/functions/prestosql/fuzzer/ApproxPercentileInputGenerator.h"
 #include "velox/functions/prestosql/fuzzer/ApproxPercentileResultVerifier.h"
 #include "velox/functions/prestosql/fuzzer/ArbitraryResultVerifier.h"
+#include "velox/functions/prestosql/fuzzer/AverageResultVerifier.h"
+#include "velox/functions/prestosql/fuzzer/ClassificationAggregationInputGenerator.h"
 #include "velox/functions/prestosql/fuzzer/MapUnionSumInputGenerator.h"
 #include "velox/functions/prestosql/fuzzer/MinMaxByResultVerifier.h"
 #include "velox/functions/prestosql/fuzzer/MinMaxInputGenerator.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/functions/prestosql/window/WindowFunctionsRegistration.h"
+#include "velox/vector/fuzzer/VectorFuzzer.h"
 
 DEFINE_int64(
     seed,
@@ -61,6 +64,8 @@ DEFINE_uint32(
     "Timeout in milliseconds for HTTP requests made to reference DB, "
     "such as Presto. Example: --req_timeout_ms=2000");
 
+// Any change made in the file should be reflected in
+// the FB-internal aggregation fuzzer test too.
 namespace facebook::velox::exec::test {
 namespace {
 
@@ -74,8 +79,7 @@ getCustomInputGenerators() {
       {"approx_distinct", std::make_shared<ApproxDistinctInputGenerator>()},
       {"approx_set", std::make_shared<ApproxDistinctInputGenerator>()},
       {"approx_percentile", std::make_shared<ApproxPercentileInputGenerator>()},
-      {"map_union_sum", std::make_shared<MapUnionSumInputGenerator>()},
-  };
+      {"map_union_sum", std::make_shared<MapUnionSumInputGenerator>()}};
 }
 
 } // namespace
@@ -103,12 +107,19 @@ int main(int argc, char** argv) {
   facebook::velox::window::prestosql::registerAllWindowFunctions();
   facebook::velox::functions::prestosql::registerInternalFunctions();
   facebook::velox::aggregate::prestosql::registerInternalAggregateFunctions();
-  facebook::velox::memory::MemoryManager::initialize({});
+  facebook::velox::memory::MemoryManager::initialize(
+      facebook::velox::memory::MemoryManager::Options{});
 
   size_t initialSeed = FLAGS_seed == 0 ? std::time(nullptr) : FLAGS_seed;
 
   // List of functions that have known bugs that cause crashes or failures.
   static const std::unordered_set<std::string> skipFunctions = {
+      // https://github.com/prestodb/presto/issues/24936
+      "classification_fall_out",
+      "classification_precision",
+      "classification_recall",
+      "classification_miss_rate",
+      "classification_thresholds",
       // Skip internal functions used only for result verifications.
       "$internal$count_distinct",
       "$internal$array_agg",
@@ -117,21 +128,17 @@ int main(int argc, char** argv) {
       // Lambda functions are not supported yet.
       "reduce_agg",
       "max_data_size_for_stats",
-      "map_union_sum",
-      "approx_set",
       "any_value",
-      // Presto 0.288 makes set_agg and set_union not respect order-by on
-      // inputs. Presto 0.289
-      // re-enables the order-by for them. So skip these two functions until we
-      // compare
-      // Velox result against Presto 0.289 or later versions.
-      "set_agg",
-      "set_union",
+  };
+
+  static const std::unordered_set<std::string> functionsRequireSortedInput = {
+      "tdigest_agg",
   };
 
   using facebook::velox::exec::test::ApproxDistinctResultVerifier;
   using facebook::velox::exec::test::ApproxPercentileResultVerifier;
   using facebook::velox::exec::test::ArbitraryResultVerifier;
+  using facebook::velox::exec::test::AverageResultVerifier;
   using facebook::velox::exec::test::MinMaxByResultVerifier;
   using facebook::velox::exec::test::setupReferenceQueryRunner;
   using facebook::velox::exec::test::TransformResultVerifier;
@@ -158,7 +165,7 @@ int main(int argc, char** argv) {
       customVerificationFunctions = {
           // Order-dependent functions.
           {"approx_distinct", std::make_shared<ApproxDistinctResultVerifier>()},
-          {"approx_set", nullptr},
+          {"approx_set", std::make_shared<ApproxDistinctResultVerifier>(true)},
           {"approx_percentile",
            std::make_shared<ApproxPercentileResultVerifier>()},
           {"arbitrary", std::make_shared<ArbitraryResultVerifier>()},
@@ -171,6 +178,7 @@ int main(int argc, char** argv) {
           {"map_union_sum", makeMapVerifier()},
           {"max_by", std::make_shared<MinMaxByResultVerifier>(false)},
           {"min_by", std::make_shared<MinMaxByResultVerifier>(true)},
+          {"avg", std::make_shared<AverageResultVerifier>()},
           {"multimap_agg",
            TransformResultVerifier::create(
                "transform_values({}, (k, v) -> \"$internal$canonicalize\"(v))")},
@@ -189,14 +197,21 @@ int main(int argc, char** argv) {
   Options options;
   options.onlyFunctions = FLAGS_only;
   options.skipFunctions = skipFunctions;
+  options.functionsRequireSortedInput = functionsRequireSortedInput;
   options.customVerificationFunctions = customVerificationFunctions;
   options.customInputGenerators =
       facebook::velox::exec::test::getCustomInputGenerators();
   options.timestampPrecision =
       facebook::velox::VectorFuzzer::Options::TimestampPrecision::kMilliSeconds;
+  std::shared_ptr<facebook::velox::memory::MemoryPool> rootPool{
+      facebook::velox::memory::memoryManager()->addRootPool()};
+
   return Runner::run(
       initialSeed,
       setupReferenceQueryRunner(
-          FLAGS_presto_url, "aggregation_fuzzer", FLAGS_req_timeout_ms),
+          rootPool.get(),
+          FLAGS_presto_url,
+          "aggregation_fuzzer",
+          FLAGS_req_timeout_ms),
       options);
 }

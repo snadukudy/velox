@@ -14,22 +14,31 @@
  * limitations under the License.
  */
 
-#include "velox/exec/fuzzer/PrestoQueryRunner.h"
 #include <cpr/cpr.h> // @manual
 #include <folly/json.h>
 #include <iostream>
+#include <utility>
+
 #include "velox/common/base/Fs.h"
 #include "velox/common/encode/Base64.h"
-#include "velox/common/file/FileSystems.h"
 #include "velox/connectors/hive/HiveDataSink.h"
-#include "velox/connectors/hive/TableHandle.h"
 #include "velox/core/Expressions.h"
+#include "velox/core/ITypedExpr.h"
 #include "velox/dwio/common/WriterFactory.h"
+#include "velox/dwio/dwrf/writer/Writer.h"
+#include "velox/exec/fuzzer/FuzzerUtil.h"
+#include "velox/exec/fuzzer/PrestoQueryRunner.h"
+#include "velox/exec/fuzzer/PrestoQueryRunnerIntermediateTypeTransforms.h"
+#include "velox/exec/fuzzer/PrestoQueryRunnerToSqlPlanNodeVisitor.h"
+#include "velox/exec/fuzzer/PrestoSql.h"
 #include "velox/exec/tests/utils/QueryAssertions.h"
+#include "velox/functions/prestosql/types/IPAddressType.h"
+#include "velox/functions/prestosql/types/IPPrefixType.h"
+#include "velox/functions/prestosql/types/JsonType.h"
+#include "velox/functions/prestosql/types/TimestampWithTimeZoneType.h"
+#include "velox/functions/prestosql/types/UuidType.h"
 #include "velox/serializers/PrestoSerializer.h"
 #include "velox/type/parser/TypeParser.h"
-
-#include <utility>
 
 using namespace facebook::velox;
 
@@ -42,7 +51,8 @@ void writeToFile(
     memory::MemoryPool* pool) {
   VELOX_CHECK_GT(data.size(), 0);
 
-  auto options = std::make_shared<dwio::common::WriterOptions>();
+  std::shared_ptr<dwio::common::WriterOptions> options =
+      std::make_shared<dwrf::WriterOptions>();
   options->schema = data[0]->type();
   options->memoryPool = pool;
 
@@ -57,13 +67,13 @@ void writeToFile(
   writer->close();
 }
 
-ByteInputStream toByteStream(const std::string& input) {
+std::unique_ptr<ByteInputStream> toByteStream(const std::string& input) {
   std::vector<ByteRange> ranges;
   ranges.push_back(
       {reinterpret_cast<uint8_t*>(const_cast<char*>(input.data())),
-       (int32_t)input.length(),
+       static_cast<int32_t>(input.length()),
        0});
-  return ByteInputStream(std::move(ranges));
+  return std::make_unique<BufferInputStream>(std::move(ranges));
 }
 
 RowVectorPtr deserialize(
@@ -73,30 +83,8 @@ RowVectorPtr deserialize(
   auto byteStream = toByteStream(input);
   auto serde = std::make_unique<serializer::presto::PrestoVectorSerde>();
   RowVectorPtr result;
-  serde->deserialize(&byteStream, pool, rowType, &result, nullptr);
+  serde->deserialize(byteStream.get(), pool, rowType, &result, nullptr);
   return result;
-}
-
-RowVectorPtr makeNullRows(
-    const std::vector<velox::RowVectorPtr>& input,
-    const std::string& colName,
-    memory::MemoryPool* pool) {
-  // The query doesn't need to read any columns, but it needs to see a
-  // specific number of rows. Make new 'input' as single all-null BIGINT
-  // column with as many rows as original input. This way we'll be able to
-  // create a temporary test table with the necessary number of rows.
-  vector_size_t numInput = 0;
-  for (const auto& v : input) {
-    numInput += v->size();
-  }
-
-  auto column = BaseVector::createNullConstant(BIGINT(), numInput, pool);
-  return std::make_shared<RowVector>(
-      pool,
-      ROW({colName}, {BIGINT()}),
-      nullptr,
-      numInput,
-      std::vector<VectorPtr>{column});
 }
 
 class ServerResponse {
@@ -162,180 +150,47 @@ class ServerResponse {
 } // namespace
 
 PrestoQueryRunner::PrestoQueryRunner(
+    memory::MemoryPool* pool,
     std::string coordinatorUri,
     std::string user,
     std::chrono::milliseconds timeout)
-    : coordinatorUri_{std::move(coordinatorUri)},
+    : ReferenceQueryRunner(pool),
+      coordinatorUri_{std::move(coordinatorUri)},
       user_{std::move(user)},
       timeout_(timeout) {
   eventBaseThread_.start("PrestoQueryRunner");
+  pool_ = aggregatePool()->addLeafChild("leaf");
+  queryRunnerContext_ = std::make_shared<QueryRunnerContext>();
 }
 
 std::optional<std::string> PrestoQueryRunner::toSql(
     const core::PlanNodePtr& plan) {
-  if (const auto projectNode =
-          std::dynamic_pointer_cast<const core::ProjectNode>(plan)) {
-    return toSql(projectNode);
-  }
+  PrestoSqlPlanNodeVisitorContext context;
+  PrestoQueryRunnerToSqlPlanNodeVisitor visitor(queryRunnerContext_);
+  plan->accept(visitor, context);
 
-  if (const auto windowNode =
-          std::dynamic_pointer_cast<const core::WindowNode>(plan)) {
-    return toSql(windowNode);
-  }
-
-  if (const auto aggregationNode =
-          std::dynamic_pointer_cast<const core::AggregationNode>(plan)) {
-    return toSql(aggregationNode);
-  }
-
-  if (const auto rowNumberNode =
-          std::dynamic_pointer_cast<const core::RowNumberNode>(plan)) {
-    return toSql(rowNumberNode);
-  }
-
-  if (auto tableWriteNode =
-          std::dynamic_pointer_cast<const core::TableWriteNode>(plan)) {
-    return toSql(tableWriteNode);
-  }
-
-  if (const auto joinNode =
-          std::dynamic_pointer_cast<const core::HashJoinNode>(plan)) {
-    return toSql(joinNode);
-  }
-
-  if (const auto joinNode =
-          std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(plan)) {
-    return toSql(joinNode);
-  }
-
-  VELOX_NYI();
+  return context.sql;
 }
 
-namespace {
-
-void appendComma(int32_t i, std::stringstream& sql) {
-  if (i > 0) {
-    sql << ", ";
-  }
+const std::vector<TypePtr>& PrestoQueryRunner::supportedScalarTypes() const {
+  static const std::vector<TypePtr> kScalarTypes{
+      BOOLEAN(),
+      TINYINT(),
+      SMALLINT(),
+      INTEGER(),
+      BIGINT(),
+      REAL(),
+      DOUBLE(),
+      VARCHAR(),
+      VARBINARY(),
+      TIMESTAMP(),
+      TIMESTAMP_WITH_TIME_ZONE(),
+  };
+  return kScalarTypes;
 }
 
-std::string toTypeSql(const TypePtr& type) {
-  switch (type->kind()) {
-    case TypeKind::ARRAY:
-      return fmt::format("array({})", toTypeSql(type->childAt(0)));
-    case TypeKind::MAP:
-      return fmt::format(
-          "map({}, {})",
-          toTypeSql(type->childAt(0)),
-          toTypeSql(type->childAt(1)));
-    case TypeKind::ROW: {
-      const auto& rowType = type->asRow();
-      std::stringstream sql;
-      sql << "row(";
-      for (auto i = 0; i < type->size(); ++i) {
-        appendComma(i, sql);
-        sql << rowType.nameOf(i) << " ";
-        sql << toTypeSql(type->childAt(i));
-      }
-      sql << ")";
-      return sql.str();
-    }
-    default:
-      if (type->isPrimitiveType()) {
-        return type->toString();
-      }
-      VELOX_UNSUPPORTED("Type is not supported: {}", type->toString());
-  }
-}
-
-std::string toCallSql(const core::CallTypedExprPtr& call);
-
-void toCallInputsSql(
-    const std::vector<core::TypedExprPtr>& inputs,
-    std::stringstream& sql) {
-  for (auto i = 0; i < inputs.size(); ++i) {
-    appendComma(i, sql);
-
-    const auto& input = inputs.at(i);
-    if (auto field =
-            std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(
-                input)) {
-      sql << field->name();
-    } else if (
-        auto call =
-            std::dynamic_pointer_cast<const core::CallTypedExpr>(input)) {
-      sql << toCallSql(call);
-    } else if (
-        auto lambda =
-            std::dynamic_pointer_cast<const core::LambdaTypedExpr>(input)) {
-      const auto& signature = lambda->signature();
-      const auto& body =
-          std::dynamic_pointer_cast<const core::CallTypedExpr>(lambda->body());
-      VELOX_CHECK_NOT_NULL(body);
-
-      sql << "(";
-      for (auto j = 0; j < signature->size(); ++j) {
-        appendComma(j, sql);
-        sql << signature->nameOf(j);
-      }
-
-      sql << ") -> " << toCallSql(body);
-    } else {
-      VELOX_NYI();
-    }
-  }
-}
-
-std::string toCallSql(const core::CallTypedExprPtr& call) {
-  std::stringstream sql;
-  sql << call->name() << "(";
-  toCallInputsSql(call->inputs(), sql);
-  sql << ")";
-  return sql.str();
-}
-
-std::string toAggregateCallSql(
-    const core::CallTypedExprPtr& call,
-    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys,
-    const std::vector<core::SortOrder>& sortingOrders,
-    bool distinct) {
-  VELOX_CHECK_EQ(sortingKeys.size(), sortingOrders.size());
-  std::stringstream sql;
-  sql << call->name() << "(";
-
-  if (distinct) {
-    sql << "distinct ";
-  }
-
-  toCallInputsSql(call->inputs(), sql);
-
-  if (!sortingKeys.empty()) {
-    sql << " ORDER BY ";
-
-    for (int i = 0; i < sortingKeys.size(); i++) {
-      appendComma(i, sql);
-      sql << sortingKeys[i]->name() << " " << sortingOrders[i].toString();
-    }
-  }
-
-  sql << ")";
-  return sql.str();
-}
-
-std::string toWindowCallSql(
-    const core::CallTypedExprPtr& call,
-    bool ignoreNulls = false) {
-  std::stringstream sql;
-  sql << call->name() << "(";
-  toCallInputsSql(call->inputs(), sql);
-  sql << ")";
-  if (ignoreNulls) {
-    sql << " IGNORE NULLS";
-  }
-  return sql.str();
-}
-
-bool isSupportedDwrfType(const TypePtr& type) {
+// static
+bool PrestoQueryRunner::isSupportedDwrfType(const TypePtr& type) {
   if (type->isDate() || type->isIntervalDayTime() || type->isUnKnown()) {
     return false;
   }
@@ -349,426 +204,142 @@ bool isSupportedDwrfType(const TypePtr& type) {
   return true;
 }
 
-} // namespace
-
-std::optional<std::string> PrestoQueryRunner::toSql(
-    const std::shared_ptr<const core::AggregationNode>& aggregationNode) {
-  // Assume plan is Aggregation over Values.
-  VELOX_CHECK(aggregationNode->step() == core::AggregationNode::Step::kSingle);
-
-  if (!isSupportedDwrfType(aggregationNode->sources()[0]->outputType())) {
-    return std::nullopt;
+std::pair<std::vector<RowVectorPtr>, std::vector<core::ExprPtr>>
+PrestoQueryRunner::inputProjections(
+    const std::vector<RowVectorPtr>& input) const {
+  if (input.empty()) {
+    return {input, {}};
   }
 
-  std::vector<std::string> groupingKeys;
-  for (const auto& key : aggregationNode->groupingKeys()) {
-    groupingKeys.push_back(key->name());
-  }
-
-  std::stringstream sql;
-  sql << "SELECT " << folly::join(", ", groupingKeys);
-
-  const auto& aggregates = aggregationNode->aggregates();
-  if (!aggregates.empty()) {
-    if (!groupingKeys.empty()) {
-      sql << ", ";
-    }
-
-    for (auto i = 0; i < aggregates.size(); ++i) {
-      appendComma(i, sql);
-      const auto& aggregate = aggregates[i];
-      sql << toAggregateCallSql(
-          aggregate.call,
-          aggregate.sortingKeys,
-          aggregate.sortingOrders,
-          aggregate.distinct);
-
-      if (aggregate.mask != nullptr) {
-        sql << " filter (where " << aggregate.mask->name() << ")";
+  std::vector<core::ExprPtr> projections;
+  std::vector<std::string> names = input[0]->type()->asRow().names();
+  std::vector<std::vector<VectorPtr>> children(input.size());
+  for (int childIndex = 0; childIndex < input[0]->childrenSize();
+       childIndex++) {
+    const auto& childType = input[0]->childAt(childIndex)->type();
+    // If it's an intermediate only type, transform the input and add
+    // expressions to reverse the transformation.  Otherwise the input is
+    // unchanged and the projection is just an identity mapping.
+    if (isIntermediateOnlyType(childType)) {
+      for (int batchIndex = 0; batchIndex < input.size(); batchIndex++) {
+        children[batchIndex].push_back(transformIntermediateOnlyType(
+            input[batchIndex]->childAt(childIndex)));
       }
-      sql << " as " << aggregationNode->aggregateNames()[i];
-    }
-  }
-
-  sql << " FROM tmp";
-
-  if (!groupingKeys.empty()) {
-    sql << " GROUP BY " << folly::join(", ", groupingKeys);
-  }
-
-  return sql.str();
-}
-
-std::optional<std::string> PrestoQueryRunner::toSql(
-    const std::shared_ptr<const core::ProjectNode>& projectNode) {
-  auto sourceSql = toSql(projectNode->sources()[0]);
-  if (!sourceSql.has_value()) {
-    return std::nullopt;
-  }
-
-  std::stringstream sql;
-  sql << "SELECT ";
-
-  for (auto i = 0; i < projectNode->names().size(); ++i) {
-    appendComma(i, sql);
-    auto projection = projectNode->projections()[i];
-    if (auto field =
-            std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(
-                projection)) {
-      sql << field->name();
-    } else if (
-        auto call =
-            std::dynamic_pointer_cast<const core::CallTypedExpr>(projection)) {
-      sql << toCallSql(call);
+      projections.push_back(getIntermediateOnlyTypeProjectionExpr(
+          childType,
+          std::make_shared<core::FieldAccessExpr>(
+              names[childIndex], names[childIndex]),
+          names[childIndex]));
     } else {
-      VELOX_NYI();
-    }
+      for (int batchIndex = 0; batchIndex < input.size(); batchIndex++) {
+        children[batchIndex].push_back(input[batchIndex]->childAt(childIndex));
+      }
 
-    sql << " as " << projectNode->names()[i];
+      projections.push_back(std::make_shared<core::FieldAccessExpr>(
+          names[childIndex], names[childIndex]));
+    }
   }
 
-  sql << " FROM (" << sourceSql.value() << ")";
-  return sql.str();
+  std::vector<TypePtr> types;
+  for (const auto& child : children[0]) {
+    types.push_back(child->type());
+  }
+
+  auto rowType = ROW(std::move(names), std::move(types));
+
+  std::vector<RowVectorPtr> output;
+  output.reserve(input.size());
+  for (int batchIndex = 0; batchIndex < input.size(); batchIndex++) {
+    output.push_back(std::make_shared<RowVector>(
+        input[batchIndex]->pool(),
+        rowType,
+        input[batchIndex]->nulls(),
+        input[batchIndex]->size(),
+        std::move(children[batchIndex])));
+  }
+
+  return std::make_pair(output, projections);
 }
 
-namespace {
+const std::unordered_map<std::string, DataSpec>&
+PrestoQueryRunner::aggregationFunctionDataSpecs() const {
+  // For some functions, velox supports NaN, Infinity better than presto query
+  // runner, which makes the comparison impossible.
+  // Add data constraint in vector fuzzer to enforce to not generate such data
+  // for those functions before they are fixed in presto query runner
+  static const std::unordered_map<std::string, DataSpec>
+      kAggregationFunctionDataSpecs{
+          {"regr_avgx", DataSpec{false, false}},
+          {"regr_avgy", DataSpec{false, false}},
+          {"regr_r2", DataSpec{false, false}},
+          {"regr_sxx", DataSpec{false, false}},
+          {"regr_syy", DataSpec{false, false}},
+          {"regr_sxy", DataSpec{false, false}},
+          {"regr_slope", DataSpec{false, false}},
+          {"regr_replacement", DataSpec{false, false}},
+          {"covar_pop", DataSpec{true, false}},
+          {"covar_samp", DataSpec{true, false}},
+      };
 
-void appendWindowFrame(
-    const core::WindowNode::Frame& frame,
-    std::stringstream& sql) {
-  // TODO: Add support for k Range Frames by retrieving the original range bound
-  // from WindowNode.
-  switch (frame.type) {
-    case core::WindowNode::WindowType::kRange:
-      sql << " RANGE";
-      break;
-    case core::WindowNode::WindowType::kRows:
-      sql << " ROWS";
-      break;
-    default:
-      VELOX_UNREACHABLE();
-  }
-  sql << " BETWEEN";
-
-  auto appendBound = [&sql](
-                         const core::WindowNode::BoundType& bound,
-                         const core::TypedExprPtr& value) {
-    switch (bound) {
-      case core::WindowNode::BoundType::kUnboundedPreceding:
-        sql << " UNBOUNDED PRECEDING";
-        break;
-      case core::WindowNode::BoundType::kUnboundedFollowing:
-        sql << " UNBOUNDED FOLLOWING";
-        break;
-      case core::WindowNode::BoundType::kCurrentRow:
-        sql << " CURRENT ROW";
-        break;
-      case core::WindowNode::BoundType::kPreceding:
-        sql << " " << value->toString() << " PRECEDING";
-        break;
-      case core::WindowNode::BoundType::kFollowing:
-        sql << " " << value->toString() << " FOLLOWING";
-        break;
-      default:
-        VELOX_UNREACHABLE();
-    }
-  };
-
-  appendBound(frame.startType, frame.startValue);
-  sql << " AND";
-  appendBound(frame.endType, frame.endValue);
+  return kAggregationFunctionDataSpecs;
 }
 
-} // namespace
-
-std::optional<std::string> PrestoQueryRunner::toSql(
-    const std::shared_ptr<const core::WindowNode>& windowNode) {
-  if (!isSupportedDwrfType(windowNode->sources()[0]->outputType())) {
-    return std::nullopt;
+bool PrestoQueryRunner::isConstantExprSupported(
+    const core::TypedExprPtr& expr) {
+  if (std::dynamic_pointer_cast<const core::ConstantTypedExpr>(expr)) {
+    // TODO: support constant literals of these types. Complex-typed constant
+    // literals require support of converting them to SQL. Json, Ipaddress,
+    // Ipprefix, and Uuid can be enabled after we're able to generate valid
+    // input values, because when these types are used as the type of a constant
+    // literal in SQL, Presto implicitly invokes json_parse(),
+    // cast(x as Ipaddress), cast(x as Ipprefix) and cast(x as uuid) on it,
+    // which makes the behavior of Presto different from Velox. Timestamp
+    // constant literals require further investigation to ensure Presto uses the
+    // same timezone as Velox. Interval type cannot be used as the type of
+    // constant literals in Presto SQL.
+    auto& type = expr->type();
+    return type->isPrimitiveType() && !type->isTimestamp() &&
+        !isJsonType(type) && !type->isIntervalDayTime() &&
+        !isIPAddressType(type) && !isIPPrefixType(type) && !isUuidType(type) &&
+        !isTimestampWithTimeZoneType(type);
   }
-
-  std::stringstream sql;
-  sql << "SELECT ";
-
-  const auto& inputType = windowNode->sources()[0]->outputType();
-  for (auto i = 0; i < inputType->size(); ++i) {
-    appendComma(i, sql);
-    sql << inputType->nameOf(i);
-  }
-
-  sql << ", ";
-
-  const auto& functions = windowNode->windowFunctions();
-  for (auto i = 0; i < functions.size(); ++i) {
-    appendComma(i, sql);
-    sql << toWindowCallSql(functions[i].functionCall, functions[i].ignoreNulls);
-
-    sql << " OVER (";
-
-    const auto& partitionKeys = windowNode->partitionKeys();
-    if (!partitionKeys.empty()) {
-      sql << "PARTITION BY ";
-      for (auto j = 0; j < partitionKeys.size(); ++j) {
-        appendComma(j, sql);
-        sql << partitionKeys[j]->name();
-      }
-    }
-
-    const auto& sortingKeys = windowNode->sortingKeys();
-    const auto& sortingOrders = windowNode->sortingOrders();
-
-    if (!sortingKeys.empty()) {
-      sql << " ORDER BY ";
-      for (auto j = 0; j < sortingKeys.size(); ++j) {
-        appendComma(j, sql);
-        sql << sortingKeys[j]->name() << " " << sortingOrders[j].toString();
-      }
-    }
-
-    appendWindowFrame(functions[i].frame, sql);
-    sql << ")";
-  }
-
-  sql << " FROM tmp";
-
-  return sql.str();
+  return true;
 }
 
-std::optional<std::string> PrestoQueryRunner::toSql(
-    const std::shared_ptr<const core::RowNumberNode>& rowNumberNode) {
-  if (!isSupportedDwrfType(rowNumberNode->sources()[0]->outputType())) {
-    return std::nullopt;
-  }
-
-  std::stringstream sql;
-  sql << "SELECT ";
-
-  const auto& inputType = rowNumberNode->sources()[0]->outputType();
-  for (auto i = 0; i < inputType->size(); ++i) {
-    appendComma(i, sql);
-    sql << inputType->nameOf(i);
-  }
-
-  sql << ", row_number() OVER (";
-
-  const auto& partitionKeys = rowNumberNode->partitionKeys();
-  if (!partitionKeys.empty()) {
-    sql << "partition by ";
-    for (auto i = 0; i < partitionKeys.size(); ++i) {
-      appendComma(i, sql);
-      sql << partitionKeys[i]->name();
-    }
-  }
-
-  sql << ") as row_number FROM tmp";
-
-  return sql.str();
+bool PrestoQueryRunner::isSupported(const exec::FunctionSignature& signature) {
+  // TODO: support queries with these types. Among the types below, hugeint is
+  // not a native type in Presto, so fuzzer should not use it as the type of
+  // cast-to or constant literals. Hyperloglog and TDigest can only be casted
+  // from varbinary and cannot be used as the type of constant literals.
+  // Interval year to month can only be casted from NULL and cannot be used as
+  // the type of constant literals. Json, Ipaddress, Ipprefix, and UUID require
+  // special handling, because Presto requires literals of these types to be
+  // valid, and doesn't allow creating HIVE columns of these types.
+  return !(
+      usesTypeName(signature, "bingtile") ||
+      usesTypeName(signature, "interval year to month") ||
+      usesTypeName(signature, "hugeint") ||
+      usesTypeName(signature, "hyperloglog") ||
+      usesTypeName(signature, "tdigest") ||
+      usesInputTypeName(signature, "json") ||
+      usesInputTypeName(signature, "ipaddress") ||
+      usesInputTypeName(signature, "ipprefix") ||
+      usesInputTypeName(signature, "uuid"));
 }
 
-std::optional<std::string> PrestoQueryRunner::toSql(
-    const std::shared_ptr<const core::TableWriteNode>& tableWriteNode) {
-  auto insertTableHandle =
-      std::dynamic_pointer_cast<connector::hive::HiveInsertTableHandle>(
-          tableWriteNode->insertTableHandle()->connectorInsertTableHandle());
-
-  // Returns a CTAS sql with specified table properties from TableWriteNode,
-  // example sql:
-  // CREATE TABLE tmp_write WITH (
-  // PARTITIONED_BY = ARRAY['p0'],
-  // BUCKETED_COUNT = 2, BUCKETED_BY = ARRAY['b0', 'b1'],
-  // SORTED_BY = ARRAY['s0 ASC', 's1 DESC'],
-  // FORMAT = 'ORC'
-  // )
-  // AS SELECT * FROM tmp
-  std::stringstream sql;
-  sql << "CREATE TABLE tmp_write";
-  std::vector<std::string> partitionKeys;
-  for (auto i = 0; i < tableWriteNode->columnNames().size(); ++i) {
-    if (insertTableHandle->inputColumns()[i]->isPartitionKey()) {
-      partitionKeys.push_back(insertTableHandle->inputColumns()[i]->name());
-    }
+std::pair<
+    std::optional<std::multiset<std::vector<velox::variant>>>,
+    ReferenceQueryErrorCode>
+PrestoQueryRunner::execute(const core::PlanNodePtr& plan) {
+  std::pair<
+      std::optional<std::vector<velox::RowVectorPtr>>,
+      ReferenceQueryErrorCode>
+      result = executeAndReturnVector(plan);
+  if (result.first) {
+    return std::make_pair(
+        exec::test::materialize(*result.first), result.second);
   }
-  sql << " WITH (";
-
-  if (insertTableHandle->isPartitioned()) {
-    sql << " PARTITIONED_BY = ARRAY[";
-    for (int i = 0; i < partitionKeys.size(); ++i) {
-      appendComma(i, sql);
-      sql << "'" << partitionKeys[i] << "'";
-    }
-    sql << "], ";
-
-    if (insertTableHandle->bucketProperty() != nullptr) {
-      const auto bucketCount =
-          insertTableHandle->bucketProperty()->bucketCount();
-      const auto bucketColumns =
-          insertTableHandle->bucketProperty()->bucketedBy();
-      sql << " BUCKET_COUNT = " << bucketCount << ", BUCKETED_BY = ARRAY[";
-      for (int i = 0; i < bucketColumns.size(); ++i) {
-        appendComma(i, sql);
-        sql << "'" << bucketColumns[i] << "'";
-      }
-      sql << "], ";
-
-      const auto sortColumns = insertTableHandle->bucketProperty()->sortedBy();
-      if (!sortColumns.empty()) {
-        sql << " SORTED_BY = ARRAY[";
-        for (int i = 0; i < sortColumns.size(); ++i) {
-          appendComma(i, sql);
-          sql << "'" << sortColumns[i]->sortColumn() << " "
-              << (sortColumns[i]->sortOrder().isAscending() ? "ASC" : "DESC")
-              << "'";
-        }
-        sql << "], ";
-      }
-    }
-  }
-
-  sql << "FORMAT = 'ORC')  AS SELECT * FROM tmp";
-  return sql.str();
-}
-
-std::optional<std::string> PrestoQueryRunner::toSql(
-    const std::shared_ptr<const core::HashJoinNode>& joinNode) {
-  if (!isSupportedDwrfType(joinNode->sources()[0]->outputType())) {
-    return std::nullopt;
-  }
-
-  if (!isSupportedDwrfType(joinNode->sources()[1]->outputType())) {
-    return std::nullopt;
-  }
-
-  const auto joinKeysToSql = [](auto keys) {
-    std::stringstream out;
-    for (auto i = 0; i < keys.size(); ++i) {
-      if (i > 0) {
-        out << ", ";
-      }
-      out << keys[i]->name();
-    }
-    return out.str();
-  };
-
-  const auto equiClausesToSql = [](auto joinNode) {
-    std::stringstream out;
-    for (auto i = 0; i < joinNode->leftKeys().size(); ++i) {
-      if (i > 0) {
-        out << " AND ";
-      }
-      out << joinNode->leftKeys()[i]->name() << " = "
-          << joinNode->rightKeys()[i]->name();
-    }
-    return out.str();
-  };
-
-  const auto& outputNames = joinNode->outputType()->names();
-
-  std::stringstream sql;
-  if (joinNode->isLeftSemiProjectJoin()) {
-    sql << "SELECT "
-        << folly::join(", ", outputNames.begin(), --outputNames.end());
-  } else {
-    sql << "SELECT " << folly::join(", ", outputNames);
-  }
-
-  switch (joinNode->joinType()) {
-    case core::JoinType::kInner:
-      sql << " FROM t INNER JOIN u ON " << equiClausesToSql(joinNode);
-      break;
-    case core::JoinType::kLeft:
-      sql << " FROM t LEFT JOIN u ON " << equiClausesToSql(joinNode);
-      break;
-    case core::JoinType::kFull:
-      sql << " FROM t FULL OUTER JOIN u ON " << equiClausesToSql(joinNode);
-      break;
-    case core::JoinType::kLeftSemiFilter:
-      if (joinNode->leftKeys().size() > 1) {
-        return std::nullopt;
-      }
-      sql << " FROM t WHERE " << joinKeysToSql(joinNode->leftKeys())
-          << " IN (SELECT " << joinKeysToSql(joinNode->rightKeys())
-          << " FROM u)";
-      break;
-    case core::JoinType::kLeftSemiProject:
-      if (joinNode->isNullAware()) {
-        sql << ", " << joinKeysToSql(joinNode->leftKeys()) << " IN (SELECT "
-            << joinKeysToSql(joinNode->rightKeys()) << " FROM u) FROM t";
-      } else {
-        sql << ", EXISTS (SELECT * FROM u WHERE " << equiClausesToSql(joinNode)
-            << ") FROM t";
-      }
-      break;
-    case core::JoinType::kAnti:
-      if (joinNode->isNullAware()) {
-        sql << " FROM t WHERE " << joinKeysToSql(joinNode->leftKeys())
-            << " NOT IN (SELECT " << joinKeysToSql(joinNode->rightKeys())
-            << " FROM u)";
-      } else {
-        sql << " FROM t WHERE NOT EXISTS (SELECT * FROM u WHERE "
-            << equiClausesToSql(joinNode) << ")";
-      }
-      break;
-    default:
-      VELOX_UNREACHABLE(
-          "Unknown join type: {}", static_cast<int>(joinNode->joinType()));
-  }
-
-  return sql.str();
-}
-
-std::optional<std::string> PrestoQueryRunner::toSql(
-    const std::shared_ptr<const core::NestedLoopJoinNode>& joinNode) {
-  const auto& joinKeysToSql = [](auto keys) {
-    std::stringstream out;
-    for (auto i = 0; i < keys.size(); ++i) {
-      if (i > 0) {
-        out << ", ";
-      }
-      out << keys[i]->name();
-    }
-    return out.str();
-  };
-
-  const auto& outputNames = joinNode->outputType()->names();
-  std::stringstream sql;
-
-  // Nested loop join without filter.
-  VELOX_CHECK(
-      joinNode->joinCondition() == nullptr,
-      "This code path should be called only for nested loop join without filter");
-  const std::string joinCondition{"(1 = 1)"};
-  switch (joinNode->joinType()) {
-    case core::JoinType::kInner:
-      sql << " FROM t INNER JOIN u ON " << joinCondition;
-      break;
-    case core::JoinType::kLeft:
-      sql << " FROM t LEFT JOIN u ON " << joinCondition;
-      break;
-    case core::JoinType::kFull:
-      sql << " FROM t FULL OUTER JOIN u ON " << joinCondition;
-      break;
-    default:
-      VELOX_UNREACHABLE(
-          "Unknown join type: {}", static_cast<int>(joinNode->joinType()));
-  }
-
-  return sql.str();
-}
-
-std::multiset<std::vector<variant>> PrestoQueryRunner::execute(
-    const std::string& sql,
-    const std::vector<RowVectorPtr>& input,
-    const RowTypePtr& resultType) {
-  return exec::test::materialize(executeVector(sql, input, resultType));
-}
-
-std::multiset<std::vector<velox::variant>> PrestoQueryRunner::execute(
-    const std::string& sql,
-    const std::vector<RowVectorPtr>& probeInput,
-    const std::vector<RowVectorPtr>& buildInput,
-    const RowTypePtr& resultType) {
-  return exec::test::materialize(
-      executeVector(sql, probeInput, buildInput, resultType));
+  return std::make_pair(std::nullopt, result.second);
 }
 
 std::string PrestoQueryRunner::createTable(
@@ -802,68 +373,55 @@ std::string PrestoQueryRunner::createTable(
   return tableDirectoryPath;
 }
 
-std::vector<velox::RowVectorPtr> PrestoQueryRunner::executeVector(
-    const std::string& sql,
-    const std::vector<RowVectorPtr>& probeInput,
-    const std::vector<RowVectorPtr>& buildInput,
-    const velox::RowTypePtr& resultType) {
-  auto probeType = asRowType(probeInput[0]->type());
-  if (probeType->size() == 0) {
-    auto rowVector = makeNullRows(probeInput, "x", pool());
-    return executeVector(sql, {rowVector}, buildInput, resultType);
+std::pair<
+    std::optional<std::vector<velox::RowVectorPtr>>,
+    ReferenceQueryErrorCode>
+PrestoQueryRunner::executeAndReturnVector(const core::PlanNodePtr& plan) {
+  if (std::optional<std::string> sql = toSql(plan)) {
+    try {
+      std::unordered_map<std::string, std::vector<velox::RowVectorPtr>>
+          inputMap = getAllTables(plan);
+      for (const auto& [tableName, input] : inputMap) {
+        auto inputType = asRowType(input[0]->type());
+        if (inputType->size() == 0) {
+          inputMap[tableName] = {
+              makeNullRows(input, fmt::format("{}x", tableName), pool())};
+        }
+      }
+
+      auto writerPool = aggregatePool()->addAggregateChild("writer");
+      for (const auto& [tableName, input] : inputMap) {
+        auto tableDirectoryPath = createTable(tableName, input[0]->type());
+
+        // Create a new file in table's directory with fuzzer-generated data.
+        auto filePath = fs::path(tableDirectoryPath)
+                            .append(fmt::format("{}.dwrf", tableName))
+                            .string()
+                            .substr(strlen("file:"));
+
+        writeToFile(filePath, input, writerPool.get());
+      }
+
+      // Run the query.
+      return std::make_pair(execute(*sql), ReferenceQueryErrorCode::kSuccess);
+    } catch (const VeloxRuntimeError& e) {
+      // Throw if connection to Presto server is unsuccessful.
+      if (e.message().find("Couldn't connect to server") != std::string::npos) {
+        throw;
+      }
+      LOG(WARNING) << "Query failed in Presto";
+      return std::make_pair(
+          std::nullopt, ReferenceQueryErrorCode::kReferenceQueryFail);
+    } catch (...) {
+      LOG(WARNING) << "Query failed in Presto";
+      return std::make_pair(
+          std::nullopt, ReferenceQueryErrorCode::kReferenceQueryFail);
+    }
   }
 
-  auto buildType = asRowType(buildInput[0]->type());
-  if (probeType->size() == 0) {
-    auto rowVector = makeNullRows(buildInput, "y", pool());
-    return executeVector(sql, probeInput, {rowVector}, resultType);
-  }
-
-  auto probeTableDirectoryPath = createTable("t", probeInput[0]->type());
-  auto buildTableDirectoryPath = createTable("u", buildInput[0]->type());
-
-  // Create a new file in table's directory with fuzzer-generated data.
-  auto probeFilePath = fs::path(probeTableDirectoryPath)
-                           .append("probe.dwrf")
-                           .string()
-                           .substr(strlen("file:"));
-
-  auto buildFilePath = fs::path(buildTableDirectoryPath)
-                           .append("build.dwrf")
-                           .string()
-                           .substr(strlen("file:"));
-
-  auto writerPool = rootPool()->addAggregateChild("writer");
-  writeToFile(probeFilePath, probeInput, writerPool.get());
-  writeToFile(buildFilePath, buildInput, writerPool.get());
-
-  // Run the query.
-  return execute(sql);
-}
-
-std::vector<velox::RowVectorPtr> PrestoQueryRunner::executeVector(
-    const std::string& sql,
-    const std::vector<velox::RowVectorPtr>& input,
-    const velox::RowTypePtr& resultType) {
-  auto inputType = asRowType(input[0]->type());
-  if (inputType->size() == 0) {
-    auto rowVector = makeNullRows(input, "x", pool());
-    return executeVector(sql, {rowVector}, resultType);
-  }
-
-  auto tableDirectoryPath = createTable("tmp", input[0]->type());
-
-  // Create a new file in table's directory with fuzzer-generated data.
-  auto newFilePath = fs::path(tableDirectoryPath)
-                         .append("fuzzer.dwrf")
-                         .string()
-                         .substr(strlen("file:"));
-
-  auto writerPool = rootPool()->addAggregateChild("writer");
-  writeToFile(newFilePath, input, writerPool.get());
-
-  // Run the query.
-  return execute(sql);
+  LOG(INFO) << "Query not supported in Presto";
+  return std::make_pair(
+      std::nullopt, ReferenceQueryErrorCode::kReferenceQueryUnsupported);
 }
 
 std::vector<RowVectorPtr> PrestoQueryRunner::execute(const std::string& sql) {

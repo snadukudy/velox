@@ -35,6 +35,16 @@ void registerVeloxMetrics() {
   DEFINE_HISTOGRAM_METRIC(
       kMetricDriverExecTimeMs, 1'000, 0, 30'000, 50, 90, 99, 100);
 
+  // Tracks the averaged task batch processing time. This only applies for
+  // sequential task execution mode.
+  DEFINE_METRIC(kMetricTaskBatchProcessTimeMs, facebook::velox::StatType::AVG);
+
+  // Tracks task barrier execution time in range of [0, 30s] with 30 buckets and
+  // each bucket has time window of 1 second. We reports P50, P90, P99, and
+  // P100.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricTaskBarrierProcessTimeMs, 1'000, 0, 30'000, 50, 90, 99, 100);
+
   /// ================== Cache Counters =================
 
   // Tracks hive handle generation latency in range of [0, 100s] and reports
@@ -62,24 +72,33 @@ void registerVeloxMetrics() {
   // the bytes that are either currently being allocated or were in the past
   // allocated, not yet been returned back to the operating system, in the
   // form of 'Allocation' or 'ContiguousAllocation'.
-  DEFINE_METRIC(kMetricMappedMemoryBytes, facebook::velox::StatType::AVG);
+  DEFINE_METRIC(
+      kMetricMemoryAllocatorMappedBytes, facebook::velox::StatType::AVG);
 
   // Number of bytes currently allocated (used) from MemoryAllocator in the form
   // of 'Allocation' or 'ContiguousAllocation'.
-  DEFINE_METRIC(kMetricAllocatedMemoryBytes, facebook::velox::StatType::AVG);
+  DEFINE_METRIC(
+      kMetricMemoryAllocatorAllocatedBytes, facebook::velox::StatType::AVG);
+
+  // Total number of bytes currently allocated from MemoryAllocator.
+  DEFINE_METRIC(
+      kMetricMemoryAllocatorTotalUsedBytes, facebook::velox::StatType::AVG);
 
   // Number of bytes currently mapped in MmapAllocator, in the form of
   // 'ContiguousAllocation'.
   //
   // NOTE: This applies only to MmapAllocator
-  DEFINE_METRIC(kMetricMmapExternalMappedBytes, facebook::velox::StatType::AVG);
+  DEFINE_METRIC(
+      kMetricMmapAllocatorExternalMappedBytes, facebook::velox::StatType::AVG);
 
   // Number of bytes currently allocated from MmapAllocator directly from raw
   // allocateBytes() interface, and internally allocated by malloc. Only small
   // chunks of memory are delegated to malloc.
   //
   // NOTE: This applies only to MmapAllocator
-  DEFINE_METRIC(kMetricMmapDelegatedAllocBytes, facebook::velox::StatType::AVG);
+  DEFINE_METRIC(
+      kMetricMmapAllocatorDelegatedAllocatedBytes,
+      facebook::velox::StatType::AVG);
 
   /// ================== AsyncDataCache Counters =================
 
@@ -219,9 +238,9 @@ void registerVeloxMetrics() {
   // Total number of SSD evict log file open errors.
   DEFINE_METRIC(kMetricSsdCacheOpenLogErrors, facebook::velox::StatType::SUM);
 
-  // Total number of errors while deleting SSD checkpoint files.
+  // Total number of errors while deleting SSD checkpoint/evictlog files.
   DEFINE_METRIC(
-      kMetricSsdCacheDeleteCheckpointErrors, facebook::velox::StatType::SUM);
+      kMetricSsdCacheMetaFileDeleteErrors, facebook::velox::StatType::SUM);
 
   // Total number of errors while growing SSD cache files.
   DEFINE_METRIC(kMetricSsdCacheGrowFileErrors, facebook::velox::StatType::SUM);
@@ -285,18 +304,18 @@ void registerVeloxMetrics() {
   DEFINE_METRIC(
       kMetricArbitratorFailuresCount, facebook::velox::StatType::COUNT);
 
-  // Tracks the memory reclaim count on an operator.
-  DEFINE_METRIC(kMetricMemoryReclaimCount, facebook::velox::StatType::COUNT);
+  // Tracks the op memory reclaim count on an operator.
+  DEFINE_METRIC(kMetricOpMemoryReclaimCount, facebook::velox::StatType::COUNT);
 
   // Tracks op memory reclaim exec time in range of [0, 600s] with 20 buckets
   // and reports P50, P90, P99, and P100.
   DEFINE_HISTOGRAM_METRIC(
-      kMetricMemoryReclaimExecTimeMs, 30'000, 0, 600'000, 50, 90, 99, 100);
+      kMetricOpMemoryReclaimTimeMs, 30'000, 0, 600'000, 50, 90, 99, 100);
 
   // Tracks op memory reclaim bytes distribution in range of [0, 4GB] with 64
   // buckets and reports P50, P90, P99, and P100
   DEFINE_HISTOGRAM_METRIC(
-      kMetricMemoryReclaimedBytes,
+      kMetricOpMemoryReclaimedBytes,
       67'108'864,
       0,
       4'294'967'296,
@@ -305,9 +324,30 @@ void registerVeloxMetrics() {
       99,
       100);
 
-  // Tracks the memory reclaim count on an operator.
+  // Tracks the memory reclaim count on a query task.
   DEFINE_METRIC(
       kMetricTaskMemoryReclaimCount, facebook::velox::StatType::COUNT);
+
+  // Tracks query memory reclaim time in range of [0, 600s] with 20 buckets
+  // and reports P50, P90, P99, and P100.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricQueryMemoryReclaimTimeMs, 30'000, 0, 600'000, 50, 90, 99, 100);
+
+  // Tracks query memory reclaim bytes distribution in range of [0, 4GB] with 64
+  // buckets and reports P50, P90, P99, and P100
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricQueryMemoryReclaimedBytes,
+      67'108'864,
+      0,
+      4'294'967'296,
+      50,
+      90,
+      99,
+      100);
+
+  // Tracks the memory reclaim count on a query.
+  DEFINE_METRIC(
+      kMetricQueryMemoryReclaimCount, facebook::velox::StatType::COUNT);
 
   // Tracks memory reclaim task wait time in range of [0, 60s] with 60 buckets
   // and reports P50, P90, P99, and P100.
@@ -323,6 +363,9 @@ void registerVeloxMetrics() {
   DEFINE_METRIC(
       kMetricTaskMemoryReclaimWaitTimeoutCount,
       facebook::velox::StatType::COUNT);
+
+  // Tracks the total number of splits received by all tasks.
+  DEFINE_METRIC(kMetricTaskSplitsCount, facebook::velox::StatType::COUNT);
 
   // The number of times that the memory reclaim fails because the operator is
   // executing a non-reclaimable section where it is expected to have reserved
@@ -350,25 +393,74 @@ void registerVeloxMetrics() {
       kMetricArbitratorGlobalArbitrationCount,
       facebook::velox::StatType::COUNT);
 
-  // The number of global arbitration that reclaims used memory by slow disk
-  // spilling.
-  DEFINE_METRIC(
-      kMetricArbitratorSlowGlobalArbitrationCount,
-      facebook::velox::StatType::COUNT);
-
-  // The distribution of the amount of time an arbitration operation stays in
-  // arbitration queues and waits the arbitration r/w locks in range of [0,
-  // 600s] with 20 buckets. It is configured to report the latency at P50, P90,
+  // The number of victims distribution of a global arbitration run [0, 32] with
+  // 32 buckets. It is configured to report the number of victims at P50, P90,
   // P99, and P100 percentiles.
   DEFINE_HISTOGRAM_METRIC(
-      kMetricArbitratorWaitTimeMs, 30'000, 0, 600'000, 50, 90, 99, 100);
+      kMetricArbitratorGlobalArbitrationNumReclaimVictims,
+      1,
+      0,
+      32,
+      50,
+      90,
+      99,
+      100);
+
+  // The number of victim query memory pool having nothing to spill.
+  DEFINE_METRIC(
+      kMetricArbitratorGlobalArbitrationFailedVictimCount,
+      facebook::velox::StatType::COUNT);
+
+  // The time distribution of a global arbitration run [0, 600s] with 20
+  // buckets. It is configured to report the latency at P50, P90, P99, and P100
+  // percentiles.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricArbitratorGlobalArbitrationTimeMs,
+      30'000,
+      0,
+      600'000,
+      50,
+      90,
+      99,
+      100);
+
+  // The reclaimed bytes distribution of a global arbitration run in range of
+  // [0, 32GB] with 64 buckets. It is configured to report the reclaimed bytes
+  // at P50, P90, P99, and P100 percentiles.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricArbitratorGlobalArbitrationBytes,
+      512L << 20,
+      0,
+      32L << 30,
+      50,
+      90,
+      99,
+      100);
+
+  // The number of times that an arbitration operation wait for global
+  // arbitration to free up memory.
+  DEFINE_METRIC(
+      kMetricArbitratorGlobalArbitrationWaitCount,
+      facebook::velox::StatType::COUNT);
+
+  // The time distribution of a global arbitration wait [0, 300s] with 20
+  // buckets. It is configured to report the latency at P50, P90, P99, and P100
+  // percentiles.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricArbitratorGlobalArbitrationWaitTimeMs,
+      15'000,
+      0,
+      300'000,
+      50,
+      90,
+      99,
+      100);
 
   // The distribution of the amount of time it takes to complete a single
-  // arbitration request stays queued in range of [0, 600s] with 20
-  // buckets. It is configured to report the latency at P50, P90, P99,
-  // and P100 percentiles.
+  // arbitration operation in range of [0, 600s] with 20 buckets. It is
+  // configured to report the latency at P50, P90, P99, and P100 percentiles.
   DEFINE_HISTOGRAM_METRIC(
-      kMetricArbitratorArbitrationTimeMs, 30'000, 0, 600'000, 50, 90, 99, 100);
+      kMetricArbitratorOpExecTimeMs, 30'000, 0, 600'000, 50, 90, 99, 100);
 
   // Tracks the average of free memory capacity managed by the arbitrator in
   // bytes.
@@ -471,11 +563,24 @@ void registerVeloxMetrics() {
   DEFINE_METRIC(
       kMetricFileWriterEarlyFlushedRawBytes, facebook::velox::StatType::SUM);
 
+  // The distribution of the amount of time spent on hive sort writer finish
+  // call in range of [0, 120s] with 60 buckets. It is configured to report the
+  // latency at P50, P90, P99, and P100 percentiles.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricHiveSortWriterFinishTimeMs, 2'000, 0, 120'000, 50, 90, 99, 100);
+
   // The current spilling memory usage in bytes.
   DEFINE_METRIC(kMetricSpillMemoryBytes, facebook::velox::StatType::AVG);
 
   // The peak spilling memory usage in bytes.
   DEFINE_METRIC(kMetricSpillPeakMemoryBytes, facebook::velox::StatType::AVG);
+
+  /// ================== Exchange Counters =================
+
+  // Tracks exchange http transaction create delay in range of [0, 30s] with
+  // 30 buckets and reports P50, P90, P99, and P100.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricExchangeTransactionCreateDelay, 1'000, 0, 30'000, 50, 90, 99, 100);
 
   // The data exchange time distribution in range of [0, 5s] with 50 buckets. It
   // is configured to report the latency at P50, P90, P99, and P100 percentiles.
@@ -502,6 +607,52 @@ void registerVeloxMetrics() {
 
   // The number of data size exchange requests.
   DEFINE_METRIC(kMetricExchangeDataSizeCount, facebook::velox::StatType::COUNT);
+
+  /// ================== Index Lookup Counters =================
+  // The distribution of index lookup result raw bytes in range of [0, 128MB]
+  // with 128 buckets. It is configured to report the capacity at P50, P90, P99,
+  // and P100 percentiles.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricIndexLookupResultRawBytes,
+      1L << 20,
+      0,
+      128L << 20,
+      50,
+      90,
+      99,
+      100);
+
+  // The distribution of index lookup result bytes in range of [0, 128MB] with
+  // 128 buckets. It is configured to report the capacity at P50, P90, P99, and
+  // P100 percentiles.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricIndexLookupResultBytes, 1L << 20, 0, 128L << 20, 50, 90, 99, 100);
+
+  // The time distribution of index lookup time in range of [0, 16s] with 512
+  // buckets and reports P50, P90, P99, and P100.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricIndexLookupTimeMs, 32, 0, 16L << 10, 50, 90, 99, 100);
+
+  // The time distribution of index lookup wait time in range of [0, 16s] with
+  // 512 buckets and reports P50, P90, P99, and P100.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricIndexLookupWaitTimeMs, 32, 0, 16L << 10, 50, 90, 99, 100);
+
+  // The time distribution of index lookup operator blocked wait time in range
+  // of [0, 16s] with 512 buckets and reports P50, P90, P99, and P100.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricIndexLookupBlockedWaitTimeMs, 32, 0, 16L << 10, 50, 90, 99, 100);
+
+  /// ================== Table Scan Counters =================
+  // The time distribution of table scan batch processing time in range of [0,
+  // 16s] with 512 buckets and reports P50, P90, P99, and P100.
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricTableScanBatchProcessTimeMs, 32, 0, 16L << 10, 50, 90, 99, 100);
+
+  // The size distribution of table scan output batch in range of [0, 512MB]
+  // with 512 buckets and reports P50, P90, P99, and P100
+  DEFINE_HISTOGRAM_METRIC(
+      kMetricTableScanBatchBytes, 1L << 20, 0, 512L << 20, 50, 90, 99, 100);
 
   /// ================== Storage Counters =================
 

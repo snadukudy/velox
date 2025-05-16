@@ -21,13 +21,13 @@
 #include "velox/dwio/common/DirectDecoder.h"
 #include "velox/dwio/common/SelectiveColumnReader.h"
 #include "velox/dwio/common/compression/Compression.h"
+#include "velox/dwio/parquet/common/RleEncodingInternal.h"
 #include "velox/dwio/parquet/reader/BooleanDecoder.h"
 #include "velox/dwio/parquet/reader/DeltaBpDecoder.h"
+#include "velox/dwio/parquet/reader/DeltaByteArrayDecoder.h"
 #include "velox/dwio/parquet/reader/ParquetTypeWithId.h"
 #include "velox/dwio/parquet/reader/RleBpDataDecoder.h"
 #include "velox/dwio/parquet/reader/StringDecoder.h"
-
-#include <arrow/util/rle_encoding.h>
 
 namespace facebook::velox::parquet {
 
@@ -42,7 +42,7 @@ class PageReader {
       ParquetTypeWithIdPtr fileType,
       common::CompressionKind codec,
       int64_t chunkSize,
-      const date::time_zone* sessionTimezone)
+      const tz::TimeZone* sessionTimezone)
       : pool_(pool),
         inputStream_(std::move(stream)),
         type_(std::move(fileType)),
@@ -62,7 +62,7 @@ class PageReader {
       memory::MemoryPool& pool,
       common::CompressionKind codec,
       int64_t chunkSize,
-      const date::time_zone* sessionTimezone = nullptr)
+      const tz::TimeZone* sessionTimezone = nullptr)
       : pool_(pool),
         inputStream_(std::move(stream)),
         maxRepeat_(0),
@@ -88,7 +88,7 @@ class PageReader {
   /// filled.
   int32_t getLengthsAndNulls(
       LevelMode mode,
-      const arrow::LevelInfo& info,
+      const LevelInfo& info,
       int32_t begin,
       int32_t end,
       int32_t maxItems,
@@ -131,6 +131,10 @@ class PageReader {
     return encoding_ == thrift::Encoding::DELTA_BINARY_PACKED;
   }
 
+  bool isDeltaByteArray() const {
+    return encoding_ == thrift::Encoding::DELTA_BYTE_ARRAY;
+  }
+
   /// Returns the range of repdefs for the top level rows covered by the last
   /// decoderepDefs().
   std::pair<int32_t, int32_t> repDefRange() const {
@@ -141,7 +145,7 @@ class PageReader {
   // bufferEnd_ to the corresponding positions.
   thrift::PageHeader readPageHeader();
 
-  const date::time_zone* sessionTimezone() const {
+  const tz::TimeZone* sessionTimezone() const {
     return sessionTimezone_;
   }
 
@@ -305,6 +309,9 @@ class PageReader {
         nullsFromFastPath = dwio::common::useFastPath<Visitor, true>(visitor);
         auto dictVisitor = visitor.toStringDictionaryColumnVisitor();
         dictionaryIdDecoder_->readWithVisitor<true>(nulls, dictVisitor);
+      } else if (encoding_ == thrift::Encoding::DELTA_BYTE_ARRAY) {
+        nullsFromFastPath = false;
+        deltaByteArrDecoder_->readWithVisitor<true>(nulls, visitor);
       } else {
         nullsFromFastPath = false;
         stringDecoder_->readWithVisitor<true>(nulls, visitor);
@@ -313,6 +320,8 @@ class PageReader {
       if (isDictionary()) {
         auto dictVisitor = visitor.toStringDictionaryColumnVisitor();
         dictionaryIdDecoder_->readWithVisitor<false>(nullptr, dictVisitor);
+      } else if (encoding_ == thrift::Encoding::DELTA_BYTE_ARRAY) {
+        deltaByteArrDecoder_->readWithVisitor<false>(nulls, visitor);
       } else {
         stringDecoder_->readWithVisitor<false>(nulls, visitor);
       }
@@ -326,12 +335,24 @@ class PageReader {
           int>::type = 0>
   void
   callDecoder(const uint64_t* nulls, bool& nullsFromFastPath, Visitor visitor) {
-    VELOX_CHECK(!isDictionary(), "BOOLEAN types are never dictionary-encoded")
+    VELOX_CHECK(!isDictionary(), "BOOLEAN types are never dictionary-encoded");
     if (nulls) {
       nullsFromFastPath = false;
-      booleanDecoder_->readWithVisitor<true>(nulls, visitor);
+      switch (encoding_) {
+        case thrift::Encoding::RLE:
+          rleBooleanDecoder_->readWithVisitor<true>(nulls, visitor);
+          break;
+        default:
+          booleanDecoder_->readWithVisitor<true>(nulls, visitor);
+      }
     } else {
-      booleanDecoder_->readWithVisitor<false>(nulls, visitor);
+      switch (encoding_) {
+        case thrift::Encoding::RLE:
+          rleBooleanDecoder_->readWithVisitor<false>(nulls, visitor);
+          break;
+        default:
+          booleanDecoder_->readWithVisitor<false>(nulls, visitor);
+      }
     }
   }
 
@@ -366,8 +387,8 @@ class PageReader {
   // Decoder for single bit definition levels. the arrow decoders are used for
   // multibit levels pending fixing RleBpDecoder for the case.
   std::unique_ptr<RleBpDecoder> defineDecoder_;
-  std::unique_ptr<::arrow::util::RleDecoder> repeatDecoder_;
-  std::unique_ptr<::arrow::util::RleDecoder> wideDefineDecoder_;
+  std::unique_ptr<RleDecoder> repeatDecoder_;
+  std::unique_ptr<RleDecoder> wideDefineDecoder_;
 
   // True for a leaf column for which repdefs are loaded for the whole column
   // chunk. This is typically the leaftmost leaf of a list. Other leaves under
@@ -476,12 +497,12 @@ class PageReader {
   dwio::common::BitConcatenation nullConcatenation_;
 
   // LevelInfo for reading nulls for the leaf column 'this' represents.
-  arrow::LevelInfo leafInfo_;
+  LevelInfo leafInfo_;
 
   // Base values of dictionary when reading a string dictionary.
   VectorPtr dictionaryValues_;
 
-  const date::time_zone* sessionTimezone_{nullptr};
+  const tz::TimeZone* sessionTimezone_{nullptr};
 
   // Decoders. Only one will be set at a time.
   std::unique_ptr<dwio::common::DirectDecoder<true>> directDecoder_;
@@ -489,12 +510,14 @@ class PageReader {
   std::unique_ptr<StringDecoder> stringDecoder_;
   std::unique_ptr<BooleanDecoder> booleanDecoder_;
   std::unique_ptr<DeltaBpDecoder> deltaBpDecoder_;
+  std::unique_ptr<DeltaByteArrayDecoder> deltaByteArrDecoder_;
+  std::unique_ptr<RleBpDataDecoder> rleBooleanDecoder_;
   // Add decoders for other encodings here.
 };
 
 FOLLY_ALWAYS_INLINE dwio::common::compression::CompressionOptions
 getParquetDecompressionOptions(common::CompressionKind kind) {
-  dwio::common::compression::CompressionOptions options;
+  dwio::common::compression::CompressionOptions options{};
 
   if (kind == common::CompressionKind_ZLIB ||
       kind == common::CompressionKind_GZIP) {
@@ -529,6 +552,13 @@ void PageReader::readWithVisitor(Visitor& visitor) {
     visitor.setNumValuesBias(numValuesBeforePage);
     visitor.setRows(pageRows);
     callDecoder(nulls, nullsFromFastPath, visitor);
+    if (encoding_ == thrift::Encoding::DELTA_BINARY_PACKED &&
+        deltaBpDecoder_->validValuesCount() == 0) {
+      VELOX_DCHECK(
+          deltaBpDecoder_->bufferStart() == pageData_ + encodedDataSize_,
+          "Once all data in the delta binary packed decoder has been read, "
+          "its buffer ptr should be moved to the end of the page.");
+    }
     if (currentVisitorRow_ < numVisitorRows_ || isMultiPage) {
       if (mayProduceNulls) {
         if (!isMultiPage) {

@@ -18,7 +18,7 @@
 #include <folly/init/Init.h>
 
 #include "velox/benchmarks/ExpressionBenchmarkBuilder.h"
-#include "velox/functions/sparksql/Register.h"
+#include "velox/functions/sparksql/registration/Register.h"
 
 using namespace facebook;
 
@@ -26,7 +26,7 @@ using namespace facebook::velox;
 
 int main(int argc, char** argv) {
   folly::Init init(&argc, &argv);
-  memory::MemoryManager::initialize({});
+  memory::MemoryManager::initialize(memory::MemoryManager::Options{});
   functions::sparksql::registerFunctions("");
 
   ExpressionBenchmarkBuilder benchmarkBuilder;
@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
       VARCHAR(),
       DECIMAL(18, 6),
       DECIMAL(38, 6),
+      UNKNOWN(),
       ARRAY(MAP(INTEGER(), VARCHAR())),
       ROW({"f_map", "f_array"}, {MAP(INTEGER(), VARCHAR()), ARRAY(INTEGER())}),
   };

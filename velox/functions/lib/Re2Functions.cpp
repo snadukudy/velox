@@ -43,7 +43,7 @@ Expected<RE2*> ReCache::tryFindOrCompile(const StringView& pattern) {
     return reIt->second.get();
   }
 
-  if (cache_.size() >= kMaxCompiledRegexes) {
+  if (cache_.size() >= maxCompiledRegexes_) {
     return folly::makeUnexpected(
         Status::UserError("Max number of regex reached"));
   }
@@ -138,14 +138,22 @@ bool re2Extract(
     if (emptyNoMatch) {
       result.setNoCopy(row, StringView(nullptr, 0));
       return true;
-    } else {
-      result.setNull(row, true);
-      return false;
     }
+    result.setNull(row, true);
+    return false;
   } else {
     const re2::StringPiece extracted = groups[groupId];
-    result.setNoCopy(row, StringView(extracted.data(), extracted.size()));
-    return !StringView::isInline(extracted.size());
+    // Check if the extracted data is null.
+    if (extracted.data()) {
+      result.setNoCopy(row, StringView(extracted.data(), extracted.size()));
+      return !StringView::isInline(extracted.size());
+    }
+    if (emptyNoMatch) {
+      result.setNoCopy(row, StringView(nullptr, 0));
+      return true;
+    }
+    result.setNull(row, true);
+    return false;
   }
 }
 
@@ -239,6 +247,8 @@ class Re2MatchConstantPattern final : public exec::VectorFunction {
 template <bool (*Fn)(StringView, const RE2&)>
 class Re2Match final : public exec::VectorFunction {
  public:
+  explicit Re2Match(int64_t maxCompiledRegexes) : cache_(maxCompiledRegexes) {}
+
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -256,7 +266,12 @@ class Re2Match final : public exec::VectorFunction {
     exec::LocalDecodedVector toSearch(context, *args[0], rows);
     exec::LocalDecodedVector pattern(context, *args[1], rows);
     context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
-      auto& re = *cache_.findOrCompile(pattern->valueAt<StringView>(row));
+      auto tryRe = cache_.tryFindOrCompile(pattern->valueAt<StringView>(row));
+      if (tryRe.hasError()) {
+        context.setStatus(row, tryRe.error());
+        return;
+      }
+      const auto& re = *tryRe.value();
       result.set(row, Fn(toSearch->valueAt<StringView>(row), re));
     });
   }
@@ -351,6 +366,8 @@ class Re2SearchAndExtractConstantPattern final : public exec::VectorFunction {
 
  private:
   RE2 re_;
+  // If true, returns empty string as result for no match case, which is Spark's
+  // behavior. Otherwise, returns null as result, which is Presto's behavior.
   const bool emptyNoMatch_;
 };
 
@@ -359,8 +376,8 @@ class Re2SearchAndExtractConstantPattern final : public exec::VectorFunction {
 template <typename T>
 class Re2SearchAndExtract final : public exec::VectorFunction {
  public:
-  explicit Re2SearchAndExtract(bool emptyNoMatch)
-      : emptyNoMatch_(emptyNoMatch) {}
+  explicit Re2SearchAndExtract(bool emptyNoMatch, int64_t maxCompiledRegexes)
+      : emptyNoMatch_(emptyNoMatch), cache_(maxCompiledRegexes) {}
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -386,7 +403,13 @@ class Re2SearchAndExtract final : public exec::VectorFunction {
     if (args.size() == 2) {
       groups.resize(1);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
-        auto& re = *cache_.findOrCompile(pattern->valueAt<StringView>(i));
+        auto tryRe = cache_.tryFindOrCompile(pattern->valueAt<StringView>(i));
+        if (tryRe.hasError()) {
+          context.setStatus(i, tryRe.error());
+          return;
+        }
+        const auto& re = *tryRe.value();
+
         mustRefSourceStrings |=
             re2Extract(result, i, re, toSearch, groups, 0, emptyNoMatch_);
       });
@@ -394,7 +417,13 @@ class Re2SearchAndExtract final : public exec::VectorFunction {
       exec::LocalDecodedVector groupIds(context, *args[2], rows);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
         const auto groupId = groupIds->valueAt<T>(i);
-        auto& re = *cache_.findOrCompile(pattern->valueAt<StringView>(i));
+        auto tryRe = cache_.tryFindOrCompile(pattern->valueAt<StringView>(i));
+        if (tryRe.hasError()) {
+          context.setStatus(i, tryRe.error());
+          return;
+        }
+
+        const auto& re = *tryRe.value();
         checkForBadGroupId(groupId, re);
         groups.resize(groupId + 1);
         mustRefSourceStrings |=
@@ -650,6 +679,22 @@ bool matchSubstringPattern(
       std::string::npos);
 }
 
+bool matchSubstringsPattern(
+    const StringView& input,
+    const std::vector<std::string>& patterns) {
+  const char* data = input.data();
+  for (int i = 0; i < patterns.size(); i++) {
+    auto curPos =
+        std::string_view(data, input.end() - data)
+            .find(std::string_view(patterns[i].c_str(), patterns[i].size()));
+    if (curPos == std::string::npos) {
+      return false;
+    }
+    data = data + curPos + patterns[i].size();
+  }
+  return true;
+}
+
 // Return true if the input VARCHAR argument is all-ASCII for the specified
 // rows.
 FOLLY_ALWAYS_INLINE static bool isAsciiArg(
@@ -705,6 +750,8 @@ class OptimizedLike final : public exec::VectorFunction {
               .first;
         case PatternKind::kSubstring:
           return matchSubstringPattern(input, patternMetadata.fixedPattern());
+        case PatternKind::kSubstrings:
+          return matchSubstringsPattern(input, patternMetadata.substrings());
       }
     } else {
       switch (P) {
@@ -739,6 +786,8 @@ class OptimizedLike final : public exec::VectorFunction {
               input, patternMetadata, input.size() - 1);
         case PatternKind::kSubstring:
           return matchSubstringPattern(input, patternMetadata.fixedPattern());
+        case PatternKind::kSubstrings:
+          return matchSubstringsPattern(input, patternMetadata.substrings());
       }
     }
   }
@@ -866,11 +915,15 @@ class LikeWithRe2 final : public exec::VectorFunction {
 };
 
 // This function is constructed when pattern or escape are not constants.
-// It allows up to kMaxCompiledRegexes different regular expressions to be
-// compiled throughout the query lifetime per expression and thread of
-// execution, note that optimized regular expressions that are not compiled are
-// not counted.
+// It allows up to 'expression.max_compiled_regexes' different regular
+// expressions to be compiled throughout the query lifetime per expression and
+// thread of execution, note that optimized regular expressions that are not
+// compiled are not counted.
 class LikeGeneric final : public exec::VectorFunction {
+ public:
+  explicit LikeGeneric(int64_t maxCompiledRegexes)
+      : maxCompiledRegexes_(maxCompiledRegexes) {}
+
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -988,7 +1041,7 @@ class LikeGeneric final : public exec::VectorFunction {
 
     VELOX_USER_CHECK_LT(
         compiledRegularExpressions_.size(),
-        kMaxCompiledRegexes,
+        maxCompiledRegexes_,
         "Max number of regex reached");
 
     bool validEscapeUsage;
@@ -1013,6 +1066,7 @@ class LikeGeneric final : public exec::VectorFunction {
       std::pair<std::string, std::optional<char>>,
       std::unique_ptr<RE2>>
       compiledRegularExpressions_;
+  int64_t maxCompiledRegexes_;
 };
 
 void re2ExtractAll(
@@ -1037,8 +1091,13 @@ void re2ExtractAll(
     const re2::StringPiece fullMatch = groups[0];
     const re2::StringPiece subMatch = groups[groupId];
 
-    arrayWriter.add_item().setNoCopy(
-        StringView(subMatch.data(), subMatch.size()));
+    // Check if the subMatch is null.
+    if (subMatch.data()) {
+      arrayWriter.add_item().setNoCopy(
+          StringView(subMatch.data(), subMatch.size()));
+    } else {
+      arrayWriter.add_null();
+    }
     pos = fullMatch.data() + fullMatch.size() - input.data();
     if (UNLIKELY(fullMatch.size() == 0)) {
       ++pos;
@@ -1125,6 +1184,9 @@ class Re2ExtractAllConstantPattern final : public exec::VectorFunction {
 template <typename T>
 class Re2ExtractAll final : public exec::VectorFunction {
  public:
+  explicit Re2ExtractAll(int64_t maxCompiledRegexes)
+      : cache_(maxCompiledRegexes) {}
+
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -1154,7 +1216,12 @@ class Re2ExtractAll final : public exec::VectorFunction {
       //
       groups.resize(1);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
-        auto& re = *cache_.findOrCompile(pattern->valueAt<StringView>(row));
+        auto tryRe = cache_.tryFindOrCompile(pattern->valueAt<StringView>(row));
+        if (tryRe.hasError()) {
+          context.setStatus(row, tryRe.error());
+          return;
+        }
+        const auto& re = *tryRe.value();
         re2ExtractAll(resultWriter, re, inputStrs, row, groups, 0);
       });
     } else {
@@ -1163,7 +1230,12 @@ class Re2ExtractAll final : public exec::VectorFunction {
       exec::LocalDecodedVector groupIds(context, *args[2], rows);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
         const T groupId = groupIds->valueAt<T>(row);
-        auto& re = *cache_.findOrCompile(pattern->valueAt<StringView>(row));
+        auto tryRe = cache_.tryFindOrCompile(pattern->valueAt<StringView>(row));
+        if (tryRe.hasError()) {
+          context.setStatus(row, tryRe.error());
+          return;
+        }
+        const auto& re = *tryRe.value();
         checkForBadGroupId(groupId, re);
         groups.resize(groupId + 1);
         re2ExtractAll(resultWriter, re, inputStrs, row, groups, groupId);
@@ -1184,7 +1256,8 @@ class Re2ExtractAll final : public exec::VectorFunction {
 template <bool (*Fn)(StringView, const RE2&)>
 std::shared_ptr<exec::VectorFunction> makeRe2MatchImpl(
     const std::string& name,
-    const std::vector<exec::VectorFunctionArg>& inputArgs) {
+    const std::vector<exec::VectorFunctionArg>& inputArgs,
+    const core::QueryConfig& config) {
   if (inputArgs.size() != 2 || !inputArgs[0].type->isVarchar() ||
       !inputArgs[1].type->isVarchar()) {
     VELOX_UNSUPPORTED(
@@ -1200,11 +1273,14 @@ std::shared_ptr<exec::VectorFunction> makeRe2MatchImpl(
         constantPattern->as<ConstantVector<StringView>>()->valueAt(0));
   }
 
-  return std::make_shared<Re2Match<Fn>>();
+  return std::make_shared<Re2Match<Fn>>(config.exprMaxCompiledRegexes());
 }
 
 class RegexpReplaceWithLambdaFunction : public exec::VectorFunction {
  public:
+  explicit RegexpReplaceWithLambdaFunction(int64_t maxCompiledRegexes)
+      : cache_(maxCompiledRegexes) {}
+
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -1352,11 +1428,11 @@ class RegexpReplaceWithLambdaFunction : public exec::VectorFunction {
   // Sections being replaced should not overlap.
   struct Replacer {
     const StringView& original;
-    exec::StringWriter<false>& writer;
+    exec::StringWriter& writer;
     char* result;
     size_t start = 0;
 
-    Replacer(const StringView& _original, exec::StringWriter<false>& _writer)
+    Replacer(const StringView& _original, exec::StringWriter& _writer)
         : original{_original}, writer{_writer}, result{writer.data()} {}
 
     void replace(size_t offset, size_t size, const StringView& replacement) {
@@ -1518,13 +1594,13 @@ class RegexpReplaceWithLambdaFunction : public exec::VectorFunction {
       vector_size_t numMatchesPerRow = 0;
 
       size_t pos = 0;
-      re2::StringPiece subMatches[numGroups + 1];
+      std::vector<re2::StringPiece> subMatches(numGroups + 1);
       while (re->Match(
           toStringPiece(hay),
           pos,
           hay.size(),
           RE2::Anchor::UNANCHORED,
-          subMatches,
+          subMatches.data(),
           numGroups + 1)) {
         ++numMatchesPerRow;
         matches.ensureSize(matchRow + 1);
@@ -1572,8 +1648,8 @@ class RegexpReplaceWithLambdaFunction : public exec::VectorFunction {
 std::shared_ptr<exec::VectorFunction> makeRe2Match(
     const std::string& name,
     const std::vector<exec::VectorFunctionArg>& inputArgs,
-    const core::QueryConfig& /*config*/) {
-  return makeRe2MatchImpl<re2FullMatch>(name, inputArgs);
+    const core::QueryConfig& config) {
+  return makeRe2MatchImpl<re2FullMatch>(name, inputArgs, config);
 }
 
 std::vector<std::shared_ptr<exec::FunctionSignature>> re2MatchSignatures() {
@@ -1588,8 +1664,8 @@ std::vector<std::shared_ptr<exec::FunctionSignature>> re2MatchSignatures() {
 std::shared_ptr<exec::VectorFunction> makeRe2Search(
     const std::string& name,
     const std::vector<exec::VectorFunctionArg>& inputArgs,
-    const core::QueryConfig& /*config*/) {
-  return makeRe2MatchImpl<re2PartialMatch>(name, inputArgs);
+    const core::QueryConfig& config) {
+  return makeRe2MatchImpl<re2PartialMatch>(name, inputArgs, config);
 }
 
 std::vector<std::shared_ptr<exec::FunctionSignature>> re2SearchSignatures() {
@@ -1604,7 +1680,7 @@ std::vector<std::shared_ptr<exec::FunctionSignature>> re2SearchSignatures() {
 std::shared_ptr<exec::VectorFunction> makeRe2Extract(
     const std::string& name,
     const std::vector<exec::VectorFunctionArg>& inputArgs,
-    const core::QueryConfig& /*config*/,
+    const core::QueryConfig& config,
     const bool emptyNoMatch) {
   auto numArgs = inputArgs.size();
   VELOX_USER_CHECK(
@@ -1653,11 +1729,14 @@ std::shared_ptr<exec::VectorFunction> makeRe2Extract(
     }
   }
 
+  const auto maxCompiledRegexes = config.exprMaxCompiledRegexes();
   switch (groupIdTypeKind) {
     case TypeKind::INTEGER:
-      return std::make_shared<Re2SearchAndExtract<int32_t>>(emptyNoMatch);
+      return std::make_shared<Re2SearchAndExtract<int32_t>>(
+          emptyNoMatch, maxCompiledRegexes);
     case TypeKind::BIGINT:
-      return std::make_shared<Re2SearchAndExtract<int64_t>>(emptyNoMatch);
+      return std::make_shared<Re2SearchAndExtract<int64_t>>(
+          emptyNoMatch, maxCompiledRegexes);
     default:
       VELOX_UNREACHABLE();
   }
@@ -1688,19 +1767,19 @@ std::vector<std::shared_ptr<exec::FunctionSignature>> re2ExtractSignatures() {
 }
 
 PatternMetadata PatternMetadata::generic() {
-  return {PatternKind::kGeneric, 0, "", {}};
+  return {PatternKind::kGeneric, 0, "", {}, {}};
 }
 
 PatternMetadata PatternMetadata::atLeastN(size_t length) {
-  return {PatternKind::kAtLeastN, length, "", {}};
+  return {PatternKind::kAtLeastN, length, "", {}, {}};
 }
 
 PatternMetadata PatternMetadata::exactlyN(size_t length) {
-  return {PatternKind::kExactlyN, length, "", {}};
+  return {PatternKind::kExactlyN, length, "", {}, {}};
 }
 
 PatternMetadata PatternMetadata::fixed(const std::string& fixedPattern) {
-  return {PatternKind::kFixed, fixedPattern.length(), fixedPattern, {}};
+  return {PatternKind::kFixed, fixedPattern.length(), fixedPattern, {}, {}};
 }
 
 PatternMetadata PatternMetadata::relaxedFixed(
@@ -1711,11 +1790,12 @@ PatternMetadata PatternMetadata::relaxedFixed(
       PatternKind::kRelaxedFixed,
       fixedLength,
       std::move(fixedPattern),
-      std::move(subPatterns)};
+      std::move(subPatterns),
+      {}};
 }
 
 PatternMetadata PatternMetadata::prefix(const std::string& fixedPattern) {
-  return {PatternKind::kPrefix, fixedPattern.length(), fixedPattern, {}};
+  return {PatternKind::kPrefix, fixedPattern.length(), fixedPattern, {}, {}};
 }
 
 PatternMetadata PatternMetadata::relaxedPrefix(
@@ -1726,11 +1806,12 @@ PatternMetadata PatternMetadata::relaxedPrefix(
       PatternKind::kRelaxedPrefix,
       fixedLength,
       std::move(fixedPattern),
-      std::move(subPatterns)};
+      std::move(subPatterns),
+      {}};
 }
 
 PatternMetadata PatternMetadata::suffix(const std::string& fixedPattern) {
-  return {PatternKind::kSuffix, fixedPattern.length(), fixedPattern, {}};
+  return {PatternKind::kSuffix, fixedPattern.length(), fixedPattern, {}, {}};
 }
 
 PatternMetadata PatternMetadata::relaxedSuffix(
@@ -1741,22 +1822,47 @@ PatternMetadata PatternMetadata::relaxedSuffix(
       PatternKind::kRelaxedSuffix,
       fixedLength,
       std::move(fixedPattern),
-      std::move(subPatterns)};
+      std::move(subPatterns),
+      {}};
 }
 
 PatternMetadata PatternMetadata::substring(const std::string& fixedPattern) {
-  return {PatternKind::kSubstring, fixedPattern.length(), fixedPattern, {}};
+  return {PatternKind::kSubstring, fixedPattern.length(), fixedPattern, {}, {}};
+}
+
+PatternMetadata PatternMetadata::substrings(
+    std::vector<std::string> substrings) {
+  return {PatternKind::kSubstrings, 0, "", {}, std::move(substrings)};
+}
+
+std::vector<std::string> PatternMetadata::parseSubstrings(
+    const std::string_view& pattern) {
+  // Not support substrings-search with '_' for best performance.
+  static const re2::RE2 fullPattern(R"((%+[^%_#\\]+)+%+)");
+  static const re2::RE2 subPattern(R"((?:%+)([^%_#\\]+))");
+  re2::StringPiece full(pattern.data(), pattern.size());
+  re2::StringPiece cur;
+  std::vector<std::string> substrings;
+  if (RE2::FullMatch(full, fullPattern)) {
+    while (RE2::PartialMatch(full, subPattern, &cur)) {
+      substrings.push_back(std::string(cur));
+      full = re2::StringPiece(cur.end(), full.end() - cur.end());
+    }
+  }
+  return substrings;
 }
 
 PatternMetadata::PatternMetadata(
     PatternKind patternKind,
     size_t length,
     std::string fixedPattern,
-    std::vector<SubPatternMetadata> subPatterns)
+    std::vector<SubPatternMetadata> subPatterns,
+    std::vector<std::string> substrings)
     : patternKind_{patternKind},
       length_{length},
       fixedPattern_(std::move(fixedPattern)),
-      subPatterns_(std::move(subPatterns)) {}
+      subPatterns_(std::move(subPatterns)),
+      substrings_(std::move(substrings)) {}
 
 // Iterates through a pattern string. Transparently handles escape sequences.
 class PatternStringIterator {
@@ -1783,7 +1889,7 @@ class PatternStringIterator {
           pattern_.size(),
           "Escape character must be followed by '%', '_' or the escape character itself: {}, escape {}",
           pattern_,
-          escapeChar_.value())
+          escapeChar_.value());
 
       currentChar = charAt(currentStart_ + 1);
       // The char follows escapeChar can only be one of (%, _, escapeChar).
@@ -1794,7 +1900,7 @@ class PatternStringIterator {
         VELOX_USER_FAIL(
             "Escape character must be followed by '%', '_' or the escape character itself: {}, escape {}",
             pattern_,
-            escapeChar_.value())
+            escapeChar_.value());
       }
       // One escape char plus the current char.
       nextStart_ = currentStart_ + 2;
@@ -1858,7 +1964,7 @@ class PatternStringIterator {
 
   // Char at current cursor.
   char charAt(size_t index) const {
-    VELOX_DCHECK(index < pattern_.size())
+    VELOX_DCHECK(index < pattern_.size());
     return pattern_.data()[index];
   }
 
@@ -2111,14 +2217,14 @@ PatternMetadata determinePatternKind(
 std::shared_ptr<exec::VectorFunction> makeLike(
     const std::string& name,
     const std::vector<exec::VectorFunctionArg>& inputArgs,
-    const core::QueryConfig& /*config*/) {
+    const core::QueryConfig& config) {
   auto numArgs = inputArgs.size();
 
   std::optional<char> escapeChar;
   if (numArgs == 3) {
     BaseVector* escape = inputArgs[2].constantValue.get();
     if (!escape) {
-      return std::make_shared<LikeGeneric>();
+      return std::make_shared<LikeGeneric>(config.exprMaxCompiledRegexes());
     }
 
     auto constantEscape = escape->as<ConstantVector<StringView>>();
@@ -2144,7 +2250,7 @@ std::shared_ptr<exec::VectorFunction> makeLike(
 
   BaseVector* constantPattern = inputArgs[1].constantValue.get();
   if (!constantPattern) {
-    return std::make_shared<LikeGeneric>();
+    return std::make_shared<LikeGeneric>(config.exprMaxCompiledRegexes());
   }
 
   if (constantPattern->isNullAt(0)) {
@@ -2154,6 +2260,17 @@ std::shared_ptr<exec::VectorFunction> makeLike(
 
   PatternMetadata patternMetadata = PatternMetadata::generic();
   try {
+    // Fast path for substrings search.
+    if (!escapeChar.has_value()) {
+      auto substrings =
+          PatternMetadata::parseSubstrings(std::string_view(pattern));
+      if (substrings.size() > 0) {
+        patternMetadata = PatternMetadata::substrings(std::move(substrings));
+        return std::make_shared<OptimizedLike<PatternKind::kSubstrings>>(
+            patternMetadata);
+      }
+    }
+
     patternMetadata =
         determinePatternKind(std::string_view(pattern), escapeChar);
   } catch (...) {
@@ -2215,7 +2332,7 @@ std::vector<std::shared_ptr<exec::FunctionSignature>> likeSignatures() {
 std::shared_ptr<exec::VectorFunction> makeRe2ExtractAll(
     const std::string& name,
     const std::vector<exec::VectorFunctionArg>& inputArgs,
-    const core::QueryConfig& /*config*/) {
+    const core::QueryConfig& config) {
   auto numArgs = inputArgs.size();
   VELOX_USER_CHECK(
       numArgs == 2 || numArgs == 3,
@@ -2260,11 +2377,12 @@ std::shared_ptr<exec::VectorFunction> makeRe2ExtractAll(
     }
   }
 
+  const auto maxCompiledRegexes = config.exprMaxCompiledRegexes();
   switch (groupIdTypeKind) {
     case TypeKind::INTEGER:
-      return std::make_shared<Re2ExtractAll<int32_t>>();
+      return std::make_shared<Re2ExtractAll<int32_t>>(maxCompiledRegexes);
     case TypeKind::BIGINT:
-      return std::make_shared<Re2ExtractAll<int64_t>>();
+      return std::make_shared<Re2ExtractAll<int64_t>>(maxCompiledRegexes);
     default:
       VELOX_UNREACHABLE();
   }
@@ -2299,7 +2417,8 @@ std::shared_ptr<exec::VectorFunction> makeRegexpReplaceWithLambda(
     const std::string& name,
     const std::vector<exec::VectorFunctionArg>& inputArgs,
     const core::QueryConfig& config) {
-  return std::make_shared<RegexpReplaceWithLambdaFunction>();
+  return std::make_shared<RegexpReplaceWithLambdaFunction>(
+      config.exprMaxCompiledRegexes());
 }
 
 std::vector<std::shared_ptr<exec::FunctionSignature>>

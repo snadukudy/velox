@@ -48,7 +48,8 @@ int main(int argc, char** argv) {
   // experience, and initialize glog and gflags.
   folly::Init init(&argc, &argv);
 
-  facebook::velox::memory::MemoryManager::initialize({});
+  facebook::velox::memory::MemoryManager::initialize(
+      facebook::velox::memory::MemoryManager::Options{});
 
   size_t initialSeed = FLAGS_seed == 0 ? std::time(nullptr) : FLAGS_seed;
 
@@ -57,8 +58,11 @@ int main(int argc, char** argv) {
 
   VELOX_CHECK(
       !FLAGS_presto_url.empty(),
-      "Table writer fuzzer only supports presto DB for now")
+      "Table writer fuzzer only supports presto DB for now");
+  std::shared_ptr<facebook::velox::memory::MemoryPool> rootPool{
+      facebook::velox::memory::memoryManager()->addRootPool()};
   auto queryRunner = std::make_unique<PrestoQueryRunner>(
+      rootPool.get(),
       FLAGS_presto_url,
       "writer_fuzzer",
       static_cast<std::chrono::milliseconds>(FLAGS_req_timeout_ms));

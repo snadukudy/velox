@@ -22,6 +22,7 @@
 
 using namespace facebook::velox;
 using namespace facebook::velox::test;
+using namespace facebook::velox::exec;
 using namespace facebook::velox::exec::test;
 
 class AssignUniqueIdTest : public OperatorTestBase {
@@ -32,7 +33,7 @@ class AssignUniqueIdTest : public OperatorTestBase {
     CursorParameters params;
     params.planNode = plan;
 
-    auto result = readCursor(params, [](auto /*task*/) {});
+    auto result = readCursor(params);
     auto numColumns = result.second[0]->childrenSize();
     ASSERT_EQ(numColumns, input[0]->childrenSize() + 1);
 

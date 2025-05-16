@@ -23,16 +23,23 @@ namespace facebook::velox::wave {
 Values::Values(CompileState& state, const core::ValuesNode& values)
     : WaveSourceOperator(state, values.outputType(), values.id()),
       values_(values.values()),
-      roundsLeft_(values.repeatTimes()) {}
+      roundsLeft_(values.repeatTimes()) {
+  for (auto& rv : values_) {
+    auto v = std::static_pointer_cast<BaseVector>(rv);
+    BaseVector::flattenVector(v);
+  }
+}
 
-AdvanceResult Values::canAdvance(WaveStream& stream) {
+std::vector<AdvanceResult> Values::canAdvance(WaveStream& stream) {
+  std::vector<AdvanceResult> results;
   if (current_ < values_.size()) {
-    return {.numRows = values_[current_]->size()};
+    auto& result = results.emplace_back();
+    result.numRows = values_[current_]->size();
+  } else if (roundsLeft_ > 1) {
+    auto& result = results.emplace_back();
+    result.numRows = values_[0]->size();
   }
-  if (roundsLeft_ > 1) {
-    return {.numRows = values_[0]->size()};
-  }
-  return {};
+  return results;
 }
 
 void Values::schedule(WaveStream& stream, int32_t maxRows) {
@@ -49,7 +56,7 @@ void Values::schedule(WaveStream& stream, int32_t maxRows) {
   VELOX_CHECK_LE(data->size(), maxRows);
 
   std::vector<const BaseVector*> sources;
-  for (auto i = 0; i < subfields_.size(); ++i) {
+  for (auto i = 0; i < outputIds_.size(); ++i) {
     sources.push_back(data->childAt(i).get());
   }
   int32_t counter = 0;

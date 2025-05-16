@@ -25,7 +25,7 @@ namespace facebook::velox::test {
 class CopyPreserveEncodingsTest : public testing::Test {
  protected:
   static void SetUpTestCase() {
-    memory::MemoryManager::testingSetInstance({});
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 
   std::shared_ptr<velox::memory::MemoryPool> pool_{
@@ -327,10 +327,12 @@ TEST_F(CopyPreserveEncodingsTest, flatNoNulls) {
 TEST_F(CopyPreserveEncodingsTest, lazyNoNulls) {
   auto lazyVector = vectorMaker_.lazyFlatVector<int32_t>(
       10, [](vector_size_t row) { return row; });
+  VELOX_ASSERT_THROW(lazyVector->copyPreserveEncodings(), "");
 
-  VELOX_ASSERT_THROW(
-      lazyVector->copyPreserveEncodings(),
-      "copyPreserveEncodings not defined for LazyVector");
+  auto copy = lazyVector->loadedVector()->copyPreserveEncodings();
+  assertEqualVectors(lazyVector, copy);
+  ASSERT_EQ(copy->encoding(), VectorEncoding::Simple::FLAT);
+  ASSERT_EQ(copy->nulls(), nullptr);
 }
 
 TEST_F(CopyPreserveEncodingsTest, sequenceHasNulls) {
@@ -348,5 +350,21 @@ TEST_F(CopyPreserveEncodingsTest, sequenceNoNulls) {
 
   assertEqualVectors(sequenceVector, copy);
   validateCopyPreserveEncodings(sequenceVector, copy);
+}
+
+TEST_F(CopyPreserveEncodingsTest, newMemoryPool) {
+  auto dictionaryVector = vectorMaker_.dictionaryVector(generateIntInput());
+
+  auto sourcePool = dictionaryVector->pool();
+  auto targetPool = memory::memoryManager()->addLeafPool();
+  auto preCopySrcMemory = sourcePool->usedBytes();
+  ASSERT_EQ(0, targetPool->usedBytes());
+
+  auto copy = dictionaryVector->copyPreserveEncodings(targetPool.get());
+  assertEqualVectors(dictionaryVector, copy);
+  validateCopyPreserveEncodings(dictionaryVector, copy);
+
+  EXPECT_EQ(preCopySrcMemory, sourcePool->usedBytes());
+  EXPECT_EQ(preCopySrcMemory, targetPool->usedBytes());
 }
 } // namespace facebook::velox::test

@@ -16,47 +16,28 @@
 
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <memory>
 #include <optional>
-#include <queue>
 
 #include <fmt/format.h>
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Portability.h"
-#include "velox/common/future/VeloxPromise.h"
 #include "velox/common/memory/Allocation.h"
 #include "velox/common/memory/MemoryAllocator.h"
 #include "velox/common/memory/MemoryArbitrator.h"
 
 DECLARE_bool(velox_memory_leak_check_enabled);
 DECLARE_bool(velox_memory_pool_debug_enabled);
+DECLARE_bool(velox_memory_pool_capacity_transfer_across_tasks);
 
 namespace facebook::velox::exec {
 class ParallelMemoryReclaimer;
 }
 
 namespace facebook::velox::memory {
-#define VELOX_MEM_POOL_CAP_EXCEEDED(errorMessage)                   \
-  _VELOX_THROW(                                                     \
-      ::facebook::velox::VeloxRuntimeError,                         \
-      ::facebook::velox::error_source::kErrorSourceRuntime.c_str(), \
-      ::facebook::velox::error_code::kMemCapExceeded.c_str(),       \
-      /* isRetriable */ true,                                       \
-      "{}",                                                         \
-      errorMessage);
-
-#define VELOX_MEM_POOL_ABORTED(errorMessage)                        \
-  _VELOX_THROW(                                                     \
-      ::facebook::velox::VeloxRuntimeError,                         \
-      ::facebook::velox::error_source::kErrorSourceRuntime.c_str(), \
-      ::facebook::velox::error_code::kMemAborted.c_str(),           \
-      /* isRetriable */ true,                                       \
-      "{}",                                                         \
-      errorMessage);
-
+class TestArbitrator;
 class MemoryManager;
 
 constexpr int64_t kMaxMemory = std::numeric_limits<int64_t>::max();
@@ -123,9 +104,20 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
   };
   static std::string kindString(Kind kind);
 
+  /// 'DebugOptions' is used to configure the per memory pool wise debug options
+  /// for memory pool when adding root memory pools.
+  struct DebugOptions {
+    /// Regex for filtering on memory pool name when 'debugEnabled' is true.
+    /// This allows us to only track the callsites of memory allocations for
+    /// memory pools whose name matches the specified regular expression. Empty
+    /// string means no match for all.
+    std::string debugPoolNameRegex;
+  };
+
   struct Options {
     /// Specifies the memory allocation alignment through this memory pool.
     uint16_t alignment{MemoryAllocator::kMaxAlignment};
+
     /// Specifies the max memory capacity of this memory pool.
     int64_t maxCapacity{kMaxMemory};
 
@@ -150,13 +142,16 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
     /// memory pools from the same root memory pool independently.
     bool threadSafe{true};
 
-    /// If true, tracks the allocation and free call stacks to detect the source
-    /// of memory leak for testing purpose.
-    bool debugEnabled{FLAGS_velox_memory_pool_debug_enabled};
-
     /// Terminates the process and generates a core file on an allocation
     /// failure
     bool coreOnAllocationFailureEnabled{false};
+
+    /// Provides the customized get preferred size function. If not set, uses
+    /// the memory pool's default function.
+    std::function<size_t(size_t)> getPreferredSize{nullptr};
+
+    /// If non-empty, enables debug mode for the created memory pool.
+    std::optional<DebugOptions> debugOptions{std::nullopt};
   };
 
   /// Constructs a named memory pool with specified 'name', 'parent' and 'kind'.
@@ -230,7 +225,9 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
       std::unique_ptr<MemoryReclaimer> reclaimer = nullptr);
 
   /// Allocates a buffer with specified 'size'.
-  virtual void* allocate(int64_t size) = 0;
+  virtual void* allocate(
+      int64_t size,
+      std::optional<uint32_t> alignment = std::nullopt) = 0;
 
   /// Allocates a zero-filled buffer with capacity that can store 'numEntries'
   /// entries with each size of 'sizeEach'.
@@ -295,7 +292,7 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
   virtual size_t preferredSize(size_t size);
 
   /// Returns the memory allocation alignment size applied internally by this
-  /// memory pool object.
+  /// memory pool object.  Must be a power of two.
   virtual uint16_t alignment() const {
     return alignment_;
   }
@@ -371,16 +368,6 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
 
   /// Returns the memory reclaimer of this memory pool if not null.
   virtual MemoryReclaimer* reclaimer() const = 0;
-
-  /// Invoked by the memory arbitrator to enter memory arbitration processing.
-  /// It is a noop if 'reclaimer' is not set, otherwise invoke the reclaimer's
-  /// corresponding method.
-  virtual void enterArbitration() = 0;
-
-  /// Invoked by the memory arbitrator to leave memory arbitration processing.
-  /// It is a noop if 'reclaimer' is not set, otherwise invoke the reclaimer's
-  /// corresponding method.
-  virtual void leaveArbitration() noexcept = 0;
 
   /// Function estimates the number of reclaimable bytes and returns in
   /// 'reclaimableBytes'. If the 'reclaimer' is not set, the function returns
@@ -466,7 +453,7 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
   /// Returns the stats of this memory pool.
   virtual Stats stats() const = 0;
 
-  virtual std::string toString() const = 0;
+  virtual std::string toString(bool detail = false) const = 0;
 
   /// Invoked to generate a descriptive memory usage summary of the entire tree.
   /// If 'skipEmptyPool' is true, then skip print out the child memory pools
@@ -496,8 +483,23 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
     return bits::roundUp(size, 8 * kMB);
   }
 
+  // Overrides getPreferredSize to allow specializing behavior for this pool.
+  void setPreferredSize(std::function<size_t(size_t)> getPreferredSizeFunc);
+
  protected:
   static constexpr uint64_t kMB = 1 << 20;
+
+  static size_t getPreferredSize(size_t size);
+
+  /// Invoked by the memory arbitrator to enter memory arbitration processing.
+  /// It is a noop if 'reclaimer' is not set, otherwise invoke the reclaimer's
+  /// corresponding method.
+  virtual void enterArbitration() = 0;
+
+  /// Invoked by the memory arbitrator to leave memory arbitration processing.
+  /// It is a noop if 'reclaimer' is not set, otherwise invoke the reclaimer's
+  /// corresponding method.
+  virtual void leaveArbitration() noexcept = 0;
 
   /// Invoked to free up to the specified amount of free memory by reducing
   /// this memory pool's capacity without actually freeing any used memory. The
@@ -523,6 +525,7 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
       const std::string& name,
       Kind kind,
       bool threadSafe,
+      const std::function<size_t(size_t)>& getPreferredSize,
       std::unique_ptr<MemoryReclaimer> reclaimer) = 0;
 
   virtual std::exception_ptr abortError() const;
@@ -531,6 +534,10 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
   /// child memory pool tracking.
   virtual void dropChild(const MemoryPool* child);
 
+  virtual inline bool debugEnabled() const {
+    return debugOptions_.has_value();
+  }
+
   const std::string name_;
   const Kind kind_;
   const uint16_t alignment_;
@@ -538,8 +545,9 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
   const int64_t maxCapacity_;
   const bool trackUsage_;
   const bool threadSafe_;
-  const bool debugEnabled_;
+  const std::optional<DebugOptions> debugOptions_;
   const bool coreOnAllocationFailureEnabled_;
+  std::function<size_t(size_t)> getPreferredSize_;
 
   /// Indicates if the memory pool has been aborted by the memory arbitrator or
   /// not.
@@ -557,6 +565,9 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
   friend class velox::exec::ParallelMemoryReclaimer;
   friend class MemoryManager;
   friend class MemoryArbitrator;
+  friend class velox::memory::TestArbitrator;
+  friend class MemoryPoolArbitrationSection;
+  friend class ArbitrationParticipant;
 
   VELOX_FRIEND_TEST(MemoryPoolTest, shrinkAndGrowAPIs);
   VELOX_FRIEND_TEST(MemoryPoolTest, grow);
@@ -573,11 +584,6 @@ class MemoryPoolImpl : public MemoryPool {
   /// The callback invoked on the root memory pool destruction. It is set by
   /// memory manager to removes the pool from 'MemoryManager::pools_'.
   using DestructionCallback = std::function<void(MemoryPool*)>;
-  /// The callback invoked when the used memory reservation of the root memory
-  /// pool exceed its capacity. It is set by memory manager to grow the memory
-  /// pool capacity. The callback returns true if the capacity growth succeeds,
-  /// otherwise false.
-  using GrowCapacityCallback = std::function<bool(MemoryPool*, uint64_t)>;
 
   MemoryPoolImpl(
       MemoryManager* manager,
@@ -585,13 +591,12 @@ class MemoryPoolImpl : public MemoryPool {
       Kind kind,
       std::shared_ptr<MemoryPool> parent,
       std::unique_ptr<MemoryReclaimer> reclaimer,
-      GrowCapacityCallback growCapacityCb,
-      DestructionCallback destructionCb,
       const Options& options = Options{});
 
   ~MemoryPoolImpl() override;
 
-  void* allocate(int64_t size) override;
+  void* allocate(int64_t size, std::optional<uint32_t> alignment = std::nullopt)
+      override;
 
   void* allocateZeroFilled(int64_t numEntries, int64_t sizeEach) override;
 
@@ -651,10 +656,6 @@ class MemoryPoolImpl : public MemoryPool {
 
   MemoryReclaimer* reclaimer() const override;
 
-  void enterArbitration() override;
-
-  void leaveArbitration() noexcept override;
-
   std::optional<uint64_t> reclaimableBytes() const override;
 
   uint64_t reclaim(
@@ -664,9 +665,18 @@ class MemoryPoolImpl : public MemoryPool {
 
   void abort(const std::exception_ptr& error) override;
 
-  std::string toString() const override {
-    std::lock_guard<std::mutex> l(mutex_);
-    return toStringLocked();
+  void setDestructionCallback(const DestructionCallback& callback);
+
+  std::string toString(bool detail = false) const override {
+    std::string result;
+    {
+      std::lock_guard<std::mutex> l(mutex_);
+      result = toStringLocked();
+    }
+    if (detail) {
+      result += "\n" + treeMemoryUsage();
+    }
+    return result;
   }
 
   /// Detailed debug pool state printout by traversing the pool structure from
@@ -674,7 +684,7 @@ class MemoryPoolImpl : public MemoryPool {
   ///
   /// Exceeded memory cap of 5.00MB when requesting 2.00MB
   /// default_root_1 usage 5.00MB peak 5.00MB
-  ///     task.test_cursor 1 usage 5.00MB peak 5.00MB
+  ///     task.test_cursor_1 usage 5.00MB peak 5.00MB
   ///         node.N/A usage 0B peak 0B
   ///             op.N/A.0.0.CallbackSink usage 0B peak 0B
   ///         node.2 usage 4.00MB peak 4.00MB
@@ -726,11 +736,11 @@ class MemoryPoolImpl : public MemoryPool {
     return debugAllocRecords_;
   }
 
-  static void setDebugPoolNameRegex(const std::string& regex) {
-    debugPoolNameRegex() = regex;
-  }
-
  private:
+  void enterArbitration() override;
+
+  void leaveArbitration() noexcept override;
+
   uint64_t shrink(uint64_t targetBytes = 0) override;
 
   bool grow(uint64_t growBytes, uint64_t reservationBytes = 0) override;
@@ -744,20 +754,16 @@ class MemoryPoolImpl : public MemoryPool {
     return static_cast<MemoryPoolImpl*>(pool.get());
   }
 
-  static folly::Synchronized<std::string>& debugPoolNameRegex() {
-    static folly::Synchronized<std::string> debugPoolNameRegex_;
-    return debugPoolNameRegex_;
-  }
-
   std::shared_ptr<MemoryPool> genChild(
       std::shared_ptr<MemoryPool> parent,
       const std::string& name,
       Kind kind,
       bool threadSafe,
+      const std::function<size_t(size_t)>& getPreferredSize,
       std::unique_ptr<MemoryReclaimer> reclaimer) override;
 
   FOLLY_ALWAYS_INLINE int64_t capacityLocked() const {
-    return parent_ != nullptr ? toImpl(parent_)->capacity_ : capacity_;
+    return toImpl(root())->capacity_;
   }
 
   FOLLY_ALWAYS_INLINE int64_t availableReservationLocked() const {
@@ -766,8 +772,8 @@ class MemoryPoolImpl : public MemoryPool {
         : std::max<int64_t>(0, reservationBytes_ - usedReservationBytes_);
   }
 
-  FOLLY_ALWAYS_INLINE int64_t sizeAlign(int64_t size) {
-    const auto remainder = size % alignment_;
+  FOLLY_ALWAYS_INLINE int64_t sizeAlign(int64_t size) const {
+    const auto remainder = size & (alignment_ - 1);
     return (remainder == 0) ? size : (size + alignment_ - remainder);
   }
 
@@ -819,27 +825,19 @@ class MemoryPoolImpl : public MemoryPool {
 
   void reserveThreadSafe(uint64_t size, bool reserveOnly = false);
 
-  // Increments the reservation and checks against limits at root tracker. Calls
-  // root tracker's 'growCallback_' if it is set and limit exceeded. Should be
-  // called without holding 'mutex_'. This function returns true if reservation
-  // succeeds. It returns false if there is concurrent reservation increment
-  // requests and need a retry from the leaf memory usage tracker. The function
-  // throws if a limit is exceeded and there is no corresponding GrowCallback or
-  // the GrowCallback fails.
-  bool incrementReservationThreadSafe(MemoryPool* requestor, uint64_t size);
+  // Increments the reservation and checks against limits at root memory pool.
+  // Provokes root memory pool to grow capacity through arbitrator if exceeds
+  // capacity. Should be called without holding 'mutex_'. This function throws
+  // if max capacity is exceeded or arbitration fails.
+  void incrementReservationThreadSafe(MemoryPool* requestor, uint64_t size);
 
-  FOLLY_ALWAYS_INLINE bool incrementReservationNonThreadSafe(
+  FOLLY_ALWAYS_INLINE void incrementReservationNonThreadSafe(
       MemoryPool* requestor,
       uint64_t size) {
     VELOX_CHECK_NOT_NULL(parent_);
     VELOX_CHECK(isLeaf());
-
-    if (!toImpl(parent_)->incrementReservationThreadSafe(requestor, size)) {
-      return false;
-    }
-
+    toImpl(parent_)->incrementReservationThreadSafe(requestor, size);
     reservationBytes_ += size;
-    return true;
   }
 
   // Returns the needed reservation size. If there is sufficient unused memory
@@ -871,6 +869,11 @@ class MemoryPoolImpl : public MemoryPool {
   void release(uint64_t bytes, bool releaseOnly = false);
 
   void releaseThreadSafe(uint64_t size, bool releaseOnly);
+
+  // Invoked to grow capacity of the root memory pool from the memory
+  // arbitrator. 'requestor' is the leaf memory pool that triggers the memory
+  // capacity growth. 'size' is the memory capacity growth in bytes.
+  void growCapacity(MemoryPool* requestor, uint64_t size);
 
   FOLLY_ALWAYS_INLINE void releaseNonThreadSafe(
       uint64_t size,
@@ -957,7 +960,6 @@ class MemoryPoolImpl : public MemoryPool {
   // of times that the allocations are recorded. 'isAlloc' will be true at
   // allocation sites, false at free sites. A good example of this filter would
   // be based on the 'name_' of the MemoryPool.
-  //  TODO(jtan6): Add support for dynamic condition change.
   bool needRecordDbg(bool isAlloc);
 
   // Invoked to record the call stack of a buffer allocation if debug mode of
@@ -999,13 +1001,7 @@ class MemoryPoolImpl : public MemoryPool {
 
   MemoryManager* const manager_;
   MemoryAllocator* const allocator_;
-  const GrowCapacityCallback growCapacityCb_;
-  const DestructionCallback destructionCb_;
-
-  // Regex for filtering on 'name_' when debug mode is enabled. This allows us
-  // to only track the callsites of memory allocations for memory pools whose
-  // name matches the specified regular expression 'debugPoolNameRegex_'.
-  const std::string debugPoolNameRegex_;
+  MemoryArbitrator* const arbitrator_;
 
   // Serializes updates on 'reservationBytes_', 'usedReservationBytes_'
   // and 'minReservationBytes_' to make reservation decision on a consistent
@@ -1014,6 +1010,8 @@ class MemoryPoolImpl : public MemoryPool {
   // the same parent do not have to be serialized.
   mutable std::mutex mutex_;
 
+  DestructionCallback destructionCb_;
+
   // Used by memory arbitration to reclaim memory from the associated query
   // object if not null. For example, a memory pool can reclaim the used memory
   // from a spillable operator through disk spilling. If null, we can't reclaim
@@ -1021,7 +1019,7 @@ class MemoryPoolImpl : public MemoryPool {
   std::unique_ptr<MemoryReclaimer> reclaimer_;
 
   // The memory cap in bytes to enforce.
-  int64_t capacity_;
+  tsan_atomic<int64_t> capacity_;
 
   // The number of reservation bytes.
   tsan_atomic<int64_t> reservationBytes_{0};
@@ -1106,9 +1104,8 @@ class StlAllocator {
 template <>
 struct fmt::formatter<facebook::velox::memory::MemoryPool::Kind>
     : formatter<std::string> {
-  auto format(
-      facebook::velox::memory::MemoryPool::Kind s,
-      format_context& ctx) {
+  auto format(facebook::velox::memory::MemoryPool::Kind s, format_context& ctx)
+      const {
     return formatter<std::string>::format(
         facebook::velox::memory::MemoryPool::kindString(s), ctx);
   }

@@ -16,11 +16,12 @@
 #pragma once
 
 #include "velox/type/Type.h"
-#include "velox/type/Variant.h"
 
 namespace facebook::velox::core {
 
 class ITypedExpr;
+class ITypedExprVisitor;
+class ITypedExprVisitorContext;
 
 using TypedExprPtr = std::shared_ptr<const ITypedExpr>;
 
@@ -51,6 +52,12 @@ class ITypedExpr : public ISerializable {
   virtual TypedExprPtr rewriteInputNames(
       const std::unordered_map<std::string, TypedExprPtr>& mapping) const = 0;
 
+  /// Part of the visitor pattern. Calls visitor.vist(*this, context) with the
+  /// "right" type of the first argument.
+  virtual void accept(
+      const ITypedExprVisitor& visitor,
+      ITypedExprVisitorContext& context) const = 0;
+
   virtual std::string toString() const = 0;
 
   virtual size_t localHash() const = 0;
@@ -61,24 +68,6 @@ class ITypedExpr : public ISerializable {
       hash = bits::hashMix(hash, inputs_[i]->hash());
     }
     return hash;
-  }
-
-  /// Returns true if other is recursively equal to 'this'. We do not
-  /// overload == because this is overloaded in a subclass for a
-  /// different purpose.
-  bool equals(const ITypedExpr& other) const {
-    if (type_ != other.type_ || inputs_.size() != other.inputs_.size()) {
-      return false;
-    }
-    if (!equalsNonRecursive(other)) {
-      return false;
-    }
-    for (int32_t i = 0; i < inputs_.size(); ++i) {
-      if (*inputs_[i] == *other.inputs_[i]) {
-        return false;
-      }
-    }
-    return true;
   }
 
   virtual bool operator==(const ITypedExpr& other) const = 0;
@@ -99,10 +88,6 @@ class ITypedExpr : public ISerializable {
   }
 
  private:
-  virtual bool equalsNonRecursive(const ITypedExpr& other) const {
-    return false;
-  }
-
   TypePtr type_;
   std::vector<TypedExprPtr> inputs_;
 };
